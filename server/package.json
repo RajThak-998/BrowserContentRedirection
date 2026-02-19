@@ -1,0 +1,13 @@
+{
+  "name": "bcr-telemetry-server",
+  "version": "0.1.0",
+  "description": "Phase 1 local WebSocket endpoint for BCR video telemetry",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
