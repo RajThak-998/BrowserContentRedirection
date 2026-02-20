@@ -143,11 +143,135 @@ const Observers = (() => {
         };
     }
 
+    // ─── Fullscreen Listener ──────────────────────────────────────────────────
+
+    /**
+     * Watch for fullscreen state changes using multiple strategies.
+     *
+     * Strategy 1: Native fullscreenchange event on document
+     * Strategy 2: YouTube-specific class mutation on <html> or <body>
+     * Strategy 3: Size heuristic — video fills window within 10px tolerance
+     *
+     * All strategies funnel into one callback.
+     *
+     * @param {HTMLVideoElement} videoEl
+     * @param {Function} callback
+     * @returns {Function} cleanup - Call to remove all listeners
+     */
+    function watchFullscreen(videoEl, callback) {
+        const cleanups = [];
+
+        // ── Strategy 1: Native fullscreenchange (all browsers) ──
+        const nativeHandler = () => {
+            const isFullscreen = _checkFullscreen(videoEl);
+            callback({ reason: "fullscreen", isFullscreen });
+        };
+
+        document.addEventListener("fullscreenchange", nativeHandler);
+        document.addEventListener("webkitfullscreenchange", nativeHandler);
+        cleanups.push(() => {
+            document.removeEventListener("fullscreenchange", nativeHandler);
+            document.removeEventListener("webkitfullscreenchange", nativeHandler);
+        });
+
+        // ── Strategy 2: MutationObserver on <html> and <body> ──
+        // YouTube adds/removes classes like "no-scroll", "scrolling",
+        // "player-full-bleed-container" to signal fullscreen state.
+        const classMutationHandler = throttle(() => {
+            const isFullscreen = _checkFullscreen(videoEl);
+            callback({ reason: "fullscreen", isFullscreen });
+        }, 100);
+
+        const classObserver = new MutationObserver(classMutationHandler);
+
+        classObserver.observe(document.documentElement, {
+            attributes: true,
+            attributeFilter: ["class", "style"],
+        });
+
+        classObserver.observe(document.body, {
+            attributes: true,
+            attributeFilter: ["class", "style"],
+        });
+
+        cleanups.push(() => classObserver.disconnect());
+
+        // ── Strategy 3: Periodic size heuristic check ──
+        // Last resort fallback — checks every 500ms if video
+        // fills the window. Catches cases where no events fire.
+        const heuristicInterval = setInterval(() => {
+            const isFullscreen = _checkFullscreen(videoEl);
+            callback({ reason: "fullscreen", isFullscreen });
+        }, 500);
+
+        cleanups.push(() => clearInterval(heuristicInterval));
+
+        return () => cleanups.forEach((fn) => fn());
+    }
+
+    // ─── Fullscreen Detection Logic ───────────────────────────────────────────
+
+    /**
+     * Multi-strategy fullscreen check for a video element.
+     * Returns true if ANY strategy confirms fullscreen.
+     *
+     * @param {HTMLVideoElement} videoEl
+     * @returns {boolean}
+     */
+    function _checkFullscreen(videoEl) {
+        // Strategy 1: Native API — direct video element
+        if (document.fullscreenElement === videoEl) return true;
+
+        // Strategy 2: Native API — any ancestor contains video
+        if (
+            document.fullscreenElement &&
+            document.fullscreenElement.contains(videoEl)
+        ) return true;
+
+        // Strategy 3: Webkit fallback
+        if (
+            document.webkitFullscreenElement &&
+            (document.webkitFullscreenElement === videoEl ||
+                document.webkitFullscreenElement.contains(videoEl))
+        ) return true;
+
+        // Strategy 4: YouTube-specific class check on known containers
+        const ytContainers = [
+            document.querySelector("ytd-app"),
+            document.querySelector(".html5-video-player"),
+            document.querySelector("#movie_player"),
+            document.querySelector(".html5-video-container"),
+            videoEl.closest(".html5-video-player"),
+            videoEl.closest("#movie_player"),
+        ];
+
+        for (const el of ytContainers) {
+            if (!el) continue;
+            const classList = el.classList;
+            if (
+                classList.contains("ytp-fullscreen") ||
+                classList.contains("full-bleed") ||
+                classList.contains("player-full-bleed-container")
+            ) return true;
+        }
+
+        // Strategy 5: Size heuristic — video bounds fill window within 10px
+        const rect = videoEl.getBoundingClientRect();
+        const fillsWidth = Math.abs(rect.width - window.innerWidth) < 10;
+        const fillsHeight = Math.abs(rect.height - window.innerHeight) < 10;
+        const atOrigin = Math.abs(rect.top) < 10 && Math.abs(rect.left) < 10;
+
+        if (fillsWidth && fillsHeight && atOrigin) return true;
+
+        return false;
+    }
+
     return {
         watchResize,
         watchVisibility,
         watchScroll,
         watchFullscreen,
         watchPlayback,
+        _checkFullscreen, 
     };
 })();

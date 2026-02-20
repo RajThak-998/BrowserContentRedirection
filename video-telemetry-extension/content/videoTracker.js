@@ -42,13 +42,15 @@ class VideoTracker {
             this._onObserverFired(data);
         });
         this._cleanups.push(cleanupScroll);
-        const cleanupFullscreen = Observers.watchFullscreen((data)=>{
-            this._isFullscreen = data.isFullscreen && (
-                document.fullscreenElement === this.videoEl ||
-                document.fullscreenElement?.contains(this.videoEl)
-            );
-            this._onObserverFired(data);
-        });
+        const cleanupFullscreen = Observers.watchFullscreen(
+            this.videoEl,
+            (data) => {
+                // Trust the observer's computed result directly
+                // _checkFullscreen already ran all strategies
+                this._isFullscreen = data.isFullscreen;
+                this._onObserverFired(data);
+            }
+        );
         this._cleanups.push(cleanupFullscreen);
 
         const cleanupPlayback = Observers.watchPlayback(this.videoEl, (data)=>{
@@ -72,6 +74,7 @@ class VideoTracker {
 
     _readState() {
         const rect = this.videoEl.getBoundingClientRect();
+
         return {
             bounds: {
                 x: rect.left,
@@ -84,11 +87,13 @@ class VideoTracker {
                 inViewport: this._lastVisibility.inViewport,
             },
             playback: {
-                state: this.videoEl.paused?"paused":"playing",
+                state: this.videoEl.paused ? "paused" : "playing",
                 currentTime: this.videoEl.currentTime,
                 rate: this.videoEl.playbackRate,
             },
-            fullscreen: this._isFullscreen,
+            // Re-verify at read time — catches cases where event
+            // fired but _isFullscreen cache was stale
+            fullscreen: this._isFullscreen || Observers._checkFullscreen(this.videoEl),
         };
     }
 
