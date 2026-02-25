@@ -1,18 +1,18 @@
-(()=>{
+(() => {
     function start() {
         console.log("[Bootstrap] BCR Video Telemetry starting...");
-        VideoRegistry.init();
+        VideoRegistry.getInstance().init();
         console.log("[Bootstrap] Registry initialized. Tracking active.");
     }
 
     function stop() {
         console.log("[Bootstrap] Page unloading. Tearing down...");
-        OverlayRenderer.destroyAll();   
-        VideoRegistry.destroy();
+        OverlayRenderer.getInstance().destroyAll();
+        VideoRegistry.getInstance().destroy();
     }
 
     if (
-        document.readyState === "complete" || 
+        document.readyState === "complete" ||
         document.readyState === "interactive"
     ) {
         start();

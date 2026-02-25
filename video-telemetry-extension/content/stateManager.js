@@ -1,22 +1,29 @@
 const POSITION_DELTA_THRESHOLD = 1;
-const StateManager = (() => {
-    const _states = new Map();
+
+// StateManager — instance-based, one per VideoTracker.
+// No singleton. No Map. No videoId routing.
+// Each instance tracks state for exactly one video element.
+class StateManager {
+    constructor() {
+        // Holds the last known state for this video
+        this.prevState = null;
+    }
 
     /**
-   * Check if the new state is meaningfully different from the last known state.
-   * Returns delta object if emission is warranted, null otherwise.
-   *
-   * @param {string} videoId
-   * @param {object} newState
-   * @returns {{ delta: object } | null}
-   */
+     * Check if the new state is meaningfully different from the last known state.
+     * Returns delta object if emission is warranted, null otherwise.
+     *
+     * @param {object} newState
+     * @returns {{ delta: object } | null}
+     */
+    computeDelta(newState) {
+        if (!newState || !newState.bounds) return null;
 
-    function computeDelta(videoId, newState) {
-        const prev = _states.get(videoId);
+        const prev = this.prevState;
 
         if (!prev) {
-            _states.set(videoId, newState);
-            return buildDelta(null, newState);
+            this.prevState = newState;
+            return this._buildDelta(null, newState);
         }
 
         const dx = newState.bounds.x - prev.bounds.x;
@@ -42,18 +49,18 @@ const StateManager = (() => {
 
         if (!shouldEmit) return null;
 
-        _states.set(videoId, newState);
-        return buildDelta({dx, dy, dw, dh}, newState);
+        this.prevState = newState;
+        return this._buildDelta({dx, dy, dw, dh}, newState);
     }
-    /**
-   * Build a delta object to attach to the emitted event.
-   *
-   * @param {{ dx, dy, dw, dh } | null} delta
-   * @param {object} newState
-   * @returns {object}
-   */
 
-    function buildDelta(delta, newState) {
+    /**
+     * Build a delta object to attach to the emitted event.
+     *
+     * @param {{ dx, dy, dw, dh } | null} delta
+     * @param {object} newState
+     * @returns {object}
+     */
+    _buildDelta(delta, newState) {
         return {
             ...newState,
             delta: delta ?? {dx: 0, dy: 0, dw: 0, dh: 0},
@@ -61,25 +68,9 @@ const StateManager = (() => {
     }
 
     /**
-   * Remove state for a video (called on removal).
-   *
-   * @param {string} videoId
-   */
-
-    function clearState(videoId) {
-        _states.delete(videoId);
+     * Reset internal state — called on tracker destroy.
+     */
+    clear() {
+        this.prevState = null;
     }
-
-    /**
-   * Check if a video has any tracked state.
-   *
-   * @param {string} videoId
-   * @returns {boolean}
-   */
-
-    function hasState(videoId) {
-        return _states.has(videoId);
-    }
-
-    return { computeDelta, clearState, hasState };
-})();
+}

@@ -108,3 +108,10 @@ Test scenarios:
 - Delta-based emission implemented
 - Overlay window mimics position/sizing
 - No CPU spikes during normal use
+
+
+## Todo List
+- convert all the function into classes -> prototypical Inheritance (javascript good parts)
+- BCR_host.exe(golang)
+- BCR_client.exe(golang)
+- Client side first have to tracedown the video in real time and then intercept the actual 
