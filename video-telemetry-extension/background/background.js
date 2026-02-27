@@ -10,7 +10,7 @@ class Transport {
     constructor() {
         this._WS_URL = "ws://localhost:8765/ws?role=extension";
         this._MAX_BACKOFF_MS = 5000;
-        this._INITIAL_BACKOFF_MS = 100;
+        this._INITIAL_BACKOFF_MS = 1000;  // Raised from 100ms to prevent reconnect storm
         this._MAX_QUEUE = 100;
 
         this._socket = null;
@@ -36,6 +36,14 @@ class Transport {
             console.log("[Transport] Already connected.");
             return;
         }
+
+        // Guard: don't connect if a retry is already scheduled.
+        // This prevents send() from triggering parallel connections
+        // while backoff timer is running.
+        if (this._retryTimer) {
+            return;
+        }
+
         this._intentionalClose = false;
         this._createSocket();
     }
@@ -68,9 +76,6 @@ class Transport {
             this._enqueue(event);
 
             if (!this._intentionalClose) {
-                // Attempt immediate reconnect in addition to scheduled backoff.
-                // Guards against MV3 service worker timer suspension killing
-                // the scheduled retry.
                 this.connect();
             }
         }
@@ -91,13 +96,20 @@ class Transport {
      */
     _enqueue(event) {
         if (this._pendingQueue.length >= this._MAX_QUEUE) {
-            // Drop oldest message to make room
             this._pendingQueue.shift();
         }
         this._pendingQueue.push(event);
     }
 
     _createSocket() {
+        // Prevent creating socket if one is already CONNECTING or OPEN
+        if (this._socket) {
+            const state = this._socket.readyState;
+            if (state === WebSocket.CONNECTING || state === WebSocket.OPEN) {
+                return;
+            }
+        }
+
         console.log(`[Transport] Connecting to ${this._WS_URL}...`);
 
         try {
@@ -127,10 +139,27 @@ class Transport {
     }
 
     _onClose(event) {
-        console.warn(`[Transport] Connection closed. Code: ${event.code}`);
-        if (!this._intentionalClose) {
-            this._scheduleReconnect();
+        const code = event.code;
+        console.warn(`[Transport] Connection closed. Code: ${code}`);
+
+        // Null out the socket reference so send() knows we're disconnected.
+        this._socket = null;
+
+        if (this._intentionalClose) {
+            return;
         }
+
+        // 1001 (Going Away) means the server replaced us with a newer
+        // connection. This is expected during extension/service worker
+        // restarts. We do NOT reconnect because the replacement is
+        // already registered — reconnecting would just create another
+        // storm of replacements.
+        if (code === 1001) {
+            console.log("[Transport] Server replaced connection (1001). Not reconnecting — replacement already active.");
+            return;
+        }
+
+        this._scheduleReconnect();
     }
 
     _onError(error) {

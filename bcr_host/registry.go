@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -25,6 +26,23 @@ func (c *Connection) Send(msgType int, data []byte) error {
 	return c.WS.WriteMessage(msgType, data)
 }
 
+// CloseWithMessage sends a close frame then closes the underlying
+// connection. Safe to call concurrently with ReadLoop.
+func (c *Connection) CloseWithMessage(code int, text string) {
+	c.mu.Lock()
+	// Best-effort write of close frame — ignore errors.
+	_ = c.WS.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(code, text),
+		time.Now().Add(2*time.Second),
+	)
+	c.mu.Unlock()
+
+	// Force-close the underlying TCP connection so ReadLoop unblocks.
+	// This is safe to call concurrently with ReadMessage.
+	c.WS.Close()
+}
+
 // Registry tracks the single active extension connection and all
 // active client connections. All fields are protected by RWMutex.
 type Registry struct {
@@ -45,13 +63,14 @@ func NewRegistry() *Registry {
 // connection is closed before being replaced.
 func (r *Registry) Register(conn *Connection) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+
+	var oldConn *Connection
 
 	switch conn.Role {
 	case "extension":
-		if r.extension != nil {
-			log.Printf("[registry] extension reconnected — closing previous connection (id=%s)", r.extension.ID)
-			r.extension.WS.Close()
+		if r.extension != nil && r.extension.ID != conn.ID {
+			log.Printf("[registry] extension reconnected — replacing previous (old=%s, new=%s)", r.extension.ID, conn.ID)
+			oldConn = r.extension
 		}
 		r.extension = conn
 		log.Printf("[registry] extension registered (id=%s)", conn.ID)
@@ -62,7 +81,18 @@ func (r *Registry) Register(conn *Connection) {
 
 	default:
 		log.Printf("[registry] unknown role %q for connection (id=%s) — rejected", conn.Role, conn.ID)
+		r.mu.Unlock()
 		conn.WS.Close()
+		return
+	}
+
+	r.mu.Unlock()
+
+	// Close old connection OUTSIDE the registry lock to avoid deadlock.
+	// We send CloseGoingAway (1001) so background.js knows this was
+	// a server-initiated replacement, not a crash.
+	if oldConn != nil {
+		oldConn.CloseWithMessage(websocket.CloseGoingAway, "replaced by new connection")
 	}
 }
 
@@ -99,16 +129,14 @@ func (r *Registry) Broadcast(msgType int, data []byte) {
 	r.mu.RUnlock()
 
 	if len(snapshot) == 0 {
-		log.Printf("[registry] broadcast called but no clients connected — dropping message")
+		// Downgrade to debug-level — this fires on every extension message
+		// when no client is connected. Not worth logging.
 		return
 	}
 
 	for _, client := range snapshot {
 		if err := client.Send(msgType, data); err != nil {
 			log.Printf("[registry] failed to send to client (id=%s): %v", client.ID, err)
-			// Removal is handled by the client's own ReadLoop when it exits.
-			// We do not force-remove here to avoid a deadlock (we'd need a write
-			// lock while the read lock is still logically in scope).
 		}
 	}
 }
