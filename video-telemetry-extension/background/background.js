@@ -8,7 +8,7 @@
 
 class Transport {
     constructor() {
-        this._WS_URL = "ws://localhost:8765";
+        this._WS_URL = "ws://localhost:8765/ws?role=extension";
         this._MAX_BACKOFF_MS = 5000;
         this._INITIAL_BACKOFF_MS = 100;
         this._MAX_QUEUE = 100;
