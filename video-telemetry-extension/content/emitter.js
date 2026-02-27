@@ -1,12 +1,6 @@
 /**
- * Emitter
- *
  * Responsible for sending structured telemetry messages to the background
  * script via chrome.runtime.sendMessage.
- *
- * Does NOT know about tracking logic.
- * Does NOT know about WebSocket.
- * Only knows how to format and send a message.
  */
 class Emitter {
     constructor() {

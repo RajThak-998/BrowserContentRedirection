@@ -79,11 +79,23 @@ class VideoTracker {
     _readState() {
         const rect = this.videoEl.getBoundingClientRect();
 
+        // ── Screen-absolute conversion ────────────────────────────────────────
+        // getBoundingClientRect() returns viewport-relative CSS pixels.
+        // GLFW SetPos needs screen-absolute pixels.
+        //
+        // window.screenX/Y — browser window's top-left corner on the screen.
+        // chromeUIHeight   — space consumed by tabs + address bar + bookmarks bar.
+        //                    outerHeight includes all chrome UI.
+        //                    innerHeight is the pure viewport.
+        const chromeUIHeight = window.outerHeight - window.innerHeight;
+        const screenX = window.screenX;
+        const screenY = window.screenY;
+
         return {
             bounds: {
-                x: rect.left,
-                y: rect.top,
-                width: rect.width,
+                x: rect.left  + screenX,
+                y: rect.top   + screenY + chromeUIHeight,
+                width:  rect.width,
                 height: rect.height,
             },
             visibility: {

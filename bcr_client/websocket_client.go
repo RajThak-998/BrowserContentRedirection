@@ -112,6 +112,6 @@ func (c *Client) connect(ctx context.Context) (wasConnected bool) {
 			continue
 		}
 
-		HandlePacket(c.ID, pkt)
+		HandlePacket(pkt)
 	}
 }

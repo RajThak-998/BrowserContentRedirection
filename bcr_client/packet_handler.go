@@ -1,49 +1,56 @@
 package main
 
 import (
-    "encoding/json"
-    "log"
+	"encoding/json"
+	"log"
 )
 
-// HandlePacket routes a decoded Packet to the appropriate logger.
-// It performs no state transformation and contains no rendering logic.
-// Future overlay integration hooks belong here as additional calls
-// after the log statements.
-func HandlePacket(clientID string, pkt Packet) {
-    // Decode meta once — shared across all packet types.
-    var meta Meta
-    if pkt.Meta != nil {
-        if err := json.Unmarshal(pkt.Meta, &meta); err != nil {
-            log.Printf("[handler] failed to decode meta: %v", err)
-        }
-    }
+// overlayManager is the single OverlayManager instance.
+// Initialised in main() before the WebSocket client starts.
+var overlayManager *OverlayManager
 
-    switch pkt.Type {
-    case "VIDEO_ADDED":
-        var payload AddedPayload
-        if err := json.Unmarshal(pkt.Payload, &payload); err != nil {
-            log.Printf("[handler] failed to decode VIDEO_ADDED payload: %v", err)
-            return
-        }
-        LogAdded(clientID, payload, meta)
+// HandlePacket routes a decoded Packet to the appropriate logger
+// and forwards geometry events to the OverlayManager.
+//
+// Called from the WebSocket goroutine — must NOT touch GLFW/OpenGL directly.
+// All window manipulation goes through overlayManager → geomCh → render loop.
+func HandlePacket(p Packet) {
+	switch p.Type {
+	case "VIDEO_ADDED":
+		var payload AddedPayload
+		if err := json.Unmarshal(p.Payload, &payload); err != nil {
+			log.Printf("[handler] VIDEO_ADDED — failed to decode payload: %v", err)
+			return
+		}
+		log.Printf("[handler] VIDEO_ADDED   id=%s  ts=%d", payload.ID, payload.Timestamp)
+		overlayManager.Create(payload.ID)
 
-    case "VIDEO_REMOVED":
-        var payload RemovedPayload
-        if err := json.Unmarshal(pkt.Payload, &payload); err != nil {
-            log.Printf("[handler] failed to decode VIDEO_REMOVED payload: %v", err)
-            return
-        }
-        LogRemoved(clientID, payload, meta)
+	case "VIDEO_UPDATE":
+		var payload UpdatePayload
+		if err := json.Unmarshal(p.Payload, &payload); err != nil {
+			log.Printf("[handler] VIDEO_UPDATE — failed to decode payload: %v", err)
+			return
+		}
+		log.Printf("[handler] VIDEO_UPDATE  id=%s  pos=(%.0f,%.0f)  size=(%.0f×%.0f)  state=%s  ratio=%.2f",
+			payload.ID,
+			payload.Bounds.X, payload.Bounds.Y,
+			payload.Bounds.Width, payload.Bounds.Height,
+			payload.Playback.State,
+			payload.Visibility.IntersectionRatio,
+		)
+		// Pass both Bounds and Visibility — manager decides show/hide.
+		overlayManager.Update(payload.ID, payload.Bounds, payload.Visibility)
 
-    case "VIDEO_UPDATE":
-        var payload UpdatePayload
-        if err := json.Unmarshal(pkt.Payload, &payload); err != nil {
-            log.Printf("[handler] failed to decode VIDEO_UPDATE payload: %v", err)
-            return
-        }
-        LogUpdate(clientID, payload, meta)
+	case "VIDEO_REMOVED":
+		var payload RemovedPayload
+		if err := json.Unmarshal(p.Payload, &payload); err != nil {
+			log.Printf("[handler] VIDEO_REMOVED — failed to decode payload: %v", err)
+			return
+		}
+		log.Printf("[handler] VIDEO_REMOVED id=%s  ts=%d", payload.ID, payload.Timestamp)
+		overlayManager.Destroy(payload.ID)
 
-    default:
-        log.Printf("[handler] unknown packet type %q — dropped", pkt.Type)
-    }
+	default:
+		log.Printf("[handler] unknown packet type: %q", p.Type)
+	}
 }

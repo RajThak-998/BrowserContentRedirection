@@ -1,8 +1,7 @@
-const POSITION_DELTA_THRESHOLD = 1;
+// instance based - not a singleton class
 
-// StateManager — instance-based, one per VideoTracker.
-// No singleton. No Map. No videoId routing.
-// Each instance tracks state for exactly one video element.
+const POSITION_DELTA_THRESHOLD = 1;     // 1px for jitter tolerance
+
 class StateManager {
     constructor() {
         // Holds the last known state for this video

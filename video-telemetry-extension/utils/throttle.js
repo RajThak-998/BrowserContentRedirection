@@ -11,7 +11,7 @@ function throttle(fn, limitMs = 33) {
         const now = performance.now();
         const remaining = limitMs - (now - lastCall);
 
-        if(remaining <= 0) {
+        if(remaining <= 0) {        // leading-edge throttle
             if(rafHandle) {
                 cancelAnimationFrame(rafHandle);
                 rafHandle = null;
