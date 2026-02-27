@@ -31,15 +31,15 @@ func HandlePacket(p Packet) {
 			log.Printf("[handler] VIDEO_UPDATE — failed to decode payload: %v", err)
 			return
 		}
-		log.Printf("[handler] VIDEO_UPDATE  id=%s  pos=(%.0f,%.0f)  size=(%.0f×%.0f)  state=%s  ratio=%.2f",
+		log.Printf("[handler] VIDEO_UPDATE  id=%s  screen=(%.0f,%.0f)  size=(%.0f×%.0f)  state=%s  ratio=%.2f",
 			payload.ID,
-			payload.Bounds.X, payload.Bounds.Y,
-			payload.Bounds.Width, payload.Bounds.Height,
+			payload.ScreenBounds.X, payload.ScreenBounds.Y,
+			payload.ScreenBounds.Width, payload.ScreenBounds.Height,
 			payload.Playback.State,
 			payload.Visibility.IntersectionRatio,
 		)
-		// Pass both Bounds and Visibility — manager decides show/hide.
-		overlayManager.Update(payload.ID, payload.Bounds, payload.Visibility)
+		// Use ScreenBounds for GLFW — screen-absolute pixels.
+		overlayManager.Update(payload.ID, payload.ScreenBounds, payload.Visibility)
 
 	case "VIDEO_REMOVED":
 		var payload RemovedPayload

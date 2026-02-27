@@ -32,13 +32,14 @@ type RemovedPayload struct {
 
 // UpdatePayload is the payload for VIDEO_UPDATE events.
 type UpdatePayload struct {
-	ID         string     `json:"id"`
-	Timestamp  int64      `json:"timestamp"`
-	Bounds     Bounds     `json:"bounds"`
-	Visibility Visibility `json:"visibility"`
-	Playback   Playback   `json:"playback"`
-	Fullscreen bool       `json:"fullscreen"`
-	Delta      Delta      `json:"delta"`
+	ID           string     `json:"id"`
+	Timestamp    int64      `json:"timestamp"`
+	Bounds       Bounds     `json:"bounds"`       // viewport-relative (for browser overlay)
+	ScreenBounds Bounds     `json:"screenBounds"` // screen-absolute   (for GLFW window)
+	Visibility   Visibility `json:"visibility"`
+	Playback     Playback   `json:"playback"`
+	Fullscreen   bool       `json:"fullscreen"`
+	Delta        Delta      `json:"delta"`
 }
 
 // Bounds represents the screen-space rectangle of the video element.

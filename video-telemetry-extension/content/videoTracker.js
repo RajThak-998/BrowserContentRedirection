@@ -65,50 +65,43 @@ class VideoTracker {
         console.log(`[VideoTracker] Initialized tracker for video: ${this.videoId}`);
     }
 
-    /**
-     * Read current DOM state of the video element.
-     * Called every time any observer fires.
-     *
-     * getBoundingClientRect() is used for position — it accounts for:
-     *  - Scroll position
-     *  - CSS transforms
-     *  - Element visibility in viewport
-     *
-     * @returns {object} Current state snapshot
-     */
     _readState() {
         const rect = this.videoEl.getBoundingClientRect();
 
-        // ── Screen-absolute conversion ────────────────────────────────────────
-        // getBoundingClientRect() returns viewport-relative CSS pixels.
-        // GLFW SetPos needs screen-absolute pixels.
-        //
-        // window.screenX/Y — browser window's top-left corner on the screen.
-        // chromeUIHeight   — space consumed by tabs + address bar + bookmarks bar.
-        //                    outerHeight includes all chrome UI.
-        //                    innerHeight is the pure viewport.
+        // ── Viewport-relative coords (CSS px) ────────────────────────────────
+        // Used by OverlayRenderer for position:fixed DOM elements.
+        // These are correct as-is from getBoundingClientRect().
+        const bounds = {
+            x:      rect.left,
+            y:      rect.top,
+            width:  rect.width,
+            height: rect.height,
+        };
+
+        // ── Screen-absolute coords (CSS px) ──────────────────────────────────
+        // Used by bcr_client (GLFW SetPos) which needs screen-absolute coords.
+        // window.screenX/Y = browser window top-left on the screen.
+        // chromeUIHeight   = tabs + address bar + bookmarks bar height.
         const chromeUIHeight = window.outerHeight - window.innerHeight;
-        const screenX = window.screenX;
-        const screenY = window.screenY;
+        const screenBounds = {
+            x:      rect.left  + window.screenX,
+            y:      rect.top   + window.screenY + chromeUIHeight,
+            width:  rect.width,
+            height: rect.height,
+        };
 
         return {
-            bounds: {
-                x: rect.left  + screenX,
-                y: rect.top   + screenY + chromeUIHeight,
-                width:  rect.width,
-                height: rect.height,
-            },
+            bounds,
+            screenBounds,
             visibility: {
                 intersectionRatio: this._lastVisibility.intersectionRatio,
-                inViewport: this._lastVisibility.inViewport,
+                inViewport:        this._lastVisibility.inViewport,
             },
             playback: {
-                state: this.videoEl.paused ? "paused" : "playing",
+                state:       this.videoEl.paused ? "paused" : "playing",
                 currentTime: this.videoEl.currentTime,
-                rate: this.videoEl.playbackRate,
+                rate:        this.videoEl.playbackRate,
             },
-            // Re-verify at read time — catches cases where event
-            // fired but _isFullscreen cache was stale
             fullscreen: this._isFullscreen || Observers._checkFullscreen(this.videoEl),
         };
     }

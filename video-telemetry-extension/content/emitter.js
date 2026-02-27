@@ -42,20 +42,19 @@ class Emitter {
      * @param {object} stateWithDelta - Output from StateManager.computeDelta
      */
     emitUpdate(videoId, stateWithDelta) {
-        const message = {
+        this._send({
             type: "VIDEO_UPDATE",
             payload: {
-                id: videoId,
-                timestamp: Date.now(),
-                bounds: stateWithDelta.bounds,
-                visibility: stateWithDelta.visibility,
-                playback: stateWithDelta.playback,
-                fullscreen: stateWithDelta.fullscreen,
-                delta: stateWithDelta.delta,
+                id:           videoId,
+                timestamp:    Date.now(),
+                bounds:       stateWithDelta.bounds,        // viewport-relative — for overlayRenderer
+                screenBounds: stateWithDelta.screenBounds,  // screen-absolute   — for bcr_client
+                visibility:   stateWithDelta.visibility,
+                playback:     stateWithDelta.playback,
+                fullscreen:   stateWithDelta.fullscreen,
+                delta:         stateWithDelta.delta,
             },
-        };
-
-        this._sendWithRetry(message, this._MAX_RETRIES);
+        });
     }
 
     /**
@@ -92,6 +91,60 @@ class Emitter {
      * @param {number} retriesLeft
      */
     _sendWithRetry(message, retriesLeft) {
+        // ── Guard: stop immediately if context is dead ──
+        if (!this._isContextAlive()) {
+            // Silent return — this is expected during page navigation
+            // No console.warn here — would spam on every navigation
+            return;
+        }
+
+        try {
+            chrome.runtime.sendMessage(message, (response) => {
+                // Re-check context inside async callback too
+                // Chrome can invalidate between send and callback
+                if (!this._isContextAlive()) return;
+
+                if (chrome.runtime.lastError) {
+                    const errMsg = chrome.runtime.lastError.message ?? "";
+
+                    // Context invalidated inside callback — silent drop
+                    if (errMsg.includes("Extension context invalidated")) return;
+                    if (errMsg.includes("message port closed")) return;
+
+                    console.warn("[Emitter] sendMessage error:", errMsg);
+                    return;
+                }
+
+                if (response?.status !== "ok") {
+                    console.warn("[Emitter] Background did not acknowledge:", response);
+
+                    if (retriesLeft > 0) {
+                        console.log(`[Emitter] Retrying... (${retriesLeft} left)`);
+                        setTimeout(() => this._sendWithRetry(message, retriesLeft - 1), 100);
+                    } else {
+                        console.error(
+                            "[Emitter] Max retries reached. Dropping:",
+                            message.type
+                        );
+                    }
+                }
+            });
+        } catch (err) {
+            // Only log if it's an unexpected error
+            // "Extension context invalidated" here is expected on navigation
+            if (!err.message?.includes("Extension context invalidated")) {
+                console.warn("[Emitter] Unexpected sendMessage exception:", err);
+            }
+        }
+    }
+
+    /**
+     * Internal: Send message to background without retry.
+     * Silently drops message if extension context is no longer valid.
+     *
+     * @param {object} message
+     */
+    _send(message) {
         // ── Guard: stop immediately if context is dead ──
         if (!this._isContextAlive()) {
             // Silent return — this is expected during page navigation
