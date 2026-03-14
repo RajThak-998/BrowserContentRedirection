@@ -171,16 +171,6 @@ class Emitter {
 
                 if (response?.status !== "ok") {
                     console.warn("[Emitter] Background did not acknowledge:", response);
-
-                    if (retriesLeft > 0) {
-                        console.log(`[Emitter] Retrying... (${retriesLeft} left)`);
-                        setTimeout(() => this._sendWithRetry(message, retriesLeft - 1), 100);
-                    } else {
-                        console.error(
-                            "[Emitter] Max retries reached. Dropping:",
-                            message.type
-                        );
-                    }
                 }
             });
         } catch (err) {

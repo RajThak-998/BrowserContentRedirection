@@ -20,7 +20,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "js": [
         "utils/throttle.js",
         "content/stateManager.js",
@@ -31,6 +31,13 @@
         "content/videoRegistry.js",
         "content/bootstrap.js"
       ]
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["content/pageInterceptor.js"],
+      "matches": ["<all_urls>"]
     }
   ]
 }
