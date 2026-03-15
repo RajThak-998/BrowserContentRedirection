@@ -47,12 +47,12 @@ class Emitter {
             payload: {
                 id:           videoId,
                 timestamp:    Date.now(),
-                bounds:       stateWithDelta.bounds,        // viewport-relative — for overlayRenderer
-                screenBounds: stateWithDelta.screenBounds,  // screen-absolute   — for bcr_client
+                bounds:       stateWithDelta.bounds,
+                screenBounds: stateWithDelta.screenBounds,
                 visibility:   stateWithDelta.visibility,
                 playback:     stateWithDelta.playback,
                 fullscreen:   stateWithDelta.fullscreen,
-                delta:         stateWithDelta.delta,
+                delta:        stateWithDelta.delta,
             },
         });
     }
@@ -81,33 +81,40 @@ class Emitter {
         );
     }
 
+    /**
+     * Send a MEDIA_CHUNK event with metadata + raw chunk bytes.
+     *
+     * @param {{seq:number,size:number,ts:number,trackType:string,chunk:ArrayBuffer}} payload
+     */
+    emitMediaChunk(payload) {
+        const chunkView = new Uint8Array(payload.chunk);
+
+        this._send({
+            type: "MEDIA_CHUNK",
+            payload: {
+                seq: payload.seq,
+                size: payload.size,
+                ts: payload.ts,
+                trackType: payload.trackType ?? "unknown",
+                chunkBytes: Array.from(chunkView),
+            },
+        });
+    }
+
     // ─── Internal ─────────────────────────────────────────────────────────────
 
-    /**
-     * Internal: Send message to background with simple retry on failure.
-     * Silently drops message if extension context is no longer valid.
-     *
-     * @param {object} message
-     * @param {number} retriesLeft
-     */
     _sendWithRetry(message, retriesLeft) {
-        // ── Guard: stop immediately if context is dead ──
         if (!this._isContextAlive()) {
-            // Silent return — this is expected during page navigation
-            // No console.warn here — would spam on every navigation
             return;
         }
 
         try {
             chrome.runtime.sendMessage(message, (response) => {
-                // Re-check context inside async callback too
-                // Chrome can invalidate between send and callback
                 if (!this._isContextAlive()) return;
 
                 if (chrome.runtime.lastError) {
                     const errMsg = chrome.runtime.lastError.message ?? "";
 
-                    // Context invalidated inside callback — silent drop
                     if (errMsg.includes("Extension context invalidated")) return;
                     if (errMsg.includes("message port closed")) return;
 
@@ -122,46 +129,30 @@ class Emitter {
                         console.log(`[Emitter] Retrying... (${retriesLeft} left)`);
                         setTimeout(() => this._sendWithRetry(message, retriesLeft - 1), 100);
                     } else {
-                        console.error(
-                            "[Emitter] Max retries reached. Dropping:",
-                            message.type
-                        );
+                        console.error("[Emitter] Max retries reached. Dropping:", message.type);
                     }
                 }
             });
         } catch (err) {
-            // Only log if it's an unexpected error
-            // "Extension context invalidated" here is expected on navigation
             if (!err.message?.includes("Extension context invalidated")) {
                 console.warn("[Emitter] Unexpected sendMessage exception:", err);
             }
         }
     }
 
-    /**
-     * Internal: Send message to background without retry.
-     * Silently drops message if extension context is no longer valid.
-     *
-     * @param {object} message
-     */
     _send(message) {
-        // ── Guard: stop immediately if context is dead ──
+        // Bug fix: no undefined retriesLeft usage in _send().
         if (!this._isContextAlive()) {
-            // Silent return — this is expected during page navigation
-            // No console.warn here — would spam on every navigation
             return;
         }
 
         try {
             chrome.runtime.sendMessage(message, (response) => {
-                // Re-check context inside async callback too
-                // Chrome can invalidate between send and callback
                 if (!this._isContextAlive()) return;
 
                 if (chrome.runtime.lastError) {
                     const errMsg = chrome.runtime.lastError.message ?? "";
 
-                    // Context invalidated inside callback — silent drop
                     if (errMsg.includes("Extension context invalidated")) return;
                     if (errMsg.includes("message port closed")) return;
 
@@ -174,8 +165,6 @@ class Emitter {
                 }
             });
         } catch (err) {
-            // Only log if it's an unexpected error
-            // "Extension context invalidated" here is expected on navigation
             if (!err.message?.includes("Extension context invalidated")) {
                 console.warn("[Emitter] Unexpected sendMessage exception:", err);
             }

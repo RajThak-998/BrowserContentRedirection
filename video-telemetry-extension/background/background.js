@@ -4,23 +4,36 @@
  * MV3 classic service workers cannot use importScripts reliably.
  */
 
+// ─── Feature Flags ──────────────────────────────────────────────────────────
+
+const ENABLE_MEDIA_CHUNK_ROUTE = true;
+const MEDIA_LOG_EVERY_N = 100;
+const MAX_MEDIA_CHUNK_BYTES = 4 * 1024 * 1024; // 4MB safety cap per chunk
+
+// ─── Media Counters ─────────────────────────────────────────────────────────
+
+let _mediaSeen = 0;
+
 // ─── Transport ─────────────────────────────────────────────────────────────
 
 class Transport {
     constructor() {
         this._WS_URL = "ws://localhost:8765/ws?role=extension";
         this._MAX_BACKOFF_MS = 5000;
-        this._INITIAL_BACKOFF_MS = 1000;  // Raised from 100ms to prevent reconnect storm
+        this._INITIAL_BACKOFF_MS = 1000;
         this._MAX_QUEUE = 100;
+        this._MAX_MEDIA_QUEUE = 50;
 
         this._socket = null;
         this._retryCount = 0;
         this._retryTimer = null;
         this._intentionalClose = false;
-        this._pendingQueue = [];
-    }
 
-    // ─── Singleton ────────────────────────────────────────────────────────────
+        this._pendingQueue = [];
+        this._pendingMediaQueue = [];
+
+        this._encoder = new TextEncoder();
+    }
 
     static getInstance() {
         if (!Transport._instance) {
@@ -29,17 +42,12 @@ class Transport {
         return Transport._instance;
     }
 
-    // ─── Public API ───────────────────────────────────────────────────────────
-
     connect() {
         if (this._socket && this._socket.readyState === WebSocket.OPEN) {
             console.log("[Transport] Already connected.");
             return;
         }
 
-        // Guard: don't connect if a retry is already scheduled.
-        // This prevents send() from triggering parallel connections
-        // while backoff timer is running.
         if (this._retryTimer) {
             return;
         }
@@ -64,6 +72,7 @@ class Transport {
         console.log("[Transport] Disconnected intentionally.");
     }
 
+    // Existing JSON telemetry path (unchanged).
     send(event) {
         if (this._socket && this._socket.readyState === WebSocket.OPEN) {
             try {
@@ -81,19 +90,30 @@ class Transport {
         }
     }
 
+    // New binary media path.
+    sendMediaChunk(event) {
+        if (this._socket && this._socket.readyState === WebSocket.OPEN) {
+            try {
+                const frame = this._buildMediaFrame(event);
+                this._socket.send(frame);
+            } catch (err) {
+                console.warn("[Transport] Binary media send failed:", err);
+                this._enqueueMedia(event);
+            }
+        } else {
+            this._enqueueMedia(event);
+
+            if (!this._intentionalClose) {
+                this.connect();
+            }
+        }
+    }
+
     getStatus() {
         if (!this._socket) return "NO_SOCKET";
         return ["CONNECTING", "OPEN", "CLOSING", "CLOSED"][this._socket.readyState];
     }
 
-    // ─── Internal ─────────────────────────────────────────────────────────────
-
-    /**
-     * Enqueue a message with MAX_QUEUE cap.
-     * Oldest message is dropped when cap is reached.
-     *
-     * @param {object} event
-     */
     _enqueue(event) {
         if (this._pendingQueue.length >= this._MAX_QUEUE) {
             this._pendingQueue.shift();
@@ -101,8 +121,42 @@ class Transport {
         this._pendingQueue.push(event);
     }
 
+    _enqueueMedia(event) {
+        if (this._pendingMediaQueue.length >= this._MAX_MEDIA_QUEUE) {
+            this._pendingMediaQueue.shift();
+        }
+        this._pendingMediaQueue.push(event);
+    }
+
+    _buildMediaFrame(event) {
+        const payload = event.payload;
+        const chunkBytes = Uint8Array.from(payload.chunkBytes);
+
+        const header = {
+            type: "MEDIA_CHUNK",
+            payload: {
+                seq: payload.seq,
+                size: payload.size,
+                ts: payload.ts,
+                trackType: payload.trackType,
+            },
+            meta: event.meta ?? {},
+        };
+
+        const headerBytes = this._encoder.encode(JSON.stringify(header));
+
+        // Frame layout: [u32 headerLen LE][headerJSON][rawChunkBytes]
+        const frame = new Uint8Array(4 + headerBytes.length + chunkBytes.length);
+        const dv = new DataView(frame.buffer);
+        dv.setUint32(0, headerBytes.length, true);
+
+        frame.set(headerBytes, 4);
+        frame.set(chunkBytes, 4 + headerBytes.length);
+
+        return frame.buffer;
+    }
+
     _createSocket() {
-        // Prevent creating socket if one is already CONNECTING or OPEN
         if (this._socket) {
             const state = this._socket.readyState;
             if (state === WebSocket.CONNECTING || state === WebSocket.OPEN) {
@@ -131,29 +185,29 @@ class Transport {
         this._retryCount = 0;
 
         if (this._pendingQueue.length > 0) {
-            console.log(`[Transport] Flushing ${this._pendingQueue.length} queued messages.`);
+            console.log(`[Transport] Flushing ${this._pendingQueue.length} queued telemetry messages.`);
             const queue = [...this._pendingQueue];
             this._pendingQueue = [];
             queue.forEach((event) => this.send(event));
+        }
+
+        if (this._pendingMediaQueue.length > 0) {
+            console.log(`[Transport] Flushing ${this._pendingMediaQueue.length} queued media messages.`);
+            const mediaQueue = [...this._pendingMediaQueue];
+            this._pendingMediaQueue = [];
+            mediaQueue.forEach((event) => this.sendMediaChunk(event));
         }
     }
 
     _onClose(event) {
         const code = event.code;
         console.warn(`[Transport] Connection closed. Code: ${code}`);
-
-        // Null out the socket reference so send() knows we're disconnected.
         this._socket = null;
 
         if (this._intentionalClose) {
             return;
         }
 
-        // 1001 (Going Away) means the server replaced us with a newer
-        // connection. This is expected during extension/service worker
-        // restarts. We do NOT reconnect because the replacement is
-        // already registered — reconnecting would just create another
-        // storm of replacements.
         if (code === 1001) {
             console.log("[Transport] Server replaced connection (1001). Not reconnecting — replacement already active.");
             return;
@@ -167,7 +221,10 @@ class Transport {
     }
 
     _onMessage(event) {
-        console.log("[Transport] Received from endpoint:", event.data);
+        // Keep logging compact. Incoming side may be text/binary.
+        if (typeof event.data === "string") {
+            console.log("[Transport] Received text from endpoint:", event.data);
+        }
     }
 
     _scheduleReconnect() {
@@ -188,7 +245,6 @@ class Transport {
     }
 }
 
-// Singleton static property
 Transport._instance = null;
 
 // ─── Startup ───────────────────────────────────────────────────────────────
@@ -218,6 +274,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             _handleTelemetry(message, sender, sendResponse);
             break;
 
+        case "MEDIA_CHUNK":
+            _handleMediaChunk(message, sender, sendResponse);
+            break;
+
         default:
             console.warn("[Background] Unknown message type:", message.type);
             sendResponse({status: "error", reason: "unknown type"});
@@ -228,8 +288,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────
 
-function _handleTelemetry(message, sender, sendResponse) {
-    const enrichedMessage = {
+function _enrichWithSenderMeta(message, sender) {
+    return {
         ...message,
         meta: {
             tabId: sender.tab.id,
@@ -237,12 +297,60 @@ function _handleTelemetry(message, sender, sendResponse) {
             frameId: sender.frameId ?? 0,
         },
     };
+}
+
+function _handleTelemetry(message, sender, sendResponse) {
+    const enrichedMessage = _enrichWithSenderMeta(message, sender);
 
     try {
         Transport.getInstance().send(enrichedMessage);
         sendResponse({status: "ok"});
     } catch (err) {
         console.error("[Background] Failed to send via transport:", err);
+        sendResponse({status: "error", reason: err.message});
+    }
+}
+
+function _isValidMediaPayload(payload) {
+    if (!payload) return false;
+    if (!Number.isFinite(payload.seq) || payload.seq <= 0) return false;
+    if (!Number.isFinite(payload.size) || payload.size < 0) return false;
+    if (!Number.isFinite(payload.ts) || payload.ts < 0) return false;
+    if (typeof payload.trackType !== "string") return false;
+
+    if (!Array.isArray(payload.chunkBytes)) return false;
+    if (payload.chunkBytes.length !== payload.size) return false;
+    if (payload.size > MAX_MEDIA_CHUNK_BYTES) return false;
+
+    return true;
+}
+
+function _handleMediaChunk(message, sender, sendResponse) {
+    if (!ENABLE_MEDIA_CHUNK_ROUTE) {
+        sendResponse({status: "ok", skipped: true});
+        return;
+    }
+
+    if (!_isValidMediaPayload(message.payload)) {
+        sendResponse({status: "error", reason: "invalid MEDIA_CHUNK payload"});
+        return;
+    }
+
+    const enrichedMessage = _enrichWithSenderMeta(message, sender);
+
+    try {
+        Transport.getInstance().sendMediaChunk(enrichedMessage);
+
+        _mediaSeen++;
+        if (_mediaSeen % MEDIA_LOG_EVERY_N === 0) {
+            console.log(
+                `[Background] MEDIA_CHUNK seq=${message.payload.seq} size=${message.payload.size} tabId=${sender.tab.id}`
+            );
+        }
+
+        sendResponse({status: "ok"});
+    } catch (err) {
+        console.error("[Background] Failed to route MEDIA_CHUNK:", err);
         sendResponse({status: "error", reason: err.message});
     }
 }
