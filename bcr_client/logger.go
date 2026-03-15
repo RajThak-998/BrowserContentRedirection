@@ -73,3 +73,17 @@ func tabURL(m Meta) string {
 	}
 	return m.TabURL
 }
+
+// LogMediaChunkLog prints a structured MEDIA_CHUNK_LOG block.
+func LogMediaChunkLog(clientID string, p MediaChunkLogPayload, m Meta) {
+	fmt.Println()
+	fmt.Println("┌─ MEDIA_CHUNK_LOG ────────────────────────")
+	fmt.Printf("│  Client      : %s\n", clientID)
+	fmt.Printf("│  Seq         : %d\n", p.Seq)
+	fmt.Printf("│  Size        : %d bytes\n", p.Size)
+	fmt.Printf("│  Track       : %s\n", p.TrackType)
+	fmt.Printf("│  Chunk TS    : %.2f ms\n", p.TS)
+	fmt.Printf("│  Host Recv   : %s\n", formatTime(p.HostReceivedMS))
+	fmt.Printf("│  Tab         : %s\n", tabURL(m))
+	fmt.Println("└────────────────────────────────────────────")
+}

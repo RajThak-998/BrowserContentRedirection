@@ -50,6 +50,25 @@ func HandlePacket(p Packet) {
 		log.Printf("[handler] VIDEO_REMOVED id=%s  ts=%d", payload.ID, payload.Timestamp)
 		overlayManager.Destroy(payload.ID)
 
+	case "MEDIA_CHUNK_LOG":
+		var payload MediaChunkLogPayload
+		if err := json.Unmarshal(p.Payload, &payload); err != nil {
+			log.Printf("[handler] MEDIA_CHUNK_LOG — failed to decode payload: %v", err)
+			return
+		}
+
+		// Meta is optional; decode best-effort.
+		var meta Meta
+		if len(p.Meta) > 0 {
+			if err := json.Unmarshal(p.Meta, &meta); err != nil {
+				log.Printf("[handler] MEDIA_CHUNK_LOG — failed to decode meta: %v", err)
+			}
+		}
+
+		log.Printf("[handler] MEDIA_CHUNK_LOG seq=%d size=%d track=%s",
+			payload.Seq, payload.Size, payload.TrackType)
+		LogMediaChunkLog("bcr_client_main", payload, meta)
+
 	default:
 		log.Printf("[handler] unknown packet type: %q", p.Type)
 	}

@@ -70,3 +70,13 @@ type Delta struct {
 	DW float64 `json:"dw"`
 	DH float64 `json:"dh"`
 }
+
+// MediaChunkLogPayload is the lightweight media summary forwarded by bcr_host.
+// It does NOT contain raw chunk bytes.
+type MediaChunkLogPayload struct {
+	Seq            int64   `json:"seq"`
+	Size           int     `json:"size"`
+	TS             float64 `json:"ts"`
+	TrackType      string  `json:"trackType"`
+	HostReceivedMS int64   `json:"hostReceivedMs"`
+}
