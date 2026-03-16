@@ -95,11 +95,14 @@ func handleMediaBinaryFrame(data []byte, registry *Registry) {
 		log.Printf("[router] MEDIA_CHUNK size mismatch header=%d actual=%d", hdr.Payload.Size, len(chunkBytes))
 	}
 
-	log.Printf("[router] MEDIA_CHUNK seq=%d size=%d track=%s",
+	log.Printf("[router] MEDIA_CHUNK seq=%d size=%d track=%s init=%v",
 		hdr.Payload.Seq,
 		len(chunkBytes),
 		hdr.Payload.TrackType,
+		hdr.Payload.IsInitSegment,
 	)
+
+	registry.Broadcast(websocket.BinaryMessage, data)
 
 	// Forward lightweight summary to clients (no raw chunk yet).
 	logPayload := MediaChunkLogPayload{
@@ -111,6 +114,7 @@ func handleMediaBinaryFrame(data []byte, registry *Registry) {
 		Codec:          hdr.Payload.Codec,
 		SourceBufferID: hdr.Payload.SourceBufferID,
 		HostReceivedMS: time.Now().UnixMilli(),
+		IsInitSegment:  hdr.Payload.IsInitSegment,
 	}
 
 	payloadRaw, err := json.Marshal(logPayload)

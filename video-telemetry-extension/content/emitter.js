@@ -99,6 +99,7 @@ class Emitter {
                 mimeType: payload.mimeType ?? "unknown",
                 codec: payload.codec ?? "unknown",
                 sourceBufferId: payload.sourceBufferId ?? "unknown",
+                isInitSegment: payload.isInitSegment === true,
                 chunkBytes: Array.from(chunkView),
             },
         });

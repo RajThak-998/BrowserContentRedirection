@@ -142,6 +142,7 @@ class Transport {
                 mimeType: payload.mimeType,
                 codec: payload.codec,
                 sourceBufferId: payload.sourceBufferId,
+                isInitSegment: payload.isInitSegment === true,
             },
             meta: event.meta ?? {},
         };
@@ -335,6 +336,8 @@ function _isValidMediaPayload(payload) {
     if (!Array.isArray(payload.chunkBytes)) return false;
     if (payload.chunkBytes.length !== payload.size) return false;
     if (payload.size > MAX_MEDIA_CHUNK_BYTES) return false;
+
+    if (typeof payload.isInitSegment !== "boolean") return false;
 
     return true;
 }

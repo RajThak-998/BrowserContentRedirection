@@ -88,5 +88,18 @@ func LogMediaChunkLog(clientID string, p MediaChunkLogPayload, m Meta) {
 	fmt.Printf("│  Chunk TS    : %.2f ms\n", p.TS)
 	fmt.Printf("│  Host Recv   : %s\n", formatTime(p.HostReceivedMS))
 	fmt.Printf("│  Tab         : %s\n", tabURL(m))
+	fmt.Printf("│  Init Seg    : %v\n", p.IsInitSegment)
 	fmt.Println("└────────────────────────────────────────────")
+}
+
+func LogMediaBufferSnapshot(s BufferSnapshot) {
+	fmt.Printf("[MediaBuffer] key=%s chunks=%d bytes=%d gaps=%d dropped=%d initSeq=%d lastSeq=%d\n",
+		s.TrackKey,
+		s.MediaChunkCount,
+		s.TotalBytes,
+		s.GapCount,
+		s.Dropped,
+		s.InitSeq,
+		s.LastSeq,
+	)
 }

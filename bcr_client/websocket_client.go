@@ -100,8 +100,11 @@ func (c *Client) connect(ctx context.Context) (wasConnected bool) {
 			return wasConnected
 		}
 
-		// Only handle text frames — binary frames are reserved for
-		// future media transport and ignored at this stage.
+		if msgType == websocket.BinaryMessage {
+			HandleMediaBinaryFrame(data)
+			continue
+		}
+
 		if msgType != websocket.TextMessage {
 			continue
 		}

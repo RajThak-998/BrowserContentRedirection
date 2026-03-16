@@ -8,7 +8,11 @@
 
     const sourceBufferMeta = new WeakMap();
     const sourceBufferIds = new WeakMap();
+    const initSeenBySourceBuffer = new WeakMap();
     let sourceBufferSeq = 0;
+
+    const SCAN_WINDOW_BYTES = 8192;
+    const MOOV_NEAR_START_BYTES = 2048;
 
     const originalAppendBuffer = SourceBuffer.prototype.appendBuffer;
     const originalChangeType = SourceBuffer.prototype.changeType;
@@ -62,6 +66,9 @@
             codec,
             sourceBufferId: getOrCreateSourceBufferId(sb),
         });
+
+        // Representation/type changes may introduce a fresh init segment.
+        initSeenBySourceBuffer.set(sb, false);
     }
 
     function patchAddSourceBuffer(ctorName) {
@@ -76,6 +83,63 @@
             } catch (_) {}
             return sb;
         };
+    }
+
+    function findAscii(u8, ascii, limit) {
+        const max = Math.min(limit, u8.length);
+        if (ascii.length === 0 || max < ascii.length) return -1;
+
+        outer:
+        for (let i = 0; i <= max - ascii.length; i++) {
+            for (let j = 0; j < ascii.length; j++) {
+                if (u8[i + j] !== ascii.charCodeAt(j)) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    function findBytes(u8, needle, limit) {
+        const max = Math.min(limit, u8.length);
+        if (needle.length === 0 || max < needle.length) return -1;
+
+        outer:
+        for (let i = 0; i <= max - needle.length; i++) {
+            for (let j = 0; j < needle.length; j++) {
+                if (u8[i + j] !== needle[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    function detectInitSegment(u8) {
+        const scanLimit = Math.min(SCAN_WINDOW_BYTES, u8.length);
+
+        // MP4: init likely contains ftyp + moov; fallback to moov near start.
+        const ftypPos = findAscii(u8, "ftyp", scanLimit);
+        const moovPos = findAscii(u8, "moov", scanLimit);
+        const isMp4Init =
+            (ftypPos !== -1 && moovPos !== -1) ||
+            (moovPos !== -1 && moovPos <= MOOV_NEAR_START_BYTES);
+
+        if (isMp4Init) return true;
+
+        // WebM: EBML header at start + Segment marker in scan window.
+        const ebml = [0x1A, 0x45, 0xDF, 0xA3];
+        const segment = [0x18, 0x53, 0x80, 0x67];
+
+        const hasEbmlAtStart =
+            u8.length >= 4 &&
+            u8[0] === ebml[0] &&
+            u8[1] === ebml[1] &&
+            u8[2] === ebml[2] &&
+            u8[3] === ebml[3];
+
+        const segmentPos = findBytes(u8, segment, scanLimit);
+        if (hasEbmlAtStart && segmentPos !== -1) return true;
+
+        return false;
     }
 
     patchAddSourceBuffer("MediaSource");
@@ -104,6 +168,16 @@
                     sourceBufferId: getOrCreateSourceBufferId(this),
                 };
 
+                let isInitSegment = false;
+                const initAlreadySeen = initSeenBySourceBuffer.get(this) === true;
+
+                if (!initAlreadySeen) {
+                    isInitSegment = detectInitSegment(copied);
+                    if (isInitSegment) {
+                        initSeenBySourceBuffer.set(this, true);
+                    }
+                }
+
                 window.postMessage(
                     {
                         type: "BCR_MEDIA_CHUNK",
@@ -113,6 +187,7 @@
                         mimeType: meta.mimeType,
                         codec: meta.codec,
                         sourceBufferId: meta.sourceBufferId,
+                        isInitSegment,
                         chunkBuffer: copied.buffer,
                     },
                     "*",

@@ -24,6 +24,7 @@ type MediaChunkHeader struct {
 	MimeType       string  `json:"mimeType"`
 	Codec          string  `json:"codec"`
 	SourceBufferID string  `json:"sourceBufferId"`
+	IsInitSegment  bool    `json:"isInitSegment"`
 }
 
 // What host forwards to clients instead of raw bytes.
@@ -35,5 +36,6 @@ type MediaChunkLogPayload struct {
 	MimeType       string  `json:"mimeType"`
 	Codec          string  `json:"codec"`
 	SourceBufferID string  `json:"sourceBufferId"`
+	IsInitSegment  bool    `json:"isInitSegment"`
 	HostReceivedMS int64   `json:"hostReceivedMs"`
 }

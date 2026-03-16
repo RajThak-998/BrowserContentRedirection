@@ -56,6 +56,7 @@
             const mimeType = data.mimeType ?? "unknown";
             const codec = data.codec ?? "unknown";
             const sourceBufferId = data.sourceBufferId ?? "unknown";
+            const isInitSegment = data.isInitSegment === true;
 
             if (_windowCount % 50 === 0) {
                 console.log("[BCR] media chunk received:", size);
@@ -78,6 +79,7 @@
                 mimeType,
                 codec,
                 sourceBufferId,
+                isInitSegment,
                 chunk: chunkBuffer,
             });
         };

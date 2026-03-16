@@ -451,3 +451,85 @@ VIDEO_REMOVED
 | Browser window offset calibration | `videoTracker.js: _readState()` | Add `window.screenX/Y` correction factor configurable via extension options page |
 | Playback control forwarding | `packet_handler.go` | Send control messages back through bcr_host to extension |
 | WebRTC frame capture | `videoTracker.js` | Capture frames via `canvas.drawImage(video)` → send as binary WS frames |
+
+
+
+
+# Rough Architecture 
+
+                   ┌─────────────────────────┐
+                   │        Browser          │
+                   │   (YouTube Player)     │
+                   └───────────┬────────────┘
+                               │
+                               │ MediaSource / MSE
+                               │
+                        appendBuffer(chunk)
+                               │
+                               ▼
+                   ┌─────────────────────────┐
+                   │     pageInterceptor     │
+                   │   (Page World Script)   │
+                   │                         │
+                   │ intercept appendBuffer  │
+                   │ detect track type       │
+                   │ detect init segment     │
+                   │ attach metadata         │
+                   └───────────┬────────────┘
+                               │
+                               │ postMessage
+                               │ (transferable buffer)
+                               ▼
+                   ┌─────────────────────────┐
+                   │      Content Script     │
+                   │        bootstrap        │
+                   │                         │
+                   │ receive chunk event     │
+                   │ sequence numbering      │
+                   │ queue / rate guards     │
+                   └───────────┬────────────┘
+                               │
+                               ▼
+                   ┌─────────────────────────┐
+                   │         Emitter         │
+                   │                         │
+                   │ emitMediaChunk()        │
+                   │ unify messaging path    │
+                   └───────────┬────────────┘
+                               │
+                               │ chrome.runtime.sendMessage
+                               ▼
+                   ┌─────────────────────────┐
+                   │       background.js     │
+                   │                         │
+                   │ validate payload        │
+                   │ attach tab metadata     │
+                   │ route to transport      │
+                   └───────────┬────────────┘
+                               │
+                               ▼
+                   ┌─────────────────────────┐
+                   │        Transport        │
+                   │                         │
+                   │ binary frame encoding   │
+                   │                         │
+                   │ [headerLen][header][data]
+                   └───────────┬────────────┘
+                               │
+                               │ WebSocket
+                               ▼
+                   ┌─────────────────────────┐
+                   │         bcr_host        │
+                   │                         │
+                   │ parse binary frame      │
+                   │ log / forward summary   │
+                   └───────────┬────────────┘
+                               │
+                               ▼
+                   ┌─────────────────────────┐
+                   │        bcr_client       │
+                   │                         │
+                   │ log metadata            │
+                   │ future: reconstruct MSE │
+                   │ future: decode/render   │
+                   └─────────────────────────┘

@@ -80,6 +80,7 @@ type MediaChunkHeader struct {
 	MimeType       string  `json:"mimeType"`
 	Codec          string  `json:"codec"`
 	SourceBufferID string  `json:"sourceBufferId"`
+	IsInitSegment  bool    `json:"isInitSegment"`
 }
 
 // MediaChunkLogPayload is the lightweight media summary forwarded by bcr_host.
@@ -93,4 +94,12 @@ type MediaChunkLogPayload struct {
 	Codec          string  `json:"codec"`
 	SourceBufferID string  `json:"sourceBufferId"`
 	HostReceivedMS int64   `json:"hostReceivedMs"`
+	IsInitSegment  bool    `json:"isInitSegment"`
+}
+
+// MediaChunkFrameHeader is the JSON header embedded in each binary media frame.
+type MediaChunkFrameHeader struct {
+	Type    string           `json:"type"`
+	Payload MediaChunkHeader `json:"payload"`
+	Meta    json.RawMessage  `json:"meta,omitempty"`
 }
