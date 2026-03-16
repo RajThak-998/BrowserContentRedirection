@@ -107,6 +107,9 @@ func handleMediaBinaryFrame(data []byte, registry *Registry) {
 		Size:           len(chunkBytes),
 		TS:             hdr.Payload.TS,
 		TrackType:      hdr.Payload.TrackType,
+		MimeType:       hdr.Payload.MimeType,
+		Codec:          hdr.Payload.Codec,
+		SourceBufferID: hdr.Payload.SourceBufferID,
 		HostReceivedMS: time.Now().UnixMilli(),
 	}
 

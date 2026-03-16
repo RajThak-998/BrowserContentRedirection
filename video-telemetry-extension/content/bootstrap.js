@@ -2,7 +2,6 @@
     const ENABLE_MEDIA_INTERCEPT = true;
     const ENABLE_MEDIA_FORWARD = true;
 
-    // Rate protection for MEDIA_CHUNK forwarding (content -> background).
     const MEDIA_WINDOW_MS = 1000;
     const MAX_MEDIA_EVENTS_PER_WINDOW = 250;
 
@@ -15,7 +14,6 @@
     let _droppedInWindow = 0;
 
     function _injectPageInterceptor() {
-        // Idempotent guard if start() is ever called more than once.
         if (document.getElementById("bcr-page-interceptor")) return;
 
         const script = document.createElement("script");
@@ -55,8 +53,10 @@
             const size = chunkBuffer.byteLength;
             const ts = typeof data.ts === "number" ? data.ts : now;
             const trackType = data.trackType ?? "unknown";
+            const mimeType = data.mimeType ?? "unknown";
+            const codec = data.codec ?? "unknown";
+            const sourceBufferId = data.sourceBufferId ?? "unknown";
 
-            // Keep minimal visibility without flooding.
             if (_windowCount % 50 === 0) {
                 console.log("[BCR] media chunk received:", size);
             }
@@ -71,10 +71,13 @@
             _windowCount++;
 
             Emitter.getInstance().emitMediaChunk({
-                seq: ++_mediaSeq, // sequence generated in content layer
+                seq: ++_mediaSeq,
                 size,
                 ts,
                 trackType,
+                mimeType,
+                codec,
+                sourceBufferId,
                 chunk: chunkBuffer,
             });
         };
@@ -85,7 +88,6 @@
 
     function _detachMediaChunkListener() {
         if (!_mediaListenerAttached || !_onWindowMessage) return;
-
         window.removeEventListener("message", _onWindowMessage);
         _onWindowMessage = null;
         _mediaListenerAttached = false;
@@ -93,12 +95,6 @@
 
     function start() {
         console.log("[Bootstrap] BCR Video Telemetry starting...");
-
-        if (ENABLE_MEDIA_INTERCEPT) {
-            _attachMediaChunkListener();
-            _injectPageInterceptor();
-        }
-
         VideoRegistry.getInstance().init();
         console.log("[Bootstrap] Registry initialized. Tracking active.");
     }
@@ -110,10 +106,13 @@
         VideoRegistry.getInstance().destroy();
     }
 
-    if (
-        document.readyState === "complete" ||
-        document.readyState === "interactive"
-    ) {
+    // IMPORTANT: inject and attach as early as possible.
+    if (ENABLE_MEDIA_INTERCEPT) {
+        _attachMediaChunkListener();
+        _injectPageInterceptor();
+    }
+
+    if (document.readyState === "complete" || document.readyState === "interactive") {
         start();
     } else {
         document.addEventListener("DOMContentLoaded", start, {once: true});

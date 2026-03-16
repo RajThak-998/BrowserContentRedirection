@@ -96,6 +96,9 @@ class Emitter {
                 size: payload.size,
                 ts: payload.ts,
                 trackType: payload.trackType ?? "unknown",
+                mimeType: payload.mimeType ?? "unknown",
+                codec: payload.codec ?? "unknown",
+                sourceBufferId: payload.sourceBufferId ?? "unknown",
                 chunkBytes: Array.from(chunkView),
             },
         });

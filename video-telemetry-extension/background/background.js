@@ -139,6 +139,9 @@ class Transport {
                 size: payload.size,
                 ts: payload.ts,
                 trackType: payload.trackType,
+                mimeType: payload.mimeType,
+                codec: payload.codec,
+                sourceBufferId: payload.sourceBufferId,
             },
             meta: event.meta ?? {},
         };
@@ -311,12 +314,23 @@ function _handleTelemetry(message, sender, sendResponse) {
     }
 }
 
+function _isValidTrackType(trackType) {
+    return trackType === "audio" ||
+        trackType === "video" ||
+        trackType === "text" ||
+        trackType === "unknown";
+}
+
 function _isValidMediaPayload(payload) {
     if (!payload) return false;
     if (!Number.isFinite(payload.seq) || payload.seq <= 0) return false;
     if (!Number.isFinite(payload.size) || payload.size < 0) return false;
     if (!Number.isFinite(payload.ts) || payload.ts < 0) return false;
-    if (typeof payload.trackType !== "string") return false;
+    if (!_isValidTrackType(payload.trackType)) return false;
+
+    if (typeof payload.mimeType !== "string") return false;
+    if (typeof payload.codec !== "string") return false;
+    if (typeof payload.sourceBufferId !== "string") return false;
 
     if (!Array.isArray(payload.chunkBytes)) return false;
     if (payload.chunkBytes.length !== payload.size) return false;

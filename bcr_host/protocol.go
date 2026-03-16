@@ -17,10 +17,13 @@ type MediaChunkFrameHeader struct {
 }
 
 type MediaChunkHeader struct {
-	Seq       int64   `json:"seq"`
-	Size      int     `json:"size"`
-	TS        float64 `json:"ts"`
-	TrackType string  `json:"trackType"`
+	Seq            int64   `json:"seq"`
+	Size           int     `json:"size"`
+	TS             float64 `json:"ts"`
+	TrackType      string  `json:"trackType"`
+	MimeType       string  `json:"mimeType"`
+	Codec          string  `json:"codec"`
+	SourceBufferID string  `json:"sourceBufferId"`
 }
 
 // What host forwards to clients instead of raw bytes.
@@ -29,5 +32,8 @@ type MediaChunkLogPayload struct {
 	Size           int     `json:"size"`
 	TS             float64 `json:"ts"`
 	TrackType      string  `json:"trackType"`
+	MimeType       string  `json:"mimeType"`
+	Codec          string  `json:"codec"`
+	SourceBufferID string  `json:"sourceBufferId"`
 	HostReceivedMS int64   `json:"hostReceivedMs"`
 }
