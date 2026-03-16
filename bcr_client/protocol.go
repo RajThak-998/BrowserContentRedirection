@@ -71,6 +71,17 @@ type Delta struct {
 	DH float64 `json:"dh"`
 }
 
+// MediaChunkHeader is the header for each media chunk.
+type MediaChunkHeader struct {
+	Seq            int64   `json:"seq"`
+	Size           int     `json:"size"`
+	TS             float64 `json:"ts"`
+	TrackType      string  `json:"trackType"`
+	MimeType       string  `json:"mimeType"`
+	Codec          string  `json:"codec"`
+	SourceBufferID string  `json:"sourceBufferId"`
+}
+
 // MediaChunkLogPayload is the lightweight media summary forwarded by bcr_host.
 // It does NOT contain raw chunk bytes.
 type MediaChunkLogPayload struct {
@@ -78,5 +89,8 @@ type MediaChunkLogPayload struct {
 	Size           int     `json:"size"`
 	TS             float64 `json:"ts"`
 	TrackType      string  `json:"trackType"`
+	MimeType       string  `json:"mimeType"`
+	Codec          string  `json:"codec"`
+	SourceBufferID string  `json:"sourceBufferId"`
 	HostReceivedMS int64   `json:"hostReceivedMs"`
 }
