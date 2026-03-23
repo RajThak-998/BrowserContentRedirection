@@ -8,7 +8,9 @@
 
 const ENABLE_MEDIA_CHUNK_ROUTE = true;
 const MEDIA_LOG_EVERY_N = 100;
+const CHUNK_META_LOG_EVERY_N = 50;
 const MAX_MEDIA_CHUNK_BYTES = 4 * 1024 * 1024; // 4MB safety cap per chunk
+const HARD_MAX_MEDIA_CHUNK_BYTES = 16 * 1024 * 1024; // hard cap to prevent memory pressure crashes
 
 // ─── Media Counters ─────────────────────────────────────────────────────────
 
@@ -123,7 +125,9 @@ class Transport {
 
     _enqueueMedia(event) {
         if (this._pendingMediaQueue.length >= this._MAX_MEDIA_QUEUE) {
-            this._pendingMediaQueue.shift();
+            const dropped = this._pendingMediaQueue.shift();
+            const droppedSize = dropped?.payload?.size;
+            console.warn(`[Chunk] DROP_BLOCKED reason=media_queue_overflow size=${Number.isFinite(droppedSize) ? droppedSize : -1}`);
         }
         this._pendingMediaQueue.push(event);
     }
@@ -322,24 +326,64 @@ function _isValidTrackType(trackType) {
         trackType === "unknown";
 }
 
-function _isValidMediaPayload(payload) {
-    if (!payload) return false;
-    if (!Number.isFinite(payload.seq) || payload.seq <= 0) return false;
-    if (!Number.isFinite(payload.size) || payload.size < 0) return false;
-    if (!Number.isFinite(payload.ts) || payload.ts < 0) return false;
-    if (!_isValidTrackType(payload.trackType)) return false;
+function _normalizeMediaPayload(payload) {
+    if (!payload || typeof payload !== "object") {
+        return {ok: false, reason: "payload_missing", size: -1};
+    }
 
-    if (typeof payload.mimeType !== "string") return false;
-    if (typeof payload.codec !== "string") return false;
-    if (typeof payload.sourceBufferId !== "string") return false;
+    if (!Array.isArray(payload.chunkBytes)) {
+        return {ok: false, reason: "chunk_bytes_missing", size: -1};
+    }
 
-    if (!Array.isArray(payload.chunkBytes)) return false;
-    if (payload.chunkBytes.length !== payload.size) return false;
-    if (payload.size > MAX_MEDIA_CHUNK_BYTES) return false;
+    const actualSize = payload.chunkBytes.length;
+    if (actualSize > HARD_MAX_MEDIA_CHUNK_BYTES) {
+        return {ok: false, reason: "hard_size_cap", size: actualSize};
+    }
 
-    if (typeof payload.isInitSegment !== "boolean") return false;
+    if (actualSize > MAX_MEDIA_CHUNK_BYTES) {
+        console.warn(`[Chunk] soft_size_warning size=${actualSize} cap=${MAX_MEDIA_CHUNK_BYTES}`);
+    }
 
-    return true;
+    const declaredSize = Number.isFinite(payload.size) && payload.size >= 0
+        ? payload.size
+        : actualSize;
+
+    if (declaredSize !== actualSize) {
+        console.warn(`[Chunk] size_mismatch declared=${declaredSize} actual=${actualSize}`);
+    }
+
+    const seq = Number.isFinite(payload.seq) && payload.seq > 0
+        ? Math.trunc(payload.seq)
+        : Date.now();
+
+    const ts = Number.isFinite(payload.ts) && payload.ts >= 0
+        ? payload.ts
+        : performance.now();
+
+    const trackType = _isValidTrackType(payload.trackType)
+        ? payload.trackType
+        : "unknown";
+
+    return {
+        ok: true,
+        payload: {
+            seq,
+            size: actualSize,
+            ts,
+            trackType,
+            mimeType: typeof payload.mimeType === "string" && payload.mimeType.length > 0
+                ? payload.mimeType
+                : "unknown",
+            codec: typeof payload.codec === "string" && payload.codec.length > 0
+                ? payload.codec
+                : "unknown",
+            sourceBufferId: typeof payload.sourceBufferId === "string" && payload.sourceBufferId.length > 0
+                ? payload.sourceBufferId
+                : "unknown",
+            isInitSegment: payload.isInitSegment === true,
+            chunkBytes: payload.chunkBytes,
+        },
+    };
 }
 
 function _handleMediaChunk(message, sender, sendResponse) {
@@ -348,20 +392,33 @@ function _handleMediaChunk(message, sender, sendResponse) {
         return;
     }
 
-    if (!_isValidMediaPayload(message.payload)) {
+    const normalized = _normalizeMediaPayload(message.payload);
+    if (!normalized.ok) {
+        console.warn(`[Chunk] DROP_BLOCKED reason=${normalized.reason} size=${normalized.size}`);
         sendResponse({status: "error", reason: "invalid MEDIA_CHUNK payload"});
         return;
     }
 
-    const enrichedMessage = _enrichWithSenderMeta(message, sender);
+    const normalizedMessage = {
+        ...message,
+        payload: normalized.payload,
+    };
+
+    const enrichedMessage = _enrichWithSenderMeta(normalizedMessage, sender);
 
     try {
         Transport.getInstance().sendMediaChunk(enrichedMessage);
 
+        if (normalized.payload.isInitSegment || normalized.payload.seq % CHUNK_META_LOG_EVERY_N === 0) {
+            console.log(
+                `[ChunkMeta] seq=${normalized.payload.seq} track=${normalized.payload.trackType} mime=${normalized.payload.mimeType} codec=${normalized.payload.codec} size=${normalized.payload.size}`
+            );
+        }
+
         _mediaSeen++;
         if (_mediaSeen % MEDIA_LOG_EVERY_N === 0) {
             console.log(
-                `[Background] MEDIA_CHUNK seq=${message.payload.seq} size=${message.payload.size} tabId=${sender.tab.id}`
+                `[Background] MEDIA_CHUNK seq=${normalized.payload.seq} size=${normalized.payload.size} tabId=${sender.tab.id}`
             );
         }
 

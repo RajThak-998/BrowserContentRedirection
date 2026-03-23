@@ -9,6 +9,7 @@
     const sourceBufferMeta = new WeakMap();
     const sourceBufferIds = new WeakMap();
     const initSeenBySourceBuffer = new WeakMap();
+    const loggedFormats = new Set();
     let sourceBufferSeq = 0;
 
     const SCAN_WINDOW_BYTES = 8192;
@@ -167,6 +168,12 @@
                     codec: "unknown",
                     sourceBufferId: getOrCreateSourceBufferId(this),
                 };
+
+                const formatKey = `${meta.trackType}|${meta.mimeType}|${meta.codec}`;
+                if (!loggedFormats.has(formatKey)) {
+                    loggedFormats.add(formatKey);
+                    console.log(`[Format] track=${meta.trackType} mime=${meta.mimeType} codec=${meta.codec}`);
+                }
 
                 let isInitSegment = false;
                 const initAlreadySeen = initSeenBySourceBuffer.get(this) === true;

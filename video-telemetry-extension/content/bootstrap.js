@@ -3,7 +3,7 @@
     const ENABLE_MEDIA_FORWARD = true;
 
     const MEDIA_WINDOW_MS = 1000;
-    const MAX_MEDIA_EVENTS_PER_WINDOW = 250;
+    const MAX_MEDIA_EVENTS_PER_WINDOW = 2500;
 
     let _mediaListenerAttached = false;
     let _onWindowMessage = null;
@@ -37,6 +37,8 @@
 
     function _attachMediaChunkListener() {
         if (_mediaListenerAttached) return;
+
+        console.log("[Throttle] relaxed mode active");
 
         _onWindowMessage = (event) => {
             if (event.source !== window) return;
