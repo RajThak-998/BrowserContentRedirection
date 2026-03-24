@@ -8,7 +8,9 @@
     let _mediaListenerAttached = false;
     let _onWindowMessage = null;
 
-    let _mediaSeq = 0;
+    let _videoSeq = 0;
+    let _audioSeq = 0;
+    let _otherSeq = 0;
     let _windowStartTs = performance.now();
     let _windowCount = 0;
     let _droppedInWindow = 0;
@@ -73,8 +75,18 @@
 
             _windowCount++;
 
+            // Per-track sequence counters to avoid interleaved gaps.
+            let seqNum;
+            if (trackType === "video") {
+                seqNum = ++_videoSeq;
+            } else if (trackType === "audio") {
+                seqNum = ++_audioSeq;
+            } else {
+                seqNum = ++_otherSeq;
+            }
+
             Emitter.getInstance().emitMediaChunk({
-                seq: ++_mediaSeq,
+                seq: seqNum,
                 size,
                 ts,
                 trackType,

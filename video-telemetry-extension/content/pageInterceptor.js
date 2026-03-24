@@ -175,15 +175,9 @@
                     console.log(`[Format] track=${meta.trackType} mime=${meta.mimeType} codec=${meta.codec}`);
                 }
 
-                let isInitSegment = false;
-                const initAlreadySeen = initSeenBySourceBuffer.get(this) === true;
-
-                if (!initAlreadySeen) {
-                    isInitSegment = detectInitSegment(copied);
-                    if (isInitSegment) {
-                        initSeenBySourceBuffer.set(this, true);
-                    }
-                }
+                // Always scan for init segments — YouTube sends new init
+                // segments during ABR quality switches without calling changeType().
+                const isInitSegment = detectInitSegment(copied);
 
                 window.postMessage(
                     {
