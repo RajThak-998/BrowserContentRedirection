@@ -10,6 +10,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+
 // ReadLoop blocks on reading messages from a single connection.
 // It routes messages based on the connection's role:
 //   - extension text:   broadcast unchanged (existing VIDEO_* telemetry)
@@ -57,12 +58,24 @@ func handleExtensionMessage(msgType int, data []byte, registry *Registry) {
 		// Existing telemetry path unchanged.
 		registry.Broadcast(msgType, data)
 
+		if isVideoUpdatePacket(data){
+			mediaBridge.tryForwardText(data)
+		}
+
 	case websocket.BinaryMessage:
 		handleMediaBinaryFrame(data, registry)
 
 	default:
 		log.Printf("[router] unsupported extension msgType=%d (%d bytes) — dropped", msgType, len(data))
 	}
+}
+
+func isVideoUpdatePacket(data []byte) bool {
+	var pkt Packet
+	if err := json.Unmarshal(data, &pkt); err != nil {
+		return false
+	}
+	return pkt.Type == "VIDEO_UPDATE"
 }
 
 func handleMediaBinaryFrame(data []byte, registry *Registry) {
@@ -145,7 +158,7 @@ func handleMediaBinaryFrame(data []byte, registry *Registry) {
 		return
 	}
 
-	mediaBridge.tryForward(
+	mediaBridge.tryForwardBinary(
 		hdr.Payload.TrackType,
 		hdr.Payload.MimeType,
 		hdr.Payload.Seq,
@@ -166,6 +179,19 @@ const (
 	bridgeFilterMode = "all"
 )
 
+
+
+type bridgeMessage struct {
+	msgType int
+	kind string
+	data []byte
+
+	track string
+	mime string
+	seq int64
+	init bool
+}
+
 type bridgeChunk struct {
 	track string
 	mime  string
@@ -176,15 +202,41 @@ type bridgeChunk struct {
 
 type bridgeForwarder struct {
 	startOnce sync.Once
-	sendCh    chan bridgeChunk
+	sendCh    chan bridgeMessage
 }
 
 var mediaBridge = newBridgeForwarder()
 
 func newBridgeForwarder() *bridgeForwarder {
 	return &bridgeForwarder{
-		sendCh: make(chan bridgeChunk, bridgeQueueSize),
+		sendCh: make(chan bridgeMessage, bridgeQueueSize),
 	}
+}
+
+
+func (b *bridgeForwarder) writeLoop(conn *websocket.Conn) error {
+	for msg := range b.sendCh{
+		if err := conn.WriteMessage(msg.msgType, msg.data);
+		err != nil {
+			log.Printf("[Bridge] ERROR send failed type=%d kind=%s: %v", msg.msgType, msg.kind, err)
+			return err
+		}
+
+		if msg.kind == "telemetry" {
+			log.Printf("[Bridge] FORWARD telemetry type=text size=%d", len(msg.data))
+			continue
+		}
+
+		if msg.init {
+			log.Printf("[Bridge] INIT track=%s mime=%s size=%d", msg.track, msg.mime, len(msg.data))
+		}
+
+		if msg.init || msg.seq%50 == 0 {
+			log.Printf("[Bridge] FORWARD media type=binary track=%s mime=%s size=%d seq=%d",msg.track, msg.mime, len(msg.data), msg.seq)
+		}
+	}
+
+	return nil
 }
 
 func (b *bridgeForwarder) start() {
@@ -217,25 +269,6 @@ func (b *bridgeForwarder) run() {
 	}
 }
 
-func (b *bridgeForwarder) writeLoop(conn *websocket.Conn) error {
-	for msg := range b.sendCh {
-		if err := conn.WriteMessage(websocket.BinaryMessage, msg.data); err != nil {
-			log.Printf("[Bridge] ERROR send failed: %v", err)
-			return err
-		}
-
-		if msg.init {
-			log.Printf("[Bridge] INIT track=%s mime=%s size=%d", msg.track, msg.mime, len(msg.data))
-		}
-
-		if msg.init || msg.seq%50 == 0 {
-			log.Printf("[Bridge] FORWARD track=%s mime=%s size=%d seq=%d",
-				msg.track, msg.mime, len(msg.data), msg.seq)
-		}
-	}
-
-	return nil
-}
 
 func bridgeShouldForward(track string, isInit bool) (bool, string) {
 	// Always forward init segments.
@@ -262,26 +295,49 @@ func bridgeShouldForward(track string, isInit bool) (bool, string) {
 	}
 }
 
-func (b *bridgeForwarder) tryForward(track, mime string, seq int64, isInit bool, data []byte) {
-	b.start()
 
+func (b *bridgeForwarder) tryForwardBinary(track, mime string, seq int64, isInit bool, data []byte) {
+	b.start()
 	ok, reason := bridgeShouldForward(track, isInit)
 	if !ok {
 		log.Printf("[Bridge] SKIP track=%s reason=%s", track, reason)
 		return
 	}
 
-	payload := append([]byte(nil), data...) // decouple from caller memory
+	payload := append([]byte(nil), data...)
 
 	select {
-	case b.sendCh <- bridgeChunk{
-		track: track,
-		mime:  mime,
-		seq:   seq,
-		init:  isInit,
-		data:  payload,
-	}:
-	default:
-		log.Printf("[Bridge] SKIP track=%s reason=bridge_queue_full", track)
+		case b.sendCh <- bridgeMessage{
+			msgType: websocket.BinaryMessage,
+			kind: "media",
+			data: payload,
+			track: track,
+			mime: mime,
+			seq: seq,
+			init: isInit,
+		}:
+		default:
+			log.Printf("[Bridge] SKIP track=%s reason=bridge_queue_full", track)
+	}
+}
+
+func (b *bridgeForwarder) tryForwardText(data []byte) {
+	b.start()
+	if len(b.sendCh) > (bridgeQueueSize*3)/4 {
+		log.Printf("[Bridge] SKIP telemetry reason=bridge_busy")
+		return
+	}
+
+	payload := append([]byte(nil), data...)
+
+	select {
+		case b.sendCh <- bridgeMessage{
+			msgType: websocket.TextMessage,
+			kind: "telemetry",
+			data: payload,
+		}:
+			log.Printf("[Bridge] queued telemetry VIDEO_UPDATE (%d bytes)", len(payload))
+		default:
+			log.Printf("[Bridge] SKIP telemetry reason=bridge_queue_full")
 	}
 }

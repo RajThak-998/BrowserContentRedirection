@@ -7,7 +7,9 @@ import (
 	"log"
 	"net"
 	"net/http"
-
+	"sync"
+	"time"
+	"math"
 	"github.com/gorilla/websocket"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -16,7 +18,26 @@ import (
 type App struct {
 	ctx        context.Context
 	signalConn net.Conn
+
+	windowMu	sync.Mutex
+	lastWindowApply time.Time
 }
+
+const telemetryWindowThrottle = 33*time.Millisecond
+
+type VideoUpdate struct {
+	Type string `json:"type"`
+	Payload struct {
+		ScreenBounds struct {
+			X	float64	`json:"x"`
+			Y	float64	`json:"y"`
+			Width float64	`json:"width"`
+			Height float64	`json:"height"`
+		}	`json:"screenBounds"`
+	}	`json:"payload"`
+}
+
+
 
 // NewApp creates a new App application struct
 func NewApp() *App {
@@ -119,6 +140,49 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+
+func (a *App) applyWindowFromTelemetry(x, y, w, h float64) {
+	ix := int(math.Round(x))
+	iy := int(math.Round(y))
+	iw := int(math.Round(w))
+	ih := int(math.Round(h))
+
+	if iw<1 || ih <1 {
+		return
+	}
+
+	now := time.Now()
+
+	a.windowMu.Lock()
+	if !a.lastWindowApply.IsZero() && now.Sub(a.lastWindowApply) < telemetryWindowThrottle {
+		a.windowMu.Unlock()
+		return
+	}
+
+	a.lastWindowApply = now
+	a.windowMu.Unlock()
+
+	a.SetWindowPosition(ix, iy)
+	a.SetWindowSize(iw, ih)
+
+	log.Printf("[Telemetry] VIDEO_UPDATE applied pos=(%d, %d) size=(%d, %d)", ix, iy, iw, ih)
+}
+
+func (a *App) handleVideoUpdateTelemetry(message []byte) bool {
+	var evt VideoUpdate
+	if err := json.Unmarshal(message, &evt); err != nil {
+		return false
+	}
+	if evt.Type != "VIDEO_UPDATE" {
+		return false
+	}
+
+	b := evt.Payload.ScreenBounds
+	a.applyWindowFromTelemetry(b.X, b.Y, b.Width, b.Height)
+	return true
+}
+
+
 // startWebSocketServer listens for incoming byte chunks
 func (a *App) startWebSocketServer() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -137,10 +201,15 @@ func (a *App) startWebSocketServer() {
 				break
 			}
 
-			log.Printf("WebSocket received message of type: %d, size: %d bytes", mt, len(message))
+			// log.Printf("WebSocket received message of type: %d, size: %d bytes", mt, len(message))
 
 			// Process Text messages as JSON Window commands
 			if mt == websocket.TextMessage {
+
+				if a.handleVideoUpdateTelemetry(message) {
+					continue
+				}
+
 				var cmd struct {
 					X      *int  `json:"x"`
 					Y      *int  `json:"y"`

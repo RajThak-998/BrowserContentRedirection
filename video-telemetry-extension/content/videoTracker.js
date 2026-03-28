@@ -85,7 +85,7 @@ class VideoTracker {
         const chromeUIHeight = window.outerHeight - window.innerHeight;
         const screenBounds = {
             x:      rect.left  + window.screenX,
-            y:      rect.top   + window.screenY + chromeUIHeight,
+            y:      rect.top   + window.screenY,
             width:  rect.width,
             height: rect.height,
         };
