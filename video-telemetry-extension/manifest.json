@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "BCR Video Telemetry",
   "version": "0.1.0",
-  "description": "Phase 1 — Detects and tracks video elements, emits position and state telemetry to a local endpoint.",
+  "description": "Detects and suppresses the primary video element; forwards all MSE chunks to the BCR WebRTC pipeline.",
 
   "permissions": [
     "activeTab",
@@ -21,6 +21,14 @@
     {
       "matches": ["<all_urls>"],
       "run_at": "document_start",
+      "world": "MAIN",
+      "js": [
+        "content/pageInterceptor.js"
+      ]
+    },
+    {
+      "matches": ["<all_urls>"],
+      "run_at": "document_start",
       "js": [
         "utils/throttle.js",
         "content/stateManager.js",
@@ -31,13 +39,6 @@
         "content/videoRegistry.js",
         "content/bootstrap.js"
       ]
-    }
-  ],
-
-  "web_accessible_resources": [
-    {
-      "resources": ["content/pageInterceptor.js"],
-      "matches": ["<all_urls>"]
     }
   ]
 }

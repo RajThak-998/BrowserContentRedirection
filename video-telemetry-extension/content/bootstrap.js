@@ -1,5 +1,10 @@
 (() => {
-    const ENABLE_MEDIA_INTERCEPT = true;
+    // pageInterceptor.js runs in the page's JS world (world: MAIN) via the
+    // manifest — no script-tag injection needed here.
+    // This isolated-world bootstrap only needs to:
+    //   1. Listen for BCR_MEDIA_CHUNK postMessages from page world.
+    //   2. Forward them to the Emitter (background service worker).
+
     const ENABLE_MEDIA_FORWARD = true;
 
     const MEDIA_WINDOW_MS = 1000;
@@ -15,15 +20,6 @@
     let _windowCount = 0;
     let _droppedInWindow = 0;
 
-    function _injectPageInterceptor() {
-        if (document.getElementById("bcr-page-interceptor")) return;
-
-        const script = document.createElement("script");
-        script.id = "bcr-page-interceptor";
-        script.src = chrome.runtime.getURL("content/pageInterceptor.js");
-        script.onload = () => script.remove();
-        (document.head || document.documentElement).appendChild(script);
-    }
 
     function _rotateMediaWindowIfNeeded(now) {
         if (now - _windowStartTs < MEDIA_WINDOW_MS) return;
@@ -122,11 +118,9 @@
         VideoRegistry.getInstance().destroy();
     }
 
-    // IMPORTANT: inject and attach as early as possible.
-    if (ENABLE_MEDIA_INTERCEPT) {
-        _attachMediaChunkListener();
-        _injectPageInterceptor();
-    }
+    // pageInterceptor.js (world: MAIN) is already active via the manifest.
+    // We only need to attach the postMessage listener on the isolated-world side.
+    _attachMediaChunkListener();
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
         start();
