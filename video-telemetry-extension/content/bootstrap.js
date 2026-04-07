@@ -24,10 +24,6 @@
     function _rotateMediaWindowIfNeeded(now) {
         if (now - _windowStartTs < MEDIA_WINDOW_MS) return;
 
-        if (_droppedInWindow > 0) {
-            console.warn(`[BCR] media chunk drops in last window: ${_droppedInWindow}`);
-        }
-
         _windowStartTs = now;
         _windowCount = 0;
         _droppedInWindow = 0;
@@ -35,8 +31,6 @@
 
     function _attachMediaChunkListener() {
         if (_mediaListenerAttached) return;
-
-        console.log("[Throttle] relaxed mode active");
 
         _onWindowMessage = (event) => {
             if (event.source !== window) return;
@@ -57,10 +51,6 @@
             const codec = data.codec ?? "unknown";
             const sourceBufferId = data.sourceBufferId ?? "unknown";
             const isInitSegment = data.isInitSegment === true;
-
-            if (_windowCount % 50 === 0) {
-                console.log("[BCR] media chunk received:", size);
-            }
 
             if (!ENABLE_MEDIA_FORWARD) return;
 
@@ -106,13 +96,10 @@
     }
 
     function start() {
-        console.log("[Bootstrap] BCR Video Telemetry starting...");
         VideoRegistry.getInstance().init();
-        console.log("[Bootstrap] Registry initialized. Tracking active.");
     }
 
     function stop() {
-        console.log("[Bootstrap] Page unloading. Tearing down...");
         _detachMediaChunkListener();
         OverlayRenderer.getInstance().destroyAll();
         VideoRegistry.getInstance().destroy();

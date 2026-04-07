@@ -42,6 +42,11 @@
     const origChangeType      = SourceBuffer.prototype.changeType; // may be undefined
     const origAddSourceBuffer = MediaSource.prototype?.addSourceBuffer;
 
+    // Save RTCPeerConnection method originals for a transparent canary hook.
+    const rtcProto = window.RTCPeerConnection?.prototype;
+    const origSetLocalDescription = rtcProto?.setLocalDescription;
+    const origSetRemoteDescription = rtcProto?.setRemoteDescription;
+
     // Property descriptors (needed to bypass our own patches internally)
     const srcObjectDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
     const srcDesc       = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
@@ -123,7 +128,6 @@
         video.muted   = true;
         video.preload = 'none';
 
-        console.log('[BCR Suppressor] Primary video suppressed:', video);
     }
 
     // ─── Primary Video Election ────────────────────────────────────────────────
@@ -171,6 +175,46 @@
     }
 
     // ─── Prototype Patches ────────────────────────────────────────────────────
+
+    // RTCPeerConnection canary hook (transparent): log SDP shape, preserve
+    // original method behavior and Promise chains exactly.
+    if (
+        rtcProto &&
+        typeof origSetLocalDescription === 'function' &&
+        typeof origSetRemoteDescription === 'function' &&
+        rtcProto.__BCR_RTC_CANARY_PATCHED__ !== true
+    ) {
+        Object.defineProperty(rtcProto, '__BCR_RTC_CANARY_PATCHED__', {
+            value: true,
+            writable: false,
+            configurable: true,
+            enumerable: false,
+        });
+
+        rtcProto.setLocalDescription = function patchedSetLocalDescription(...args) {
+            const description = args[0];
+            if (
+                description &&
+                typeof description.type === 'string' &&
+                typeof description.sdp === 'string'
+            ) {
+                console.log('[BCR RTC Canary] localDescription', description.type, description.sdp.length);
+            }
+            return origSetLocalDescription.apply(this, args);
+        };
+
+        rtcProto.setRemoteDescription = function patchedSetRemoteDescription(...args) {
+            const description = args[0];
+            if (
+                description &&
+                typeof description.type === 'string' &&
+                typeof description.sdp === 'string'
+            ) {
+                console.log('[BCR RTC Canary] remoteDescription', description.type, description.sdp.length);
+            }
+            return origSetRemoteDescription.apply(this, args);
+        };
+    }
 
     // play() → return resolved Promise for suppressed videos (never reject —
     // many sites chain .then()/.catch() on the return value).
@@ -404,10 +448,6 @@
                 const formatKey = `${meta.trackType}|${meta.mimeType}|${meta.codec}`;
                 if (!loggedFormats.has(formatKey)) {
                     loggedFormats.add(formatKey);
-                    console.log(
-                        `[BCR] track=${meta.trackType} mime=${meta.mimeType}` +
-                        ` codec=${meta.codec} suppressed=${isSuppressed}`
-                    );
                 }
 
                 const isInitSegment = detectInitSegment(copied);

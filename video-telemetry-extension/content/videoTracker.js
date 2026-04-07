@@ -62,7 +62,6 @@ class VideoTracker {
         });
         this._cleanups.push(cleanupPlayback);
 
-        console.log(`[VideoTracker] Initialized tracker for video: ${this.videoId}`);
     }
 
     _readState() {
@@ -143,8 +142,7 @@ class VideoTracker {
         this._cleanups.forEach((cleanup) => {
             try {
                 cleanup();
-            } catch (err) {
-                console.warn(`[VideoTracker] Cleanup error for ${this.videoId}:`, err);
+            } catch (_) {
             }
         });
 
@@ -156,6 +154,5 @@ class VideoTracker {
         // 7. Overlay destroyed
         OverlayRenderer.getInstance().destroy(this.videoId);
 
-        console.log(`[VideoTracker] Destroyed tracker for video: ${this.videoId}`);
     }
 }

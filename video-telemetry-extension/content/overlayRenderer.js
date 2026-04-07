@@ -113,8 +113,6 @@ class OverlayRenderer {
 
         // Initial position sync
         this._syncPosition(videoId);
-
-        console.log(`[OverlayRenderer] Created overlay for: ${videoId.slice(0, 8)}`);
     }
 
     /**
@@ -174,8 +172,6 @@ class OverlayRenderer {
 
         entry.wrapper.remove();
         this._overlays.delete(videoId);
-
-        console.log(`[OverlayRenderer] Destroyed overlay for: ${videoId.slice(0, 8)}`);
     }
 
     /**

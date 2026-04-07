@@ -16,11 +16,8 @@ class VideoRegistry {
     // ─── Public API ───────────────────────────────────────────────────────────
 
     init() {
-        console.log("[VideoRegistry] Initializing...");
         const existingVideos = document.querySelectorAll("video");
         existingVideos.forEach((videoEl) => this._registerVideo(videoEl));
-
-        console.log(`[VideoRegistry] Found ${existingVideos.length} existing video(s)`);
 
         this._startMutationObserver();
     }
@@ -33,7 +30,6 @@ class VideoRegistry {
 
         this._registry.forEach(({tracker}) => tracker.destroy());
         this._registry.clear();
-        console.log("[VideoRegistry] Destroyed all trackers.");
     }
 
     /**
@@ -61,7 +57,6 @@ class VideoRegistry {
 
         this._registry.set(videoEl, {id, tracker});
         Emitter.getInstance().emitAdded(id);
-        console.log(`[VideoRegistry] Registered video: ${id}`);
     }
 
     /**
@@ -77,7 +72,6 @@ class VideoRegistry {
         entry.tracker.destroy();
         this._registry.delete(videoEl);
         Emitter.getInstance().emitRemoved(entry.id);
-        console.log(`[VideoRegistry] Unregistered video: ${entry.id}`);
     }
 
     _startMutationObserver() {
@@ -109,8 +103,6 @@ class VideoRegistry {
             childList: true,
             subtree: true,
         });
-
-        console.log("[VideoRegistry] MutationObserver started.");
     }
 
     /**
