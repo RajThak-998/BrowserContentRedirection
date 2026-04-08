@@ -25,7 +25,7 @@ func main() {
 
 	// Create application with options
 	err := wails.Run(&options.App{
-		Title:       "WebRTC Display",
+		Title:       "WebRTC Player",
 		Width:       *width,
 		Height:      *height,
 		Frameless:   true,

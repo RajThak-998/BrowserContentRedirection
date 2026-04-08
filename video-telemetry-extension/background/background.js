@@ -11,10 +11,24 @@ const MEDIA_LOG_EVERY_N = 100;
 const CHUNK_META_LOG_EVERY_N = 50;
 const MAX_MEDIA_CHUNK_BYTES = 4 * 1024 * 1024; // 4MB safety cap per chunk
 const HARD_MAX_MEDIA_CHUNK_BYTES = 16 * 1024 * 1024; // hard cap to prevent memory pressure crashes
+const RTC_ROUTE_TTL_MS = 5 * 60 * 1000;
+const RTC_ROUTE_SWEEP_MS = 60 * 1000;
+
+const RTC_UPSTREAM_TYPES = new Set([
+    "RTC_SHADOW_REMOTE",
+    "RTC_SHADOW_LOCAL",
+    "RTC_SHADOW_CLOSE",
+]);
+
+const RTC_DOWNSTREAM_TYPES = new Set([
+    "RTC_SHADOW_READY",
+    "RTC_SHADOW_ERROR",
+]);
 
 // ─── Media Counters ─────────────────────────────────────────────────────────
 
 let _mediaSeen = 0;
+const _rtcBridgeRoutes = new Map();
 
 // ─── Transport ─────────────────────────────────────────────────────────────
 
@@ -230,9 +244,19 @@ class Transport {
 
     _onMessage(event) {
         // Keep logging compact. Incoming side may be text/binary.
-        if (typeof event.data === "string") {
-            console.log("[Transport] Received text from endpoint:", event.data);
+        if (typeof event.data !== "string") return;
+
+        try {
+            const packet = JSON.parse(event.data);
+            if (packet && RTC_DOWNSTREAM_TYPES.has(packet.type)) {
+                _routeRtcShadowToContent(packet);
+                return;
+            }
+        } catch (_) {
+            // Not JSON, keep as compact transport log.
         }
+
+        console.log("[Transport] Received text from endpoint:", event.data);
     }
 
     _scheduleReconnect() {
@@ -259,6 +283,7 @@ Transport._instance = null;
 
 Transport.getInstance().connect();
 console.log("[Background] Service worker started. Transport connecting...");
+setInterval(_sweepRtcRoutes, RTC_ROUTE_SWEEP_MS);
 
 // ─── Message Listener ──────────────────────────────────────────────────────
 
@@ -284,6 +309,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         case "MEDIA_CHUNK":
             _handleMediaChunk(message, sender, sendResponse);
+            break;
+
+        case "RTC_SHADOW_REMOTE":
+        case "RTC_SHADOW_LOCAL":
+        case "RTC_SHADOW_CLOSE":
+            _handleRtcShadow(message, sender, sendResponse);
             break;
 
         default:
@@ -316,6 +347,83 @@ function _handleTelemetry(message, sender, sendResponse) {
     } catch (err) {
         console.error("[Background] Failed to send via transport:", err);
         sendResponse({status: "error", reason: err.message});
+    }
+}
+
+function _rememberRtcRoute(bridgeId, sender) {
+    if (typeof bridgeId !== "string" || bridgeId.length === 0) return;
+
+    _rtcBridgeRoutes.set(bridgeId, {
+        tabId: sender.tab.id,
+        frameId: sender.frameId ?? 0,
+        updatedAt: Date.now(),
+    });
+}
+
+function _handleRtcShadow(message, sender, sendResponse) {
+    if (!RTC_UPSTREAM_TYPES.has(message.type)) {
+        sendResponse({status: "error", reason: "unsupported rtc type"});
+        return;
+    }
+
+    const bridgeId = message.payload?.bridgeId;
+    if (typeof bridgeId !== "string" || bridgeId.length === 0) {
+        sendResponse({status: "error", reason: "bridgeId required"});
+        return;
+    }
+
+    _rememberRtcRoute(bridgeId, sender);
+
+    const enrichedMessage = _enrichWithSenderMeta(message, sender);
+
+    try {
+        Transport.getInstance().send(enrichedMessage);
+        if (message.type === "RTC_SHADOW_CLOSE") {
+            _rtcBridgeRoutes.delete(bridgeId);
+        }
+        sendResponse({status: "ok"});
+    } catch (err) {
+        console.error("[Background] Failed to send RTC shadow message:", err);
+        sendResponse({status: "error", reason: err.message});
+    }
+}
+
+function _routeRtcShadowToContent(packet) {
+    const bridgeId = packet?.payload?.bridgeId;
+    if (typeof bridgeId !== "string" || bridgeId.length === 0) {
+        return;
+    }
+
+    const route = _rtcBridgeRoutes.get(bridgeId);
+    if (!route) {
+        return;
+    }
+
+    route.updatedAt = Date.now();
+
+    chrome.tabs.sendMessage(
+        route.tabId,
+        {
+            type: packet.type,
+            payload: packet.payload ?? {},
+        },
+        { frameId: route.frameId },
+        () => {
+            if (!chrome.runtime.lastError) return;
+            const err = chrome.runtime.lastError.message ?? "";
+            if (err.includes("Receiving end does not exist")) {
+                _rtcBridgeRoutes.delete(bridgeId);
+            }
+        }
+    );
+}
+
+function _sweepRtcRoutes() {
+    const now = Date.now();
+    for (const [bridgeId, route] of _rtcBridgeRoutes.entries()) {
+        if (now - route.updatedAt > RTC_ROUTE_TTL_MS) {
+            _rtcBridgeRoutes.delete(bridgeId);
+        }
     }
 }
 

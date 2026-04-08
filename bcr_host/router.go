@@ -10,6 +10,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+var _bridgeRegistry *Registry
 
 // ReadLoop blocks on reading messages from a single connection.
 // It routes messages based on the connection's role:
@@ -20,6 +21,10 @@ import (
 // When the connection closes or errors, it cleans up from the registry
 // and returns — letting the goroutine started in server.go exit cleanly.
 func ReadLoop(conn *Connection, registry *Registry) {
+	if _bridgeRegistry == nil {
+		_bridgeRegistry = registry
+	}
+
 	defer func() {
 		registry.Remove(conn)
 		conn.WS.Close()
@@ -44,7 +49,7 @@ func ReadLoop(conn *Connection, registry *Registry) {
 			handleExtensionMessage(msgType, data, registry)
 
 		case "client":
-			log.Printf("[router] received %d bytes from client (id=%s) — ignored", len(data), conn.ID)
+			handleClientMessage(msgType, data, registry, conn.ID)
 
 		default:
 			log.Printf("[router] received message from unknown role %q (id=%s) — dropped", conn.Role, conn.ID)
@@ -58,7 +63,7 @@ func handleExtensionMessage(msgType int, data []byte, registry *Registry) {
 		// Existing telemetry path unchanged.
 		registry.Broadcast(msgType, data)
 
-		if isVideoUpdatePacket(data){
+		if isVideoUpdatePacket(data) || isRTCShadowUpstreamPacket(data) {
 			mediaBridge.tryForwardText(data)
 		}
 
@@ -70,12 +75,56 @@ func handleExtensionMessage(msgType int, data []byte, registry *Registry) {
 	}
 }
 
+func handleClientMessage(msgType int, data []byte, registry *Registry, connID string) {
+	if msgType != websocket.TextMessage {
+		log.Printf("[router] received %d bytes from client (id=%s) — ignored", len(data), connID)
+		return
+	}
+
+	if !isRTCShadowDownstreamPacket(data) {
+		log.Printf("[router] client text ignored (id=%s, bytes=%d)", connID, len(data))
+		return
+	}
+
+	if !registry.SendToExtension(websocket.TextMessage, data) {
+		log.Printf("[router] no extension connected for shadow response (id=%s)", connID)
+	}
+}
+
 func isVideoUpdatePacket(data []byte) bool {
 	var pkt Packet
 	if err := json.Unmarshal(data, &pkt); err != nil {
 		return false
 	}
 	return pkt.Type == "VIDEO_UPDATE"
+}
+
+func isRTCShadowUpstreamPacket(data []byte) bool {
+	var pkt Packet
+	if err := json.Unmarshal(data, &pkt); err != nil {
+		return false
+	}
+
+	switch pkt.Type {
+	case PacketTypeRTCShadowRemote, PacketTypeRTCShadowLocal, PacketTypeRTCShadowClose, PacketTypeRTCShadowCandidate:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRTCShadowDownstreamPacket(data []byte) bool {
+	var pkt Packet
+	if err := json.Unmarshal(data, &pkt); err != nil {
+		return false
+	}
+
+	switch pkt.Type {
+	case PacketTypeRTCShadowReady, PacketTypeRTCShadowError, PacketTypeRTCShadowCandidate:
+		return true
+	default:
+		return false
+	}
 }
 
 func handleMediaBinaryFrame(data []byte, registry *Registry) {
@@ -163,7 +212,7 @@ func handleMediaBinaryFrame(data []byte, registry *Registry) {
 		hdr.Payload.MimeType,
 		hdr.Payload.Seq,
 		hdr.Payload.IsInitSegment,
-		data, // forward framed packet for webrtc-player metadata parsing
+		data, // forward framed packet for bcr_client metadata parsing
 	)
 
 	registry.Broadcast(websocket.TextMessage, outBytes)
@@ -179,17 +228,17 @@ const (
 	bridgeFilterMode = "all"
 )
 
-
-
 type bridgeMessage struct {
-	msgType int
-	kind string
-	data []byte
+	msgType    int
+	kind       string
+	data       []byte
+	packetType string
+	bridgeID   string
 
 	track string
-	mime string
-	seq int64
-	init bool
+	mime  string
+	seq   int64
+	init  bool
 }
 
 type bridgeChunk struct {
@@ -213,26 +262,21 @@ func newBridgeForwarder() *bridgeForwarder {
 	}
 }
 
-
 func (b *bridgeForwarder) writeLoop(conn *websocket.Conn) error {
-	for msg := range b.sendCh{
-		if err := conn.WriteMessage(msg.msgType, msg.data);
-		err != nil {
+	for msg := range b.sendCh {
+		if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
 			log.Printf("[Bridge] ERROR send failed type=%d kind=%s: %v", msg.msgType, msg.kind, err)
 			return err
 		}
 
 		if msg.kind == "telemetry" {
-			log.Printf("[Bridge] FORWARD telemetry type=text size=%d", len(msg.data))
+			if msg.packetType == PacketTypeRTCShadowRemote ||
+				msg.packetType == PacketTypeRTCShadowLocal ||
+				msg.packetType == PacketTypeRTCShadowClose ||
+				msg.packetType == PacketTypeRTCShadowCandidate {
+				log.Printf("[Bridge] SHADOW_UP -> client type=%s bridgeId=%s", msg.packetType, msg.bridgeID)
+			}
 			continue
-		}
-
-		if msg.init {
-			log.Printf("[Bridge] INIT track=%s mime=%s size=%d", msg.track, msg.mime, len(msg.data))
-		}
-
-		if msg.init || msg.seq%50 == 0 {
-			log.Printf("[Bridge] FORWARD media type=binary track=%s mime=%s size=%d seq=%d",msg.track, msg.mime, len(msg.data), msg.seq)
 		}
 	}
 
@@ -254,7 +298,40 @@ func (b *bridgeForwarder) run() {
 			continue
 		}
 
-		log.Printf("[Bridge] Connected to webrtc-player")
+		log.Printf("[Bridge] Connected to bcr_client")
+
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			for {
+				msgType, data, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+
+				if msgType != websocket.TextMessage {
+					continue
+				}
+
+				if !isRTCShadowDownstreamPacket(data) {
+					continue
+				}
+
+				packetType, bridgeID := packetTypeAndBridgeID(data)
+
+				if _bridgeRegistry == nil {
+					log.Printf("[Bridge] SHADOW_DOWN dropped (no registry) type=%s bridgeId=%s", packetType, bridgeID)
+					continue
+				}
+
+				if !_bridgeRegistry.SendToExtension(websocket.TextMessage, data) {
+					log.Printf("[Bridge] SHADOW_DOWN dropped (no extension) type=%s bridgeId=%s", packetType, bridgeID)
+					continue
+				}
+
+				log.Printf("[Bridge] SHADOW_DOWN -> extension type=%s bridgeId=%s", packetType, bridgeID)
+			}
+		}()
 
 		err = b.writeLoop(conn)
 		if err != nil {
@@ -264,11 +341,11 @@ func (b *bridgeForwarder) run() {
 		}
 
 		_ = conn.Close()
+		<-readDone
 		log.Printf("[Bridge] Reconnecting...")
 		time.Sleep(bridgeReconnectDelay)
 	}
 }
-
 
 func bridgeShouldForward(track string, isInit bool) (bool, string) {
 	// Always forward init segments.
@@ -295,7 +372,6 @@ func bridgeShouldForward(track string, isInit bool) (bool, string) {
 	}
 }
 
-
 func (b *bridgeForwarder) tryForwardBinary(track, mime string, seq int64, isInit bool, data []byte) {
 	b.start()
 	ok, reason := bridgeShouldForward(track, isInit)
@@ -307,37 +383,69 @@ func (b *bridgeForwarder) tryForwardBinary(track, mime string, seq int64, isInit
 	payload := append([]byte(nil), data...)
 
 	select {
-		case b.sendCh <- bridgeMessage{
-			msgType: websocket.BinaryMessage,
-			kind: "media",
-			data: payload,
-			track: track,
-			mime: mime,
-			seq: seq,
-			init: isInit,
-		}:
-		default:
-			log.Printf("[Bridge] SKIP track=%s reason=bridge_queue_full", track)
+	case b.sendCh <- bridgeMessage{
+		msgType: websocket.BinaryMessage,
+		kind:    "media",
+		data:    payload,
+		track:   track,
+		mime:    mime,
+		seq:     seq,
+		init:    isInit,
+	}:
+	default:
+		if isInit {
+			log.Printf("[Bridge] SKIP media init reason=bridge_queue_full track=%s", track)
+		}
 	}
 }
 
 func (b *bridgeForwarder) tryForwardText(data []byte) {
 	b.start()
+	packetType, bridgeID := packetTypeAndBridgeID(data)
+	isShadow := packetType == PacketTypeRTCShadowRemote ||
+		packetType == PacketTypeRTCShadowLocal ||
+		packetType == PacketTypeRTCShadowClose ||
+		packetType == PacketTypeRTCShadowCandidate
+
 	if len(b.sendCh) > (bridgeQueueSize*3)/4 {
-		log.Printf("[Bridge] SKIP telemetry reason=bridge_busy")
+		if isShadow {
+			log.Printf("[Bridge] SHADOW_UP dropped reason=bridge_busy type=%s bridgeId=%s", packetType, bridgeID)
+		}
 		return
 	}
 
 	payload := append([]byte(nil), data...)
 
 	select {
-		case b.sendCh <- bridgeMessage{
-			msgType: websocket.TextMessage,
-			kind: "telemetry",
-			data: payload,
-		}:
-			log.Printf("[Bridge] queued telemetry VIDEO_UPDATE (%d bytes)", len(payload))
-		default:
-			log.Printf("[Bridge] SKIP telemetry reason=bridge_queue_full")
+	case b.sendCh <- bridgeMessage{
+		msgType:    websocket.TextMessage,
+		kind:       "telemetry",
+		data:       payload,
+		packetType: packetType,
+		bridgeID:   bridgeID,
+	}:
+		if isShadow {
+			log.Printf("[Bridge] SHADOW_UP queued type=%s bridgeId=%s", packetType, bridgeID)
+		}
+	default:
+		if isShadow {
+			log.Printf("[Bridge] SHADOW_UP dropped reason=bridge_queue_full type=%s bridgeId=%s", packetType, bridgeID)
+		}
 	}
+}
+
+func packetTypeAndBridgeID(data []byte) (string, string) {
+	var pkt Packet
+	if err := json.Unmarshal(data, &pkt); err != nil {
+		return "unknown", ""
+	}
+
+	type withBridgeID struct {
+		BridgeID string `json:"bridgeId"`
+	}
+
+	var payload withBridgeID
+	_ = json.Unmarshal(pkt.Payload, &payload)
+
+	return pkt.Type, payload.BridgeID
 }

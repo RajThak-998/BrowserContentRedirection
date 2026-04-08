@@ -140,3 +140,22 @@ func (r *Registry) Broadcast(msgType int, data []byte) {
 		}
 	}
 }
+
+// SendToExtension sends a raw message to the currently active extension
+// connection. Returns false when no extension is connected.
+func (r *Registry) SendToExtension(msgType int, data []byte) bool {
+	r.mu.RLock()
+	ext := r.extension
+	r.mu.RUnlock()
+
+	if ext == nil {
+		return false
+	}
+
+	if err := ext.Send(msgType, data); err != nil {
+		log.Printf("[registry] failed to send to extension (id=%s): %v", ext.ID, err)
+		return false
+	}
+
+	return true
+}

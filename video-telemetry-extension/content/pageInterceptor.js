@@ -16,6 +16,8 @@
  *   - Primary video = highest-area visible <video>.  Re-elected on each new
  *     video node.  Only one video is suppressed at a time.
  */
+
+
 (() => {
     if (window.__BCR_PAGE_INTERCEPTOR_INSTALLED__) return;
     window.__BCR_PAGE_INTERCEPTOR_INSTALLED__ = true;
@@ -42,10 +44,11 @@
     const origChangeType      = SourceBuffer.prototype.changeType; // may be undefined
     const origAddSourceBuffer = MediaSource.prototype?.addSourceBuffer;
 
-    // Save RTCPeerConnection method originals for a transparent canary hook.
+    // Save RTCPeerConnection method originals for shadow signaling hooks.
     const rtcProto = window.RTCPeerConnection?.prototype;
     const origSetLocalDescription = rtcProto?.setLocalDescription;
     const origSetRemoteDescription = rtcProto?.setRemoteDescription;
+    const origRTCPeerConnection = window.RTCPeerConnection;
 
     // Property descriptors (needed to bypass our own patches internally)
     const srcObjectDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
@@ -176,31 +179,263 @@
 
     // ─── Prototype Patches ────────────────────────────────────────────────────
 
-    // RTCPeerConnection canary hook (transparent): log SDP shape, preserve
-    // original method behavior and Promise chains exactly.
+    const RTC_WAIT_TIMEOUT_MS = 2000;
+    const rtcStateByPeer = new WeakMap();
+    const rtcReadyByBridgeId = new Map();
+    const rtcWaitersByBridgeId = new Map();
+
+    function generateBridgeId() {
+        if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+            return crypto.randomUUID();
+        }
+        return `bcr-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    }
+
+    function emitShadowEvent(type, payload) {
+        window.postMessage({ type, payload }, '*');
+    }
+
+    function ensureRtcState(pc) {
+        let entry = rtcStateByPeer.get(pc);
+        if (entry) return entry;
+
+        const bridgeId = generateBridgeId();
+        entry = {
+            bridgeId,
+            closedEmitted: false,
+            lastSeen: performance.now(),
+        };
+
+        rtcStateByPeer.set(pc, entry);
+
+        try {
+            Object.defineProperty(pc, '_bcr_id', {
+                value: bridgeId,
+                writable: false,
+                configurable: true,
+                enumerable: false,
+            });
+        } catch (_) {
+            // Best-effort debug hint only.
+            pc._bcr_id = bridgeId;
+        }
+
+        return entry;
+    }
+
+    function resolveShadowReady(bridgeId, payload) {
+        if (!bridgeId) return;
+        rtcReadyByBridgeId.set(bridgeId, payload);
+
+        const waiters = rtcWaitersByBridgeId.get(bridgeId);
+        if (!waiters || waiters.length === 0) return;
+
+        rtcWaitersByBridgeId.delete(bridgeId);
+        for (const waiter of waiters) {
+            clearTimeout(waiter.timer);
+            waiter.resolve(payload);
+        }
+    }
+
+    function rejectShadowReady(bridgeId) {
+        if (!bridgeId) return;
+
+        const waiters = rtcWaitersByBridgeId.get(bridgeId);
+        if (!waiters || waiters.length === 0) return;
+
+        rtcWaitersByBridgeId.delete(bridgeId);
+        for (const waiter of waiters) {
+            clearTimeout(waiter.timer);
+            waiter.resolve(null);
+        }
+    }
+
+    function awaitShadowReady(bridgeId, timeoutMs) {
+        if (!bridgeId) return Promise.resolve(null);
+
+        const cached = rtcReadyByBridgeId.get(bridgeId);
+        if (cached) return Promise.resolve(cached);
+
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                const list = rtcWaitersByBridgeId.get(bridgeId) ?? [];
+                rtcWaitersByBridgeId.set(
+                    bridgeId,
+                    list.filter((item) => item.resolve !== resolve)
+                );
+                resolve(null);
+            }, timeoutMs);
+
+            const waiters = rtcWaitersByBridgeId.get(bridgeId) ?? [];
+            waiters.push({ resolve, timer });
+            rtcWaitersByBridgeId.set(bridgeId, waiters);
+        });
+    }
+
+    function buildDescriptionLike(originalDescription, nextSdp) {
+        const next = {
+            type: originalDescription?.type,
+            sdp: nextSdp,
+        };
+
+        if (typeof window.RTCSessionDescription === 'function') {
+            try {
+                return new window.RTCSessionDescription(next);
+            } catch (_) {
+                return next;
+            }
+        }
+
+        return next;
+    }
+
+    function mungeSdpTransport(sdp, shadow) {
+        if (typeof sdp !== 'string' || !shadow) return sdp;
+
+        let munged = sdp;
+
+        if (typeof shadow.iceUfrag === 'string' && shadow.iceUfrag.length > 0) {
+            munged = munged.replace(/^a=ice-ufrag:.*$/gm, `a=ice-ufrag:${shadow.iceUfrag}`);
+        }
+
+        if (typeof shadow.icePwd === 'string' && shadow.icePwd.length > 0) {
+            munged = munged.replace(/^a=ice-pwd:.*$/gm, `a=ice-pwd:${shadow.icePwd}`);
+        }
+
+        if (typeof shadow.dtlsFingerprint === 'string' && shadow.dtlsFingerprint.length > 0) {
+            const fullFingerprint = shadow.dtlsFingerprint.trim();
+            if (/^[A-Za-z0-9-]+\s+[0-9A-Fa-f:]+$/.test(fullFingerprint)) {
+                munged = munged.replace(/^a=fingerprint:.*$/gm, `a=fingerprint:${fullFingerprint}`);
+            } else {
+                munged = munged.replace(
+                    /^a=fingerprint:([A-Za-z0-9-]+)\s+.*$/gm,
+                    (_, alg) => `a=fingerprint:${alg} ${fullFingerprint}`
+                );
+            }
+        }
+
+        if (typeof shadow.localIp === 'string' && shadow.localIp.length > 0) {
+            munged = munged.replace(/^c=IN IP4\s+.*$/gm, `c=IN IP4 ${shadow.localIp}`);
+        }
+
+        return munged;
+    }
+
+    function maybeEmitShadowClose(pc, reason) {
+        const entry = ensureRtcState(pc);
+        if (entry.closedEmitted) return;
+
+        entry.closedEmitted = true;
+        rtcReadyByBridgeId.delete(entry.bridgeId);
+        rejectShadowReady(entry.bridgeId);
+
+        emitShadowEvent('BCR_RTC_SHADOW_CLOSE', {
+            bridgeId: entry.bridgeId,
+            reason,
+            timestamp: Date.now(),
+        });
+    }
+
+    function attachPeerLifecycleHooks(pc) {
+        ensureRtcState(pc);
+
+        const onStateChange = () => {
+            if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+                maybeEmitShadowClose(pc, `connectionState:${pc.connectionState}`);
+                return;
+            }
+
+            if (pc.iceConnectionState === 'closed' || pc.iceConnectionState === 'failed') {
+                maybeEmitShadowClose(pc, `iceConnectionState:${pc.iceConnectionState}`);
+            }
+        };
+
+        pc.addEventListener('connectionstatechange', onStateChange);
+        pc.addEventListener('iceconnectionstatechange', onStateChange);
+    }
+
+    function installPeerConstructorHook() {
+        if (typeof origRTCPeerConnection !== 'function') return;
+        if (window.RTCPeerConnection?.__BCR_RTC_CTOR_PATCHED__ === true) return;
+
+        const PatchedRTCPeerConnection = function BCRPatchedRTCPeerConnection(...args) {
+            const pc = new origRTCPeerConnection(...args);
+            attachPeerLifecycleHooks(pc);
+            return pc;
+        };
+
+        PatchedRTCPeerConnection.prototype = origRTCPeerConnection.prototype;
+        Object.setPrototypeOf(PatchedRTCPeerConnection, origRTCPeerConnection);
+
+        Object.defineProperty(PatchedRTCPeerConnection, '__BCR_RTC_CTOR_PATCHED__', {
+            value: true,
+            writable: false,
+            configurable: false,
+            enumerable: false,
+        });
+
+        window.RTCPeerConnection = PatchedRTCPeerConnection;
+    }
+
+    window.addEventListener('message', (event) => {
+        if (event.source !== window) return;
+
+        const data = event.data;
+        if (!data || typeof data.type !== 'string') return;
+
+        if (data.type === 'BCR_RTC_SHADOW_READY') {
+            const payload = data.payload;
+            const bridgeId = payload?.bridgeId;
+            if (typeof bridgeId === 'string' && bridgeId.length > 0) {
+                resolveShadowReady(bridgeId, payload);
+            }
+        }
+
+        if (data.type === 'BCR_RTC_SHADOW_ERROR') {
+            const payload = data.payload;
+            const bridgeId = payload?.bridgeId;
+            if (typeof bridgeId === 'string' && bridgeId.length > 0) {
+                rejectShadowReady(bridgeId);
+            }
+        }
+    });
+
     if (
         rtcProto &&
         typeof origSetLocalDescription === 'function' &&
         typeof origSetRemoteDescription === 'function' &&
-        rtcProto.__BCR_RTC_CANARY_PATCHED__ !== true
+        rtcProto.__BCR_RTC_SHADOW_PATCHED__ !== true
     ) {
-        Object.defineProperty(rtcProto, '__BCR_RTC_CANARY_PATCHED__', {
+        installPeerConstructorHook();
+
+        Object.defineProperty(rtcProto, '__BCR_RTC_SHADOW_PATCHED__', {
             value: true,
             writable: false,
             configurable: true,
             enumerable: false,
         });
 
-        rtcProto.setLocalDescription = function patchedSetLocalDescription(...args) {
+        rtcProto.setLocalDescription = async function patchedSetLocalDescription(...args) {
             const description = args[0];
-            if (
-                description &&
-                typeof description.type === 'string' &&
-                typeof description.sdp === 'string'
-            ) {
-                console.log('[BCR RTC Canary] localDescription', description.type, description.sdp.length);
+            if (!description || typeof description.sdp !== 'string') {
+                return origSetLocalDescription.apply(this, args);
             }
-            return origSetLocalDescription.apply(this, args);
+
+            const entry = ensureRtcState(this);
+            entry.lastSeen = performance.now();
+
+            emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
+                bridgeId: entry.bridgeId,
+                sdpType: description.type ?? 'unknown',
+                sdp: description.sdp,
+                timestamp: Date.now(),
+            });
+
+            const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
+            const mungedSdp = shadowReady ? mungeSdpTransport(description.sdp, shadowReady) : description.sdp;
+            const patchedDescription = buildDescriptionLike(description, mungedSdp);
+
+            return origSetLocalDescription.apply(this, [patchedDescription, ...args.slice(1)]);
         };
 
         rtcProto.setRemoteDescription = function patchedSetRemoteDescription(...args) {
@@ -210,7 +445,15 @@
                 typeof description.type === 'string' &&
                 typeof description.sdp === 'string'
             ) {
-                console.log('[BCR RTC Canary] remoteDescription', description.type, description.sdp.length);
+                const entry = ensureRtcState(this);
+                entry.lastSeen = performance.now();
+
+                emitShadowEvent('BCR_RTC_SHADOW_REMOTE', {
+                    bridgeId: entry.bridgeId,
+                    sdpType: description.type,
+                    sdp: description.sdp,
+                    timestamp: Date.now(),
+                });
             }
             return origSetRemoteDescription.apply(this, args);
         };

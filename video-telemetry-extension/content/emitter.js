@@ -105,6 +105,50 @@ class Emitter {
         });
     }
 
+    emitRtcShadowRemote(payload) {
+        this._sendWithRetry(
+            {
+                type: "RTC_SHADOW_REMOTE",
+                payload: {
+                    bridgeId: payload.bridgeId,
+                    sdpType: payload.sdpType ?? "unknown",
+                    sdp: payload.sdp ?? "",
+                    timestamp: payload.timestamp ?? Date.now(),
+                },
+            },
+            this._MAX_RETRIES
+        );
+    }
+
+    emitRtcShadowLocal(payload) {
+        this._sendWithRetry(
+            {
+                type: "RTC_SHADOW_LOCAL",
+                payload: {
+                    bridgeId: payload.bridgeId,
+                    sdpType: payload.sdpType ?? "unknown",
+                    sdp: payload.sdp ?? "",
+                    timestamp: payload.timestamp ?? Date.now(),
+                },
+            },
+            this._MAX_RETRIES
+        );
+    }
+
+    emitRtcShadowClose(payload) {
+        this._sendWithRetry(
+            {
+                type: "RTC_SHADOW_CLOSE",
+                payload: {
+                    bridgeId: payload.bridgeId,
+                    reason: payload.reason ?? "unknown",
+                    timestamp: payload.timestamp ?? Date.now(),
+                },
+            },
+            this._MAX_RETRIES
+        );
+    }
+
     // ─── Internal ─────────────────────────────────────────────────────────────
 
     _sendWithRetry(message, retriesLeft) {

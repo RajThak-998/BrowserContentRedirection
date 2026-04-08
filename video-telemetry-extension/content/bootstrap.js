@@ -12,6 +12,8 @@
 
     let _mediaListenerAttached = false;
     let _onWindowMessage = null;
+    let _runtimeListenerAttached = false;
+    let _onRuntimeMessage = null;
 
     let _videoSeq = 0;
     let _audioSeq = 0;
@@ -36,7 +38,24 @@
             if (event.source !== window) return;
 
             const data = event.data;
-            if (!data || data.type !== "BCR_MEDIA_CHUNK") return;
+            if (!data || typeof data.type !== "string") return;
+
+            if (data.type === "BCR_RTC_SHADOW_REMOTE") {
+                Emitter.getInstance().emitRtcShadowRemote(data.payload ?? {});
+                return;
+            }
+
+            if (data.type === "BCR_RTC_SHADOW_LOCAL") {
+                Emitter.getInstance().emitRtcShadowLocal(data.payload ?? {});
+                return;
+            }
+
+            if (data.type === "BCR_RTC_SHADOW_CLOSE") {
+                Emitter.getInstance().emitRtcShadowClose(data.payload ?? {});
+                return;
+            }
+
+            if (data.type !== "BCR_MEDIA_CHUNK") return;
 
             const now = performance.now();
             _rotateMediaWindowIfNeeded(now);
@@ -88,11 +107,44 @@
         _mediaListenerAttached = true;
     }
 
+    function _attachRuntimeListener() {
+        if (_runtimeListenerAttached) return;
+
+        _onRuntimeMessage = (message) => {
+            if (!message || typeof message.type !== "string") return;
+
+            if (message.type === "RTC_SHADOW_READY") {
+                window.postMessage({
+                    type: "BCR_RTC_SHADOW_READY",
+                    payload: message.payload ?? {},
+                }, "*");
+                return;
+            }
+
+            if (message.type === "RTC_SHADOW_ERROR") {
+                window.postMessage({
+                    type: "BCR_RTC_SHADOW_ERROR",
+                    payload: message.payload ?? {},
+                }, "*");
+            }
+        };
+
+        chrome.runtime.onMessage.addListener(_onRuntimeMessage);
+        _runtimeListenerAttached = true;
+    }
+
     function _detachMediaChunkListener() {
         if (!_mediaListenerAttached || !_onWindowMessage) return;
         window.removeEventListener("message", _onWindowMessage);
         _onWindowMessage = null;
         _mediaListenerAttached = false;
+    }
+
+    function _detachRuntimeListener() {
+        if (!_runtimeListenerAttached || !_onRuntimeMessage) return;
+        chrome.runtime.onMessage.removeListener(_onRuntimeMessage);
+        _onRuntimeMessage = null;
+        _runtimeListenerAttached = false;
     }
 
     function start() {
@@ -101,6 +153,7 @@
 
     function stop() {
         _detachMediaChunkListener();
+        _detachRuntimeListener();
         OverlayRenderer.getInstance().destroyAll();
         VideoRegistry.getInstance().destroy();
     }
@@ -108,6 +161,7 @@
     // pageInterceptor.js (world: MAIN) is already active via the manifest.
     // We only need to attach the postMessage listener on the isolated-world side.
     _attachMediaChunkListener();
+    _attachRuntimeListener();
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
         start();

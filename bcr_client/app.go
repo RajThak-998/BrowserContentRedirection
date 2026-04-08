@@ -3,13 +3,15 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"sync"
 	"time"
-	"math"
+
+	"bcr_client/internal"
+
 	"github.com/gorilla/websocket"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -19,25 +21,13 @@ type App struct {
 	ctx        context.Context
 	signalConn net.Conn
 
-	windowMu	sync.Mutex
+	windowMu        sync.Mutex
 	lastWindowApply time.Time
+
+	mediaEngine *engine.Engine
 }
 
-const telemetryWindowThrottle = 33*time.Millisecond
-
-type VideoUpdate struct {
-	Type string `json:"type"`
-	Payload struct {
-		ScreenBounds struct {
-			X	float64	`json:"x"`
-			Y	float64	`json:"y"`
-			Width float64	`json:"width"`
-			Height float64	`json:"height"`
-		}	`json:"screenBounds"`
-	}	`json:"payload"`
-}
-
-
+const telemetryWindowThrottle = 33 * time.Millisecond
 
 // NewApp creates a new App application struct
 func NewApp() *App {
@@ -49,11 +39,32 @@ func NewApp() *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 
+	a.mediaEngine = engine.New(
+		engine.Config{ListenAddr: ":8081"},
+		engine.Callbacks{
+			OnVideoChunk: func(data []byte) {
+				base64Str := base64.StdEncoding.EncodeToString(data)
+				runtime.EventsEmit(a.ctx, "onVideoChunk", base64Str)
+			},
+			OnVideoUpdate: func(update engine.VideoUpdate) {
+				b := update.Payload.ScreenBounds
+				a.applyWindowFromTelemetry(b.X, b.Y, b.Width, b.Height)
+			},
+			OnLog: func(message string) {
+				log.Println(message)
+			},
+		},
+	)
+
 	// Start the TCP server for WebRTC SDP in the background
 	go a.startTCPServer()
 
-	// Start the WebSocket server for MSE byte chunks in the background
-	go a.startWebSocketServer()
+	// Start core engine (WebSocket signaling + media bridge) in background.
+	go func() {
+		if err := a.mediaEngine.Run(ctx); err != nil {
+			log.Printf("Engine stopped with error: %v", err)
+		}
+	}()
 }
 
 func (a *App) startTCPServer() {
@@ -140,14 +151,13 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-
 func (a *App) applyWindowFromTelemetry(x, y, w, h float64) {
 	ix := int(math.Round(x))
 	iy := int(math.Round(y))
 	iw := int(math.Round(w))
 	ih := int(math.Round(h))
 
-	if iw<1 || ih <1 {
+	if iw < 1 || ih < 1 {
 		return
 	}
 
@@ -166,88 +176,4 @@ func (a *App) applyWindowFromTelemetry(x, y, w, h float64) {
 	a.SetWindowSize(iw, ih)
 
 	log.Printf("[Telemetry] VIDEO_UPDATE applied pos=(%d, %d) size=(%d, %d)", ix, iy, iw, ih)
-}
-
-func (a *App) handleVideoUpdateTelemetry(message []byte) bool {
-	var evt VideoUpdate
-	if err := json.Unmarshal(message, &evt); err != nil {
-		return false
-	}
-	if evt.Type != "VIDEO_UPDATE" {
-		return false
-	}
-
-	b := evt.Payload.ScreenBounds
-	a.applyWindowFromTelemetry(b.X, b.Y, b.Width, b.Height)
-	return true
-}
-
-
-// startWebSocketServer listens for incoming byte chunks
-func (a *App) startWebSocketServer() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Printf("WebSocket Upgrade failed: %v", err)
-			return
-		}
-		defer conn.Close()
-		log.Println("WebSocket Client Connected for MSE Byte Streaming.")
-
-		for {
-			mt, message, err := conn.ReadMessage()
-			if err != nil || mt == websocket.CloseMessage {
-				log.Printf("WebSocket disconnected. err=%v, type=%d", err, mt)
-				break
-			}
-
-			// log.Printf("WebSocket received message of type: %d, size: %d bytes", mt, len(message))
-
-			// Process Text messages as JSON Window commands
-			if mt == websocket.TextMessage {
-
-				if a.handleVideoUpdateTelemetry(message) {
-					continue
-				}
-
-				var cmd struct {
-					X      *int  `json:"x"`
-					Y      *int  `json:"y"`
-					Width  *int  `json:"width"`
-					Height *int  `json:"height"`
-					Hidden *bool `json:"hidden"`
-				}
-				if err := json.Unmarshal(message, &cmd); err == nil {
-					log.Printf("Parsed Text command: %+v", cmd)
-					if cmd.Hidden != nil {
-						if *cmd.Hidden {
-							a.HideWindow()
-						} else {
-							a.ShowWindow()
-						}
-					}
-					if cmd.X != nil && cmd.Y != nil {
-						a.SetWindowPosition(*cmd.X, *cmd.Y)
-					}
-					if cmd.Width != nil && cmd.Height != nil {
-						a.SetWindowSize(*cmd.Width, *cmd.Height)
-					}
-				} else {
-					log.Printf("Error parsing text command %s: %v", string(message), err)
-				}
-			}
-
-			// Only process Binary messages for video streaming
-			if mt == websocket.BinaryMessage {
-				base64Str := base64.StdEncoding.EncodeToString(message)
-				runtime.EventsEmit(a.ctx, "onVideoChunk", base64Str)
-			}
-		}
-	})
-
-	log.Println("WebSocket Server listening on :8081 for MSE Byte Chunks...")
-	err := http.ListenAndServe(":8081", nil)
-	if err != nil {
-		log.Fatalf("Failed to start WebSocket server on :8081: %v", err)
-	}
 }
