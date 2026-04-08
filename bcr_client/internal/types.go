@@ -39,6 +39,13 @@ type RTCShadowRemotePayload struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+type RTCShadowLocalPayload struct {
+	BridgeID  string `json:"bridgeId"`
+	SDPType   string `json:"sdpType"`
+	SDP       string `json:"sdp"`
+	Timestamp int64  `json:"timestamp"`
+}
+
 type RTCShadowClosePayload struct {
 	BridgeID string `json:"bridgeId"`
 }

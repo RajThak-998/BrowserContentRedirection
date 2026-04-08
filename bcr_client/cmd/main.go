@@ -5,8 +5,7 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
-
-	engine "bcr_client/internal"
+	"bcr_client/internal"
 )
 
 func main() {

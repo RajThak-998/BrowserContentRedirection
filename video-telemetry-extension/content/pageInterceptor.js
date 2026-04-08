@@ -22,14 +22,24 @@
     if (window.__BCR_PAGE_INTERCEPTOR_INSTALLED__) return;
     window.__BCR_PAGE_INTERCEPTOR_INSTALLED__ = true;
 
+    function BCR_LOG(...args) {
+        console.log('[BCR-INTERNAL]', ...args);
+    }
+
+    try {
+        window.BCR_LOG = BCR_LOG;
+    } catch (_) {
+        // Ignore failures in locked-down contexts.
+    }
+
     // ─── Shared State ─────────────────────────────────────────────────────────
     // Exposed on window so isolated-world scripts can read flags if needed.
     // All WeakSets: no memory leak risk, GC-friendly.
     const state = {
-        suppressedVideos:        new WeakSet(),
-        suppressedMediaSources:  new WeakSet(),
+        suppressedVideos: new WeakSet(),
+        suppressedMediaSources: new WeakSet(),
         suppressedSourceBuffers: new WeakSet(),
-        primaryVideo:            null,
+        primaryVideo: null,
     };
     window.__BCR_STATE__ = state;
 
@@ -38,10 +48,10 @@
     let _bypass = false;
 
     // ─── Save Originals Before Any Patch ──────────────────────────────────────
-    const origPlay            = HTMLMediaElement.prototype.play;
-    const origLoad            = HTMLMediaElement.prototype.load;
-    const origAppendBuffer    = SourceBuffer.prototype.appendBuffer;
-    const origChangeType      = SourceBuffer.prototype.changeType; // may be undefined
+    const origPlay = HTMLMediaElement.prototype.play;
+    const origLoad = HTMLMediaElement.prototype.load;
+    const origAppendBuffer = SourceBuffer.prototype.appendBuffer;
+    const origChangeType = SourceBuffer.prototype.changeType; // may be undefined
     const origAddSourceBuffer = MediaSource.prototype?.addSourceBuffer;
 
     // Save RTCPeerConnection method originals for shadow signaling hooks.
@@ -52,7 +62,7 @@
 
     // Property descriptors (needed to bypass our own patches internally)
     const srcObjectDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
-    const srcDesc       = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+    const srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
 
     // ─── Blob URL → MediaSource Registry ─────────────────────────────────────
     // YouTube uses: ms = new MediaSource() → video.src = URL.createObjectURL(ms)
@@ -82,7 +92,7 @@
             for (let i = 0; i < active.length; i++) {
                 state.suppressedSourceBuffers.add(active[i]);
             }
-        } catch (_) {}
+        } catch (_) { }
     }
 
     // ─── Video Suppression ────────────────────────────────────────────────────
@@ -108,7 +118,7 @@
             if (existingMs instanceof MediaSource) {
                 suppressMediaSource(existingMs);
             }
-        } catch (_) {}
+        } catch (_) { }
 
         // Suppress any already-attached MediaSource (blob URL src= path)
         try {
@@ -116,7 +126,7 @@
             if (currentSrc && blobUrlToMediaSource.has(currentSrc)) {
                 suppressMediaSource(blobUrlToMediaSource.get(currentSrc));
             }
-        } catch (_) {}
+        } catch (_) { }
 
         // Flush GPU decode pipeline.  Also causes the browser to detach the
         // MediaSource — page will re-assign, hitting our patched setter.
@@ -128,7 +138,7 @@
         }
 
         // Prevent autoplay and preloading
-        video.muted   = true;
+        video.muted = true;
         video.preload = 'none';
 
     }
@@ -144,10 +154,10 @@
             const area = rect.width * rect.height;
             if (area < 100) return 0; // ignore tiny / hidden videos
             const inViewport =
-                rect.top    < window.innerHeight &&
+                rect.top < window.innerHeight &&
                 rect.bottom > 0 &&
-                rect.left   < window.innerWidth  &&
-                rect.right  > 0;
+                rect.left < window.innerWidth &&
+                rect.right > 0;
             return inViewport ? area : area * 0.05;
         } catch (_) {
             return 0;
@@ -161,14 +171,14 @@
      */
     function electPrimaryVideo() {
         const videos = document.querySelectorAll('video');
-        let best      = null;
+        let best = null;
         let bestScore = 0;
 
         for (const v of videos) {
             const score = scoreVideo(v);
             if (score > bestScore) {
                 bestScore = score;
-                best      = v;
+                best = v;
             }
         }
 
@@ -183,6 +193,7 @@
     const rtcStateByPeer = new WeakMap();
     const rtcReadyByBridgeId = new Map();
     const rtcWaitersByBridgeId = new Map();
+    const rtcLastErrorByBridgeId = new Map();
 
     function generateBridgeId() {
         if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -192,6 +203,9 @@
     }
 
     function emitShadowEvent(type, payload) {
+        if (type === 'BCR_RTC_SHADOW_REMOTE' || type === 'BCR_RTC_SHADOW_LOCAL' || type === 'BCR_RTC_SHADOW_CLOSE') {
+            BCR_LOG('[BCR] Dispatching to Host via bridgeId:', payload?.bridgeId, 'event=', type);
+        }
         window.postMessage({ type, payload }, '*');
     }
 
@@ -226,6 +240,7 @@
     function resolveShadowReady(bridgeId, payload) {
         if (!bridgeId) return;
         rtcReadyByBridgeId.set(bridgeId, payload);
+        rtcLastErrorByBridgeId.delete(bridgeId);
 
         const waiters = rtcWaitersByBridgeId.get(bridgeId);
         if (!waiters || waiters.length === 0) return;
@@ -237,8 +252,10 @@
         }
     }
 
-    function rejectShadowReady(bridgeId) {
+    function rejectShadowReady(bridgeId, reason = 'shadow_error') {
         if (!bridgeId) return;
+
+        rtcLastErrorByBridgeId.set(bridgeId, reason);
 
         const waiters = rtcWaitersByBridgeId.get(bridgeId);
         if (!waiters || waiters.length === 0) return;
@@ -270,6 +287,13 @@
             waiters.push({ resolve, timer });
             rtcWaitersByBridgeId.set(bridgeId, waiters);
         });
+    }
+
+    function consumeShadowErrorReason(bridgeId) {
+        if (!bridgeId) return null;
+        const reason = rtcLastErrorByBridgeId.get(bridgeId) ?? null;
+        rtcLastErrorByBridgeId.delete(bridgeId);
+        return reason;
     }
 
     function buildDescriptionLike(originalDescription, nextSdp) {
@@ -387,6 +411,7 @@
             const payload = data.payload;
             const bridgeId = payload?.bridgeId;
             if (typeof bridgeId === 'string' && bridgeId.length > 0) {
+                BCR_LOG('[BCR] Received SHADOW_READY bridgeId=', bridgeId);
                 resolveShadowReady(bridgeId, payload);
             }
         }
@@ -395,7 +420,8 @@
             const payload = data.payload;
             const bridgeId = payload?.bridgeId;
             if (typeof bridgeId === 'string' && bridgeId.length > 0) {
-                rejectShadowReady(bridgeId);
+                BCR_LOG('[BCR] Received SHADOW_ERROR bridgeId=', bridgeId, 'stage=', payload?.stage, 'reason=', payload?.reason);
+                rejectShadowReady(bridgeId, payload?.reason ?? 'shadow_error');
             }
         }
     });
@@ -407,6 +433,8 @@
         rtcProto.__BCR_RTC_SHADOW_PATCHED__ !== true
     ) {
         installPeerConstructorHook();
+        BCR_LOG('[BCR] Hooking setRemoteDescription...');
+        BCR_LOG('[BCR] Hooking setLocalDescription...');
 
         Object.defineProperty(rtcProto, '__BCR_RTC_SHADOW_PATCHED__', {
             value: true,
@@ -431,7 +459,30 @@
                 timestamp: Date.now(),
             });
 
+            BCR_LOG('[BCR] Captured SDP type:', description.type ?? 'unknown', 'direction=local bridgeId=', entry.bridgeId);
+
+            // When the browser is creating an offer (offerer role), invalidate any stale
+            // SHADOW_READY from a previous negotiation so we wait for fresh credentials.
+            if ((description.type ?? '').toLowerCase() === 'offer') {
+                rtcReadyByBridgeId.delete(entry.bridgeId);
+            }
+
             const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
+
+            const currentEntry = ensureRtcState(this);
+            if (currentEntry.bridgeId !== entry.bridgeId) {
+                BCR_LOG('[BCR] BridgeId changed during setLocalDescription; fail-open with original SDP old=', entry.bridgeId, 'new=', currentEntry.bridgeId);
+                return origSetLocalDescription.apply(this, args);
+            }
+
+            if (!shadowReady) {
+                const errReason = consumeShadowErrorReason(entry.bridgeId);
+                if (errReason) {
+                    BCR_LOG('[BCR] Received SHADOW_ERROR, fail-open via original setLocalDescription bridgeId=', entry.bridgeId, 'reason=', errReason);
+                } else {
+                    BCR_LOG('[BCR] SHADOW_READY timeout, fail-open via original setLocalDescription bridgeId=', entry.bridgeId);
+                }
+            }
             const mungedSdp = shadowReady ? mungeSdpTransport(description.sdp, shadowReady) : description.sdp;
             const patchedDescription = buildDescriptionLike(description, mungedSdp);
 
@@ -447,6 +498,15 @@
             ) {
                 const entry = ensureRtcState(this);
                 entry.lastSeen = performance.now();
+
+                BCR_LOG('[BCR] Captured SDP type:', description.type, 'direction=remote bridgeId=', entry.bridgeId);
+
+                // When a new remote offer arrives, the shadow PC will be rebuilt with
+                // fresh credentials. Invalidate any stale SHADOW_READY so the upcoming
+                // setLocalDescription(answer) waits for the fresh response.
+                if (description.type.toLowerCase() === 'offer') {
+                    rtcReadyByBridgeId.delete(entry.bridgeId);
+                }
 
                 emitShadowEvent('BCR_RTC_SHADOW_REMOTE', {
                     bridgeId: entry.bridgeId,
@@ -468,9 +528,9 @@
             }
             return origPlay.call(this);
         },
-        writable:     true,
+        writable: true,
         configurable: true,
-        enumerable:   false,
+        enumerable: false,
     });
 
     // load() → no-op for suppressed unless WE are the ones calling it.
@@ -499,7 +559,7 @@
                 srcObjectDesc.set.call(this, value);
             },
             configurable: true,
-            enumerable:   true,
+            enumerable: true,
         });
     }
 
@@ -519,22 +579,22 @@
                 srcDesc.set.call(this, value);
             },
             configurable: true,
-            enumerable:   true,
+            enumerable: true,
         });
     }
 
     // ─── MSE Telemetry Helpers (shared with suppression gate) ─────────────────
-    const sourceBufferMeta  = new WeakMap();
-    const sourceBufferIds   = new WeakMap();
-    const loggedFormats     = new Set();
-    let   sourceBufferSeq   = 0;
+    const sourceBufferMeta = new WeakMap();
+    const sourceBufferIds = new WeakMap();
+    const loggedFormats = new Set();
+    let sourceBufferSeq = 0;
 
-    const SCAN_WINDOW_BYTES    = 8192;
+    const SCAN_WINDOW_BYTES = 8192;
     const MOOV_NEAR_START_BYTES = 2048;
 
     function toByteView(data) {
-        if (data instanceof ArrayBuffer)   return new Uint8Array(data);
-        if (ArrayBuffer.isView(data))      return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        if (data instanceof ArrayBuffer) return new Uint8Array(data);
+        if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
         return null;
     }
 
@@ -556,22 +616,22 @@
 
     function resolveTrackType(mimeType, codec) {
         const mt = (mimeType || '').toLowerCase();
-        const c  = (codec    || '').toLowerCase();
-        if (mt.startsWith('audio/'))                           return 'audio';
-        if (mt.startsWith('video/'))                           return 'video';
-        if (mt.includes('text') || mt.includes('vtt'))        return 'text';
+        const c = (codec || '').toLowerCase();
+        if (mt.startsWith('audio/')) return 'audio';
+        if (mt.startsWith('video/')) return 'video';
+        if (mt.includes('text') || mt.includes('vtt')) return 'text';
         if (/(mp4a|opus|vorbis|flac|aac|ac-3|ec-3)/i.test(c)) return 'audio';
-        if (/(avc1|av01|vp8|vp9|hvc1|hev1|theora)/i.test(c))  return 'video';
+        if (/(avc1|av01|vp8|vp9|hvc1|hev1|theora)/i.test(c)) return 'video';
         return 'unknown';
     }
 
     function setSourceBufferMeta(sb, mimeType) {
-        const mime      = typeof mimeType === 'string' ? mimeType : 'unknown';
-        const codec     = extractCodec(mime);
+        const mime = typeof mimeType === 'string' ? mimeType : 'unknown';
+        const codec = extractCodec(mime);
         const trackType = resolveTrackType(mime, codec);
         sourceBufferMeta.set(sb, {
             trackType,
-            mimeType:       mime,
+            mimeType: mime,
             codec,
             sourceBufferId: getOrCreateSourceBufferId(sb),
         });
@@ -617,7 +677,7 @@
         ) return true;
 
         // WebM: EBML header + Segment marker
-        const ebml    = [0x1A, 0x45, 0xDF, 0xA3];
+        const ebml = [0x1A, 0x45, 0xDF, 0xA3];
         const segment = [0x18, 0x53, 0x80, 0x67];
         const hasEbml =
             u8.length >= 4 &&
@@ -641,7 +701,7 @@
                 if (state.suppressedMediaSources.has(this)) {
                     state.suppressedSourceBuffers.add(sb);
                 }
-            } catch (_) {}
+            } catch (_) { }
             return sb;
         };
     }
@@ -653,7 +713,7 @@
     if (typeof origChangeType === 'function') {
         SourceBuffer.prototype.changeType = function patchedChangeType(mimeType) {
             const result = origChangeType.call(this, mimeType);
-            try { setSourceBufferMeta(this, mimeType); } catch (_) {}
+            try { setSourceBufferMeta(this, mimeType); } catch (_) { }
             return result;
         };
     }
@@ -681,9 +741,9 @@
                 const copied = view.slice(); // fresh copy — original 'data' stays intact
 
                 const meta = sourceBufferMeta.get(this) ?? {
-                    trackType:      'unknown',
-                    mimeType:       'unknown',
-                    codec:          'unknown',
+                    trackType: 'unknown',
+                    mimeType: 'unknown',
+                    codec: 'unknown',
                     sourceBufferId: getOrCreateSourceBufferId(this),
                 };
 
@@ -699,21 +759,21 @@
                 // copied.buffer is transferred (zero-copy) to the content script.
                 window.postMessage(
                     {
-                        type:           'BCR_MEDIA_CHUNK',
-                        size:           copied.byteLength,
-                        ts:             performance.now(),
-                        trackType:      meta.trackType,
-                        mimeType:       meta.mimeType,
-                        codec:          meta.codec,
+                        type: 'BCR_MEDIA_CHUNK',
+                        size: copied.byteLength,
+                        ts: performance.now(),
+                        trackType: meta.trackType,
+                        mimeType: meta.mimeType,
+                        codec: meta.codec,
                         sourceBufferId: meta.sourceBufferId,
                         isInitSegment,
-                        chunkBuffer:    copied.buffer,
+                        chunkBuffer: copied.buffer,
                     },
                     '*',
                     [copied.buffer]  // transfer ownership to content script
                 );
             }
-        } catch (_) {}
+        } catch (_) { }
 
         if (isSuppressed) {
             // Gate the native call — decoder never receives this data.
@@ -723,7 +783,7 @@
                 try {
                     sb.dispatchEvent(new Event('update'));
                     sb.dispatchEvent(new Event('updateend'));
-                } catch (_) {}
+                } catch (_) { }
             });
             return; // intentional: no origAppendBuffer call
         }

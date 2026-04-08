@@ -31,6 +31,11 @@ func ReadLoop(conn *Connection, registry *Registry) {
 		log.Printf("[router] read loop exited (id=%s, role=%s)", conn.ID, conn.Role)
 	}()
 
+	if conn.Role == "extension" {
+		handleExtensionIngressLoop(conn, registry)
+		return
+	}
+
 	for {
 		msgType, data, err := conn.WS.ReadMessage()
 		if err != nil {
@@ -45,9 +50,6 @@ func ReadLoop(conn *Connection, registry *Registry) {
 		}
 
 		switch conn.Role {
-		case "extension":
-			handleExtensionMessage(msgType, data, registry)
-
 		case "client":
 			handleClientMessage(msgType, data, registry, conn.ID)
 
@@ -55,6 +57,91 @@ func ReadLoop(conn *Connection, registry *Registry) {
 			log.Printf("[router] received message from unknown role %q (id=%s) — dropped", conn.Role, conn.ID)
 		}
 	}
+}
+
+type extensionIngressMessage struct {
+	msgType int
+	data    []byte
+}
+
+func handleExtensionIngressLoop(conn *Connection, registry *Registry) {
+	const (
+		highPriorityQueueSize = 256
+		lowPriorityQueueSize  = 1024
+	)
+
+	highPriorityCh := make(chan extensionIngressMessage, highPriorityQueueSize)
+	lowPriorityCh := make(chan extensionIngressMessage, lowPriorityQueueSize)
+
+	var workers sync.WaitGroup
+	workers.Add(2)
+
+	go func() {
+		defer workers.Done()
+		for msg := range highPriorityCh {
+			handleExtensionMessage(msg.msgType, msg.data, registry)
+		}
+	}()
+
+	go func() {
+		defer workers.Done()
+		for msg := range lowPriorityCh {
+			handleExtensionMessage(msg.msgType, msg.data, registry)
+		}
+	}()
+
+	for {
+		msgType, data, err := conn.WS.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err,
+				websocket.CloseGoingAway,
+				websocket.CloseNormalClosure,
+				websocket.CloseNoStatusReceived,
+			) {
+				log.Printf("[router] unexpected close error (id=%s, role=%s): %v", conn.ID, conn.Role, err)
+			}
+			break
+		}
+
+		msg := extensionIngressMessage{msgType: msgType, data: data}
+
+		switch msgType {
+		case websocket.TextMessage:
+			if isRTCShadowUpstreamPacket(data) {
+				select {
+				case highPriorityCh <- msg:
+				default:
+					select {
+					case highPriorityCh <- msg:
+					case <-time.After(250 * time.Millisecond):
+						packetType, bridgeID := packetTypeAndBridgeID(data)
+						log.Printf("[router] SHADOW_UP dropped reason=high_priority_backpressure type=%s bridgeId=%s", packetType, bridgeID)
+					}
+				}
+				continue
+			}
+
+			select {
+			case lowPriorityCh <- msg:
+			default:
+				log.Printf("[router] extension telemetry dropped reason=low_priority_queue_full bytes=%d", len(data))
+			}
+
+		case websocket.BinaryMessage:
+			select {
+			case lowPriorityCh <- msg:
+			default:
+				log.Printf("[router] MEDIA_CHUNK dropped reason=low_priority_queue_full bytes=%d", len(data))
+			}
+
+		default:
+			log.Printf("[router] unsupported extension msgType=%d (%d bytes) — dropped", msgType, len(data))
+		}
+	}
+
+	close(highPriorityCh)
+	close(lowPriorityCh)
+	workers.Wait()
 }
 
 func handleExtensionMessage(msgType int, data []byte, registry *Registry) {
@@ -219,9 +306,11 @@ func handleMediaBinaryFrame(data []byte, registry *Registry) {
 }
 
 const (
-	bridgeURL            = "ws://localhost:8081"
+	bridgeControlURL     = "ws://localhost:8081?channel=control"
+	bridgeDataURL        = "ws://localhost:8081?channel=data"
 	bridgeReconnectDelay = 2 * time.Second
-	bridgeQueueSize      = 512
+	bridgeControlQueue   = 512
+	bridgeDataQueue      = 512
 
 	// Safe mode toggle:
 	// "all" (default), "video-only", "audio-only"
@@ -251,21 +340,23 @@ type bridgeChunk struct {
 
 type bridgeForwarder struct {
 	startOnce sync.Once
-	sendCh    chan bridgeMessage
+	controlCh chan bridgeMessage
+	dataCh    chan bridgeMessage
 }
 
 var mediaBridge = newBridgeForwarder()
 
 func newBridgeForwarder() *bridgeForwarder {
 	return &bridgeForwarder{
-		sendCh: make(chan bridgeMessage, bridgeQueueSize),
+		controlCh: make(chan bridgeMessage, bridgeControlQueue),
+		dataCh:    make(chan bridgeMessage, bridgeDataQueue),
 	}
 }
 
-func (b *bridgeForwarder) writeLoop(conn *websocket.Conn) error {
-	for msg := range b.sendCh {
+func (b *bridgeForwarder) writeLoop(conn *websocket.Conn, sendCh <-chan bridgeMessage, channel string) error {
+	for msg := range sendCh {
 		if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
-			log.Printf("[Bridge] ERROR send failed type=%d kind=%s: %v", msg.msgType, msg.kind, err)
+			log.Printf("[Bridge] ERROR send failed channel=%s type=%d kind=%s: %v", channel, msg.msgType, msg.kind, err)
 			return err
 		}
 
@@ -285,20 +376,21 @@ func (b *bridgeForwarder) writeLoop(conn *websocket.Conn) error {
 
 func (b *bridgeForwarder) start() {
 	b.startOnce.Do(func() {
-		go b.run()
+		go b.runControlPath()
+		go b.runDataPath()
 	})
 }
 
-func (b *bridgeForwarder) run() {
+func (b *bridgeForwarder) runControlPath() {
 	for {
-		conn, _, err := websocket.DefaultDialer.Dial(bridgeURL, nil)
+		conn, _, err := websocket.DefaultDialer.Dial(bridgeControlURL, nil)
 		if err != nil {
-			log.Printf("[Bridge] Reconnecting... dial failed: %v", err)
+			log.Printf("[Bridge] control reconnecting... dial failed: %v", err)
 			time.Sleep(bridgeReconnectDelay)
 			continue
 		}
 
-		log.Printf("[Bridge] Connected to bcr_client")
+		log.Printf("[Bridge] control connected to bcr_client")
 
 		readDone := make(chan struct{})
 		go func() {
@@ -333,16 +425,40 @@ func (b *bridgeForwarder) run() {
 			}
 		}()
 
-		err = b.writeLoop(conn)
+		err = b.writeLoop(conn, b.controlCh, "control")
 		if err != nil {
-			log.Printf("[Bridge] Disconnected: %v", err)
+			log.Printf("[Bridge] control disconnected: %v", err)
 		} else {
-			log.Printf("[Bridge] Disconnected")
+			log.Printf("[Bridge] control disconnected")
 		}
 
 		_ = conn.Close()
 		<-readDone
-		log.Printf("[Bridge] Reconnecting...")
+		log.Printf("[Bridge] control reconnecting...")
+		time.Sleep(bridgeReconnectDelay)
+	}
+}
+
+func (b *bridgeForwarder) runDataPath() {
+	for {
+		conn, _, err := websocket.DefaultDialer.Dial(bridgeDataURL, nil)
+		if err != nil {
+			log.Printf("[Bridge] data reconnecting... dial failed: %v", err)
+			time.Sleep(bridgeReconnectDelay)
+			continue
+		}
+
+		log.Printf("[Bridge] data connected to bcr_client")
+
+		err = b.writeLoop(conn, b.dataCh, "data")
+		if err != nil {
+			log.Printf("[Bridge] data disconnected: %v", err)
+		} else {
+			log.Printf("[Bridge] data disconnected")
+		}
+
+		_ = conn.Close()
+		log.Printf("[Bridge] data reconnecting...")
 		time.Sleep(bridgeReconnectDelay)
 	}
 }
@@ -383,7 +499,7 @@ func (b *bridgeForwarder) tryForwardBinary(track, mime string, seq int64, isInit
 	payload := append([]byte(nil), data...)
 
 	select {
-	case b.sendCh <- bridgeMessage{
+	case b.dataCh <- bridgeMessage{
 		msgType: websocket.BinaryMessage,
 		kind:    "media",
 		data:    payload,
@@ -394,7 +510,7 @@ func (b *bridgeForwarder) tryForwardBinary(track, mime string, seq int64, isInit
 	}:
 	default:
 		if isInit {
-			log.Printf("[Bridge] SKIP media init reason=bridge_queue_full track=%s", track)
+			log.Printf("[Bridge] SKIP media init reason=data_queue_full track=%s", track)
 		}
 	}
 }
@@ -407,7 +523,7 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 		packetType == PacketTypeRTCShadowClose ||
 		packetType == PacketTypeRTCShadowCandidate
 
-	if len(b.sendCh) > (bridgeQueueSize*3)/4 {
+	if len(b.controlCh) > (bridgeControlQueue*3)/4 {
 		if isShadow {
 			log.Printf("[Bridge] SHADOW_UP dropped reason=bridge_busy type=%s bridgeId=%s", packetType, bridgeID)
 		}
@@ -417,7 +533,7 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 	payload := append([]byte(nil), data...)
 
 	select {
-	case b.sendCh <- bridgeMessage{
+	case b.controlCh <- bridgeMessage{
 		msgType:    websocket.TextMessage,
 		kind:       "telemetry",
 		data:       payload,
