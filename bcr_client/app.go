@@ -53,6 +53,16 @@ func (a *App) startup(ctx context.Context) {
 			OnLog: func(message string) {
 				log.Println(message)
 			},
+			// OnRelayOffer fires when the Pion relay PC has gathered ICE candidates
+			// and is ready for the Wails WebView to connect as the WebRTC answerer.
+			OnRelayOffer: func(bridgeID, sdp string) {
+				type relayOfferPayload struct {
+					BridgeID string `json:"bridgeId"`
+					SDP      string `json:"sdp"`
+				}
+				log.Printf("[app] relay offer ready bridgeId=%s sdpLen=%d", bridgeID, len(sdp))
+				runtime.EventsEmit(a.ctx, "onRelayOffer", relayOfferPayload{BridgeID: bridgeID, SDP: sdp})
+			},
 		},
 	)
 
@@ -118,6 +128,16 @@ func (a *App) SendSdpAnswer(sdp string) {
 		}
 	} else {
 		log.Println("Cannot send SDP Answer: No active TCP connection.")
+	}
+}
+
+// SendRelayAnswer delivers the Wails frontend's WebRTC answer SDP to the Pion
+// relay PeerConnection so ICE+DTLS can complete and media flows to <video>.
+func (a *App) SendRelayAnswer(bridgeID string, sdp string) {
+	if err := a.mediaEngine.HandleRelayAnswer(bridgeID, sdp); err != nil {
+		log.Printf("[app] SendRelayAnswer failed bridgeId=%s err=%v", bridgeID, err)
+	} else {
+		log.Printf("[app] SendRelayAnswer OK bridgeId=%s", bridgeID)
 	}
 }
 

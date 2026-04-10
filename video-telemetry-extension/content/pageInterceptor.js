@@ -58,6 +58,8 @@
     const rtcProto = window.RTCPeerConnection?.prototype;
     const origSetLocalDescription = rtcProto?.setLocalDescription;
     const origSetRemoteDescription = rtcProto?.setRemoteDescription;
+    const origCreateOffer = rtcProto?.createOffer;
+    const origCreateAnswer = rtcProto?.createAnswer;
     const origRTCPeerConnection = window.RTCPeerConnection;
 
     // Property descriptors (needed to bypass our own patches internally)
@@ -313,19 +315,83 @@
         return next;
     }
 
+    function dispatchShadowTrickleCandidates(pc, candidates) {
+        let candidateLines = [];
+        if (Array.isArray(candidates)) {
+            candidateLines = candidates.filter(line => typeof line === 'string' && line.trim().length > 0);
+        }
+
+        let mid = '0';
+        BCR_LOG('[BCR] Preparing to synthetically trickle', candidateLines.length, 'candidates...');
+
+        // Stagger dispatching synthetic candidates slightly avoiding queue flood
+        candidateLines.forEach((line, index) => {
+            setTimeout(() => {
+                try {
+                    let candidateStr = line.trim();
+                    if (candidateStr.startsWith('a=')) {
+                        candidateStr = candidateStr.substring(2); // strictly remove "a="
+                    }
+                    if (candidateStr.startsWith('candidate:')) {
+                        candidateStr = candidateStr.substring(10); // strictly remove "candidate:" if present natively
+                    }
+                    candidateStr = candidateStr.trim();
+                    
+                    const candidateDict = {
+                        candidate: candidateStr,
+                        sdpMLineIndex: 0,
+                        sdpMid: mid
+                    };
+                    const rtcCandidate = (typeof window.RTCIceCandidate === 'function')
+                        ? new window.RTCIceCandidate(candidateDict)
+                        : candidateDict;
+
+                    let event;
+                    if (typeof window.RTCPeerConnectionIceEvent === 'function') {
+                        event = new window.RTCPeerConnectionIceEvent('icecandidate', { candidate: rtcCandidate });
+                    } else {
+                        event = new Event('icecandidate');
+                        event.candidate = rtcCandidate;
+                    }
+                    pc.dispatchEvent(event);
+                } catch (e) {
+                    BCR_LOG('[BCR] Failed to synthetically dispatch ice candidate:', e);
+                }
+            }, index * 20 + 50); // slight offset start + stagger
+        });
+
+        // Finally dispatch end-of-candidates
+        setTimeout(() => {
+            try {
+                let nullEvent;
+                if (typeof window.RTCPeerConnectionIceEvent === 'function') {
+                    nullEvent = new window.RTCPeerConnectionIceEvent('icecandidate', { candidate: null });
+                } else {
+                    nullEvent = new Event('icecandidate');
+                    nullEvent.candidate = null;
+                }
+                pc.dispatchEvent(nullEvent);
+                BCR_LOG('[BCR] Synthetic ICE Trickle complete, dispatched', candidateLines.length, 'candidates');
+            } catch (e) {
+                BCR_LOG('[BCR] Synthetic ICE Trickle end dispatch failed:', e);
+            }
+        }, candidateLines.length * 20 + 80);
+    }
+
     function mungeSdpTransport(sdp, shadow) {
         if (typeof sdp !== 'string' || !shadow) return sdp;
 
         let munged = sdp;
 
+        // ── ICE credentials ────────────────────────────────────────────────────
         if (typeof shadow.iceUfrag === 'string' && shadow.iceUfrag.length > 0) {
             munged = munged.replace(/^a=ice-ufrag:.*$/gm, `a=ice-ufrag:${shadow.iceUfrag}`);
         }
-
         if (typeof shadow.icePwd === 'string' && shadow.icePwd.length > 0) {
             munged = munged.replace(/^a=ice-pwd:.*$/gm, `a=ice-pwd:${shadow.icePwd}`);
         }
 
+        // ── DTLS fingerprint ───────────────────────────────────────────────────
         if (typeof shadow.dtlsFingerprint === 'string' && shadow.dtlsFingerprint.length > 0) {
             const fullFingerprint = shadow.dtlsFingerprint.trim();
             if (/^[A-Za-z0-9-]+\s+[0-9A-Fa-f:]+$/.test(fullFingerprint)) {
@@ -338,8 +404,36 @@
             }
         }
 
+        // ── Connection address ─────────────────────────────────────────────────
         if (typeof shadow.localIp === 'string' && shadow.localIp.length > 0) {
             munged = munged.replace(/^c=IN IP4\s+.*$/gm, `c=IN IP4 ${shadow.localIp}`);
+        }
+
+        // ── ICE candidates ─────────────────────────────────────────────────────
+        // Replace the browser's own a=candidate lines with the shadow PC's
+        // gathered candidates. This points the remote peer at the shadow's
+        // actual transport address (bcr_client's local IP + UDP port).
+        // a=end-of-candidates is also removed; we re-insert it after injection.
+        if (Array.isArray(shadow.candidates) && shadow.candidates.length > 0) {
+            // Detect line ending used in this SDP.
+            const nl = munged.includes('\r\n') ? '\r\n' : '\n';
+
+            // Strip existing candidate and end-of-candidates lines.
+            munged = munged.replace(/^a=candidate:.*$/gm, '');
+            munged = munged.replace(/^a=end-of-candidates.*$/gm, '');
+            // Clean up any blank lines left behind.
+            munged = munged.replace(/(\r?\n){3,}/g, `${nl}${nl}`);
+
+            // Inject shadow candidates after the first a=ice-pwd: line
+            // (which marks the start of the media transport block in BUNDLE).
+            // We inject once only — in BUNDLE mode a single ICE session serves all m-lines.
+            let injected = false;
+            const candidateBlock = shadow.candidates.join(nl) + nl + 'a=end-of-candidates';
+            munged = munged.replace(/(a=ice-pwd:[^\r\n]+)(\r?\n)/g, (match, pwd, newline) => {
+                if (injected) return match;
+                injected = true;
+                return pwd + newline + candidateBlock + newline;
+            });
         }
 
         return munged;
@@ -385,6 +479,20 @@
         const PatchedRTCPeerConnection = function BCRPatchedRTCPeerConnection(...args) {
             const pc = new origRTCPeerConnection(...args);
             attachPeerLifecycleHooks(pc);
+
+            // Capture the ICE server configuration from the VDI app so the shadow PC
+            // can use the same STUN/TURN servers for connectivity.
+            const config = args[0];
+            if (config && Array.isArray(config.iceServers) && config.iceServers.length > 0) {
+                const entry = ensureRtcState(pc);
+                entry.iceServers = config.iceServers.map(s => ({
+                    urls: Array.isArray(s.urls) ? s.urls : (s.url ? [s.url] : []),
+                    username: s.username ?? '',
+                    credential: s.credential ?? '',
+                }));
+                BCR_LOG('[BCR] Captured', entry.iceServers.length, 'ICE server(s) for bridgeId=', entry.bridgeId);
+            }
+
             return pc;
         };
 
@@ -430,6 +538,8 @@
         rtcProto &&
         typeof origSetLocalDescription === 'function' &&
         typeof origSetRemoteDescription === 'function' &&
+        typeof origCreateOffer === 'function' &&
+        typeof origCreateAnswer === 'function' &&
         rtcProto.__BCR_RTC_SHADOW_PATCHED__ !== true
     ) {
         installPeerConstructorHook();
@@ -443,6 +553,39 @@
             enumerable: false,
         });
 
+        // ── localDescription / currentLocalDescription getter patches ────────
+        // The VDI app reads pc.localDescription to obtain the SDP it sends over
+        // signaling. We intercept the getter to return a munged copy containing
+        // the shadow PC's credentials and candidates so the remote peer connects
+        // to the shadow transport instead of the browser's real ICE agent.
+        const origLocalDescGetter = Object.getOwnPropertyDescriptor(rtcProto, 'localDescription');
+        const origCurrentLocalDescGetter = Object.getOwnPropertyDescriptor(rtcProto, 'currentLocalDescription');
+
+        function getMungedLocalDesc(origGetter, pc) {
+            const desc = origGetter.call(pc);
+            if (!desc || !desc.sdp) return desc;
+            const entry = rtcStateByPeer.get(pc);
+            if (!entry || !entry.shadowCredentials) return desc;
+            const mungedSdp = mungeSdpTransport(desc.sdp, entry.shadowCredentials);
+            // Return a plain object that looks like RTCSessionDescription
+            return { type: desc.type, sdp: mungedSdp };
+        }
+
+        if (origLocalDescGetter && origLocalDescGetter.get) {
+            Object.defineProperty(rtcProto, 'localDescription', {
+                get() { return getMungedLocalDesc(origLocalDescGetter.get, this); },
+                configurable: true,
+                enumerable: true,
+            });
+        }
+        if (origCurrentLocalDescGetter && origCurrentLocalDescGetter.get) {
+            Object.defineProperty(rtcProto, 'currentLocalDescription', {
+                get() { return getMungedLocalDesc(origCurrentLocalDescGetter.get, this); },
+                configurable: true,
+                enumerable: true,
+            });
+        }
+
         rtcProto.setLocalDescription = async function patchedSetLocalDescription(...args) {
             const description = args[0];
             if (!description || typeof description.sdp !== 'string') {
@@ -452,41 +595,90 @@
             const entry = ensureRtcState(this);
             entry.lastSeen = performance.now();
 
-            emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
-                bridgeId: entry.bridgeId,
-                sdpType: description.type ?? 'unknown',
-                sdp: description.sdp,
-                timestamp: Date.now(),
-            });
+            let origSdpString = description.sdp;
+            let isRedundant = false;
 
-            BCR_LOG('[BCR] Captured SDP type:', description.type ?? 'unknown', 'direction=local bridgeId=', entry.bridgeId);
-
-            // When the browser is creating an offer (offerer role), invalidate any stale
-            // SHADOW_READY from a previous negotiation so we wait for fresh credentials.
-            if ((description.type ?? '').toLowerCase() === 'offer') {
-                rtcReadyByBridgeId.delete(entry.bridgeId);
-            }
-
-            const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
-
-            const currentEntry = ensureRtcState(this);
-            if (currentEntry.bridgeId !== entry.bridgeId) {
-                BCR_LOG('[BCR] BridgeId changed during setLocalDescription; fail-open with original SDP old=', entry.bridgeId, 'new=', currentEntry.bridgeId);
-                return origSetLocalDescription.apply(this, args);
-            }
-
-            if (!shadowReady) {
-                const errReason = consumeShadowErrorReason(entry.bridgeId);
-                if (errReason) {
-                    BCR_LOG('[BCR] Received SHADOW_ERROR, fail-open via original setLocalDescription bridgeId=', entry.bridgeId, 'reason=', errReason);
-                } else {
-                    BCR_LOG('[BCR] SHADOW_READY timeout, fail-open via original setLocalDescription bridgeId=', entry.bridgeId);
+            if (entry.lastOriginalLocalSdp && entry.shadowCredentials) {
+                // Determine if this setLocalDescription is just the subsequent application
+                // of the offer/answer we just generated upstream in createOffer/createAnswer.
+                const typeMatches = (description.type ?? '').toLowerCase() === (entry.lastCreateActionType ?? '').toLowerCase();
+                
+                if (typeMatches) {
+                    isRedundant = true;
+                    // Because the VDI app could have mutated the SDP structurally by stripping codecs
+                    // before giving it back to us, we just safely pass the last raw original local SDP
+                    // back into Chrome to prevent DOMExceptions out of ICE mismatches.
+                    origSdpString = entry.lastOriginalLocalSdp;
                 }
             }
-            const mungedSdp = shadowReady ? mungeSdpTransport(description.sdp, shadowReady) : description.sdp;
-            const patchedDescription = buildDescriptionLike(description, mungedSdp);
 
-            return origSetLocalDescription.apply(this, [patchedDescription, ...args.slice(1)]);
+            if (!isRedundant) {
+                emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
+                    bridgeId: entry.bridgeId,
+                    sdpType: description.type ?? 'unknown',
+                    sdp: description.sdp,
+                    iceServers: entry.iceServers ?? [],
+                    timestamp: Date.now(),
+                });
+
+                BCR_LOG('[BCR] Captured SDP type:', description.type ?? 'unknown', 'direction=local bridgeId=', entry.bridgeId);
+
+                if ((description.type ?? '').toLowerCase() === 'offer') {
+                    rtcReadyByBridgeId.delete(entry.bridgeId);
+                }
+
+                const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
+                
+                const currentEntry = ensureRtcState(this);
+                if (currentEntry.bridgeId !== entry.bridgeId) {
+                    BCR_LOG('[BCR] BridgeId changed during setLocalDescription; fail-open with original SDP');
+                    return origSetLocalDescription.apply(this, args);
+                }
+
+                if (!shadowReady) {
+                    const errReason = consumeShadowErrorReason(entry.bridgeId);
+                    BCR_LOG('[BCR] SHADOW_READY timeout or error, fail-open bridgeId=', entry.bridgeId, 'reason=', errReason ?? 'timeout');
+                    entry.shadowCredentials = null;
+                } else {
+                    entry.shadowCredentials = shadowReady;
+                    BCR_LOG('[BCR] Shadow credentials stored bridgeId=', entry.bridgeId);
+                }
+            } else {
+                BCR_LOG('[BCR] Skipping redundant SHADOW_LOCAL for pre-munged SDP bridgeId=', entry.bridgeId);
+            }
+
+            // CRITICAL: Pass the ORIGINAL SDP to Chrome's native method.
+            // Chrome's ICE agent validates that ice-ufrag/pwd match its internal state.
+            const chromeSafeDescription = {
+                type: description.type,
+                sdp: origSdpString
+            };
+
+            const result = await origSetLocalDescription.apply(this, [chromeSafeDescription, ...args.slice(1)]);
+
+            // After Chrome accepts the original SDP, mutate the argument if the framework reads it later.
+            if (entry.shadowCredentials) {
+                const targetSdp = mungeSdpTransport(origSdpString, entry.shadowCredentials);
+                try {
+                    description.sdp = targetSdp;
+                    BCR_LOG('[BCR] Description object mutated with shadow SDP bridgeId=', entry.bridgeId);
+                } catch (_) {
+                    BCR_LOG('[BCR] Description object mutation failed (frozen) bridgeId=', entry.bridgeId);
+                }
+            }
+
+            // After setLocalDescription succeeds, start trickling the ICE candidates 
+            // cached securely inside the shadow setup properties out into the VDI framework.
+            if (entry.shadowCredentials && Array.isArray(entry.shadowCredentials.candidates)) {
+                // Deduplicate by tracking the signature of the generation
+                const generationId = entry.shadowCredentials.generatedAt || entry.shadowCredentials.iceUfrag;
+                if (entry.lastDispatchedTrickleId !== generationId) {
+                    entry.lastDispatchedTrickleId = generationId;
+                    dispatchShadowTrickleCandidates(this, entry.shadowCredentials.candidates);
+                }
+            }
+
+            return result;
         };
 
         rtcProto.setRemoteDescription = function patchedSetRemoteDescription(...args) {
@@ -515,8 +707,148 @@
                     timestamp: Date.now(),
                 });
             }
-            return origSetRemoteDescription.apply(this, args);
+            // The browser's own PeerConnection will often fail ICE because its native
+            // candidates are suppressed and replaced with shadow candidates. For managed
+            // connections, catch and suppress the rejection to prevent Teams from
+            // detecting the failure and triggering a renegotiation storm.
+            const srdPromise = origSetRemoteDescription.apply(this, args);
+            const entry2 = rtcStateByPeer.get(this);
+            if (entry2 && entry2.shadowCredentials) {
+                return srdPromise.catch((err) => {
+                    BCR_LOG('[BCR] setRemoteDescription failed (expected for managed connection) bridgeId=',
+                        entry2.bridgeId, 'err=', err?.message || err);
+                    // Swallow — the shadow PC handles the real connection to Teams.
+                });
+            }
+            return srdPromise;
         };
+
+        async function patchedCreateAction(origMethod, actionType, ...args) {
+            const origDescription = await origMethod.apply(this, args);
+            // In case creation failed or returned nothing
+            if (!origDescription || typeof origDescription.sdp !== 'string') {
+                return origDescription;
+            }
+
+            const entry = ensureRtcState(this);
+            entry.lastSeen = performance.now();
+            entry.lastCreateActionType = actionType;
+
+            emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
+                bridgeId: entry.bridgeId,
+                sdpType: origDescription.type ?? actionType,
+                sdp: origDescription.sdp,
+                iceServers: entry.iceServers ?? [],
+                timestamp: Date.now(),
+            });
+
+            BCR_LOG('[BCR] Captured SDP type:', origDescription.type ?? actionType, 'direction=local build from', actionType, 'bridgeId=', entry.bridgeId);
+            
+            // Wait for the freshly built shadow PC's credentials
+            const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
+            
+            const currentEntry = ensureRtcState(this);
+            if (currentEntry.bridgeId !== entry.bridgeId) {
+                BCR_LOG('[BCR] BridgeId changed during', actionType, 'fail-open with original SDP');
+                return origDescription;
+            }
+
+            if (shadowReady) {
+                entry.shadowCredentials = shadowReady;
+                // Store the original SDP so we can retrieve it in setLocalDescription later.
+                entry.lastOriginalLocalSdp = origDescription.sdp;
+
+                const mungedSdp = mungeSdpTransport(origDescription.sdp, entry.shadowCredentials);
+                BCR_LOG('[BCR]', actionType, 'resolved and munged seamlessly bridgeId=', entry.bridgeId);
+                
+                // Must return an object that circumvents strict instanceof RTCSessionDescription checks inside RxJS / React data pipelines
+                return buildDescriptionLike(origDescription, mungedSdp);
+            }
+
+            BCR_LOG('[BCR] SHADOW_READY timeout or error during', actionType, 'fail-open via original result bridgeId=', entry.bridgeId);
+            return origDescription;
+        }
+
+        rtcProto.createOffer = function patchedCreateOffer(...args) {
+            rtcReadyByBridgeId.delete(ensureRtcState(this).bridgeId);
+            return patchedCreateAction.call(this, origCreateOffer, 'offer', ...args);
+        };
+
+        rtcProto.createAnswer = function patchedCreateAnswer(...args) {
+            return patchedCreateAction.call(this, origCreateAnswer, 'answer', ...args);
+        };
+
+        // ── addIceCandidate interception ───────────────────────────────────────
+        // When the VDI signaling delivers remote peer's ICE candidates to the
+        // browser's PC via addIceCandidate, forward them to the shadow PC in
+        // bcr_client so it can respond to the remote peer's connectivity checks.
+        const origAddIceCandidate = rtcProto.addIceCandidate;
+        rtcProto.addIceCandidate = function patchedAddIceCandidate(candidate, ...rest) {
+            if (candidate && candidate.candidate) {
+                const entry = rtcStateByPeer.get(this);
+                if (entry && entry.bridgeId) {
+                    BCR_LOG('[BCR] Forwarding remote ICE candidate to shadow bridgeId=', entry.bridgeId);
+                    emitShadowEvent('BCR_RTC_SHADOW_ICE_CANDIDATE', {
+                        bridgeId:  entry.bridgeId,
+                        candidate: candidate.candidate,
+                        sdpMid:    candidate.sdpMid ?? '0',
+                        timestamp: Date.now(),
+                    });
+                }
+            }
+            // Always call through — the browser's PC still needs to process this
+            // for its own ICE state machine (even if the real connection ends up
+            // going to the shadow).
+            return origAddIceCandidate.apply(this, [candidate, ...rest]);
+        };
+
+        // ── Trickle ICE overrides (addEventListener & onicecandidate) ──────────
+        // Intercept bound listeners to silently drop native Chrome candidates
+        // while allowing our synthetic `bcr_client` STUN payloads to trickle freely natively.
+        const origAddEventListener = rtcProto.addEventListener;
+        rtcProto.addEventListener = function patchedAddEventListener(type, listener, options) {
+            if (type === 'icecandidate' && typeof listener === 'function') {
+                if (!listener.__bcrWrapper) {
+                    listener.__bcrWrapper = function(event) {
+                        if (event.isTrusted) return; // Drop native Chrome trickle!
+                        return listener.apply(this, arguments);
+                    };
+                }
+                return origAddEventListener.call(this, type, listener.__bcrWrapper, options);
+            }
+            return origAddEventListener.call(this, type, listener, options);
+        };
+
+        const origRemoveEventListener = rtcProto.removeEventListener;
+        rtcProto.removeEventListener = function patchedRemoveEventListener(type, listener, options) {
+            if (type === 'icecandidate' && listener && listener.__bcrWrapper) {
+                return origRemoveEventListener.call(this, type, listener.__bcrWrapper, options);
+            }
+            return origRemoveEventListener.call(this, type, listener, options);
+        };
+
+        const onIceDesc = Object.getOwnPropertyDescriptor(rtcProto, 'onicecandidate');
+        if (onIceDesc) {
+            Object.defineProperty(rtcProto, 'onicecandidate', {
+                get() {
+                    return this.__bcrOnIceCandidate || onIceDesc.get.call(this);
+                },
+                set(listener) {
+                    this.__bcrOnIceCandidate = listener;
+                    if (typeof listener === 'function') {
+                        const wrapper = function(event) {
+                            if (event.isTrusted) return; // Drop native Chrome trickle!
+                            return listener.apply(this, arguments);
+                        };
+                        onIceDesc.set.call(this, wrapper);
+                    } else {
+                        onIceDesc.set.call(this, listener);
+                    }
+                },
+                enumerable: true,
+                configurable: true
+            });
+        }
     }
 
     // play() → return resolved Promise for suppressed videos (never reject —

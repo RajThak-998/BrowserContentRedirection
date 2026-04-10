@@ -3,6 +3,8 @@
 
 export function HideWindow():Promise<void>;
 
+export function SendRelayAnswer(arg1:string,arg2:string):Promise<void>;
+
 export function SendSdpAnswer(arg1:string):Promise<void>;
 
 export function SetWindowPosition(arg1:number,arg2:number):Promise<void>;

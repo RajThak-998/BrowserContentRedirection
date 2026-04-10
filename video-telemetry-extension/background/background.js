@@ -18,6 +18,7 @@ const RTC_UPSTREAM_TYPES = new Set([
     "RTC_SHADOW_REMOTE",
     "RTC_SHADOW_LOCAL",
     "RTC_SHADOW_CLOSE",
+    "RTC_SHADOW_ICE_CANDIDATE",
 ]);
 
 const RTC_DOWNSTREAM_TYPES = new Set([
@@ -314,6 +315,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case "RTC_SHADOW_REMOTE":
         case "RTC_SHADOW_LOCAL":
         case "RTC_SHADOW_CLOSE":
+        case "RTC_SHADOW_ICE_CANDIDATE":
             _handleRtcShadow(message, sender, sendResponse);
             break;
 

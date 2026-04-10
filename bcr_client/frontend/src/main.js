@@ -117,6 +117,57 @@ window.onload = function () {
     });
 
     // ==========================================
+    // 1b. Relay Mode (Shadow PC → Wails Player)
+    // ==========================================
+    // onRelayOffer is emitted by Go (app.go) when the Pion relay PC has collected
+    // its ICE candidates and is ready for the Wails WebView to answer.
+    // The resulting RTCPeerConnection receives RTP forwarded from the shadow PC
+    // (which in turn receives it from the remote VDI peer), making it available
+    // as a MediaStream on the <video> element.
+    window.runtime.EventsOn("onRelayOffer", async ({ bridgeId, sdp }) => {
+        isWebRTCLive = true;
+        logTerminal(`[Relay] Offer received bridgeId=${bridgeId} sdpLen=${sdp.length}. Showing window.`);
+        window.go.main.App.ShowWindow();
+
+        // Reset any existing MSE pipeline so the <video> can accept a srcObject.
+        if (videoElement.src) {
+            URL.revokeObjectURL(videoElement.src);
+            videoElement.removeAttribute('src');
+        }
+        if (videoElement.srcObject) {
+            videoElement.srcObject = null;
+        }
+
+        const pc = new RTCPeerConnection({ iceServers: [] }); // localhost relay — no STUN needed
+
+        pc.ontrack = (event) => {
+            logTerminal(`[Relay] Track received kind=${event.track.kind} bridgeId=${bridgeId}`);
+            if (event.streams && event.streams[0]) {
+                videoElement.srcObject = event.streams[0];
+                videoElement.play().catch(err => logErrorTerm(`[Relay] play() error: ${err}`));
+            }
+        };
+
+        pc.onconnectionstatechange = () => {
+            logTerminal(`[Relay] connectionState=${pc.connectionState} bridgeId=${bridgeId}`);
+            if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+                window.go.main.App.HideWindow();
+            }
+        };
+
+        try {
+            await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            logTerminal(`[Relay] Answer created, sending to Go bridgeId=${bridgeId}`);
+            window.go.main.App.SendRelayAnswer(bridgeId, answer.sdp);
+        } catch (err) {
+            logErrorTerm(`[Relay] Negotiation failed bridgeId=${bridgeId}: ${err}`);
+        }
+    });
+
+    // ==========================================
     // 2. MSE Mode (Byte Chunks via WebSocket)
     // ==========================================
     let mediaSource = null;

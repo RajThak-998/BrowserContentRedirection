@@ -10,6 +10,10 @@ type Callbacks struct {
 	OnVideoChunk  func(data []byte)
 	OnVideoUpdate func(update VideoUpdate)
 	OnLog         func(message string)
+	// OnRelayOffer is called when the Pion relay PC has a local offer ready for
+	// the Wails WebRTC frontend. bridgeID identifies the shadow session; sdp is
+	// the full offer SDP the frontend must call setRemoteDescription with.
+	OnRelayOffer func(bridgeID, sdp string)
 }
 
 type Packet struct {
@@ -39,10 +43,24 @@ type RTCShadowRemotePayload struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+type IceServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username"`
+	Credential string   `json:"credential"`
+}
+
 type RTCShadowLocalPayload struct {
+	BridgeID   string      `json:"bridgeId"`
+	SDPType    string      `json:"sdpType"`
+	SDP        string      `json:"sdp"`
+	IceServers []IceServer `json:"iceServers"`
+	Timestamp  int64       `json:"timestamp"`
+}
+
+type RTCShadowCandidatePayload struct {
 	BridgeID  string `json:"bridgeId"`
-	SDPType   string `json:"sdpType"`
-	SDP       string `json:"sdp"`
+	Candidate string `json:"candidate"`
+	SDPMid    string `json:"sdpMid"`
 	Timestamp int64  `json:"timestamp"`
 }
 
@@ -51,13 +69,14 @@ type RTCShadowClosePayload struct {
 }
 
 type RTCShadowReadyPayload struct {
-	BridgeID        string `json:"bridgeId"`
-	ICEUfrag        string `json:"iceUfrag"`
-	ICEPwd          string `json:"icePwd"`
-	DTLSFingerprint string `json:"dtlsFingerprint"`
-	LocalIP         string `json:"localIp"`
-	GeneratedAt     int64  `json:"generatedAt"`
-	ExpiresAt       int64  `json:"expiresAt"`
+	BridgeID        string   `json:"bridgeId"`
+	ICEUfrag        string   `json:"iceUfrag"`
+	ICEPwd          string   `json:"icePwd"`
+	DTLSFingerprint string   `json:"dtlsFingerprint"`
+	LocalIP         string   `json:"localIp"`
+	Candidates      []string `json:"candidates,omitempty"` // a=candidate lines from shadow PC's local description
+	GeneratedAt     int64    `json:"generatedAt"`
+	ExpiresAt       int64    `json:"expiresAt"`
 }
 
 type RTCShadowErrorPayload struct {
@@ -67,3 +86,17 @@ type RTCShadowErrorPayload struct {
 	Retryable bool   `json:"retryable"`
 	Timestamp int64  `json:"timestamp"`
 }
+
+// RTCShadowCandidatePayload carries a single trickle-ICE candidate in either
+// direction: extension → engine (remote peer's candidate) or engine → extension
+// (shadow PC's candidate, for post-gather trickle if needed).
+
+// MediaSection represents a parsed m= section from a browser SDP offer.
+// Used to create structurally-matching transceivers on the shadow PC so that
+// the shadow's offer aligns with the browser's offer.
+type MediaSection struct {
+	Kind      string // "audio", "video", "application"
+	Direction string // "sendrecv", "recvonly", "sendonly", "inactive"
+	Mid       string // "0", "1", "audio", etc. — from a=mid: line
+}
+

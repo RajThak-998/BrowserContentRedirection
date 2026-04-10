@@ -10,11 +10,12 @@ import (
 )
 
 var (
-	iceUfragRe    = regexp.MustCompile(`(?m)^a=ice-ufrag:(.+)$`)
-	icePwdRe      = regexp.MustCompile(`(?m)^a=ice-pwd:(.+)$`)
-	fingerprintRe = regexp.MustCompile(`(?m)^a=fingerprint:(.+)$`)
-	rtpMapLineRe  = regexp.MustCompile(`^a=rtpmap:(\d+)\s+([^/\s]+)/(\d+)(?:/(\d+))?`)
-	fmtpLineRe    = regexp.MustCompile(`^a=fmtp:(\d+)\s+(.+)`)
+	iceUfragRe       = regexp.MustCompile(`(?m)^a=ice-ufrag:(.+)$`)
+	icePwdRe         = regexp.MustCompile(`(?m)^a=ice-pwd:(.+)$`)
+	fingerprintRe    = regexp.MustCompile(`(?m)^a=fingerprint:(.+)$`)
+	candidateLineRe  = regexp.MustCompile(`(?m)^(a=candidate:[^\r\n]+)`)
+	rtpMapLineRe     = regexp.MustCompile(`^a=rtpmap:(\d+)\s+([^/\s]+)/(\d+)(?:/(\d+))?`)
+	fmtpLineRe       = regexp.MustCompile(`^a=fmtp:(\d+)\s+(.+)`)
 )
 
 // ExtractShadowCredentials parses ICE and DTLS credentials from a Pion-generated
@@ -90,7 +91,7 @@ type sdpCodecEntry struct {
 // sdpInternalCodecs are handled by Pion's interceptor pipeline; manual
 // registration causes PT conflicts and must be skipped.
 var sdpInternalCodecs = map[string]bool{
-	"rtx": true, "red": true, "ulpfec": true, "flexfec-03": true, "cn": true,
+	"ulpfec": true, "flexfec-03": true, "cn": true,
 }
 
 // parseSDPCodecs extracts all RTP codec definitions from a browser offer SDP.
@@ -175,3 +176,258 @@ func parseSDPCodecs(sdp string) []sdpCodecEntry {
 	return entries
 }
 
+// ExtractShadowCandidates returns a deduplicated slice of full "a=candidate:..."
+// lines from a Pion-generated local description SDP. In BUNDLE mode Pion repeats
+// the same candidates in every m= section; duplicates are collapsed here so the
+// JS munge injects each candidate exactly once.
+func ExtractShadowCandidates(sdp string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, m := range candidateLineRe.FindAllStringSubmatch(sdp, -1) {
+		cand := strings.TrimRight(m[1], "\r")
+		if cand != "" && !seen[cand] {
+			seen[cand] = true
+			out = append(out, cand)
+		}
+	}
+	return out
+}
+
+// ─── SDP Alignment Helpers ──────────────────────────────────────────────────
+
+var (
+	mLineRe     = regexp.MustCompile(`^m=(\w+)\s+`)
+	directionRe = regexp.MustCompile(`^a=(sendrecv|recvonly|sendonly|inactive)\s*$`)
+	rtcpFbRe    = regexp.MustCompile(`^a=rtcp-fb:(\d+)\s+(.+)`)
+	bundleRe    = regexp.MustCompile(`(?m)^a=group:BUNDLE\s+(.+)$`)
+)
+
+// ParseOfferMediaSections extracts each m= section from an SDP, returning
+// the kind (audio/video/application), direction, and mid for each.
+// This is used to create matching transceivers on the shadow PC.
+func ParseOfferMediaSections(sdp string) []MediaSection {
+	sep := "\r\n"
+	if !strings.Contains(sdp, "\r\n") {
+		sep = "\n"
+	}
+	lines := strings.Split(sdp, sep)
+
+	var sections []MediaSection
+	currentIdx := -1
+
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+
+		if m := mLineRe.FindStringSubmatch(bare); m != nil {
+			sections = append(sections, MediaSection{
+				Kind:      m[1],
+				Direction: "sendrecv", // default per RFC 4566
+			})
+			currentIdx = len(sections) - 1
+			continue
+		}
+
+		if currentIdx < 0 {
+			continue
+		}
+
+		if strings.HasPrefix(bare, "a=mid:") {
+			sections[currentIdx].Mid = strings.TrimRight(strings.TrimPrefix(bare, "a=mid:"), "\r")
+		}
+
+		if m := directionRe.FindStringSubmatch(bare); m != nil {
+			sections[currentIdx].Direction = m[1]
+		}
+	}
+
+	return sections
+}
+
+// ParseSDPCodecsStrict extracts codecs from a browser offer SDP with exact
+// payload type preservation AND rtcp-fb parameters. Unlike parseSDPCodecs,
+// this does NOT rely on RegisterDefaultCodecs — the returned entries carry
+// the exact PT assignments from the browser's offer so the shadow PC produces
+// a structurally identical offer.
+func ParseSDPCodecsStrict(sdp string) []sdpCodecEntry {
+	sep := "\r\n"
+	if !strings.Contains(sdp, "\r\n") {
+		sep = "\n"
+	}
+	lines := strings.Split(sdp, sep)
+
+	// Pass 1: Build PT → fmtp map.
+	fmtpMap := map[uint8]string{}
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+		if m := fmtpLineRe.FindStringSubmatch(bare); m != nil {
+			if pt, err := strconv.ParseUint(m[1], 10, 8); err == nil {
+				fmtpMap[uint8(pt)] = strings.TrimRight(m[2], "\r")
+			}
+		}
+	}
+
+	// Pass 2: Build PT → []RTCPFeedback map.
+	fbMap := map[uint8][]webrtc.RTCPFeedback{}
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+		if m := rtcpFbRe.FindStringSubmatch(bare); m != nil {
+			if pt, err := strconv.ParseUint(m[1], 10, 8); err == nil {
+				fbVal := strings.TrimRight(m[2], "\r")
+				parts := strings.SplitN(fbVal, " ", 2)
+				fb := webrtc.RTCPFeedback{Type: parts[0]}
+				if len(parts) > 1 {
+					fb.Parameter = parts[1]
+				}
+				fbMap[uint8(pt)] = append(fbMap[uint8(pt)], fb)
+			}
+		}
+	}
+
+	// Pass 3: Extract codec entries.
+	var entries []sdpCodecEntry
+	currentType := webrtc.RTPCodecTypeAudio
+
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+
+		if strings.HasPrefix(bare, "m=audio") {
+			currentType = webrtc.RTPCodecTypeAudio
+			continue
+		}
+		if strings.HasPrefix(bare, "m=video") {
+			currentType = webrtc.RTPCodecTypeVideo
+			continue
+		}
+
+		m := rtpMapLineRe.FindStringSubmatch(bare)
+		if m == nil {
+			continue
+		}
+
+		pt64, err := strconv.ParseUint(m[1], 10, 8)
+		if err != nil {
+			continue
+		}
+		codecName := m[2]
+		if sdpInternalCodecs[strings.ToLower(codecName)] {
+			continue
+		}
+		clockRate, err := strconv.ParseUint(m[3], 10, 32)
+		if err != nil {
+			continue
+		}
+		var channels uint16
+		if m[4] != "" {
+			if ch, err2 := strconv.ParseUint(m[4], 10, 16); err2 == nil {
+				channels = uint16(ch)
+			}
+		}
+
+		mimePrefix := "audio/"
+		if currentType == webrtc.RTPCodecTypeVideo {
+			mimePrefix = "video/"
+		}
+
+		pt := uint8(pt64)
+		entries = append(entries, sdpCodecEntry{
+			params: webrtc.RTPCodecParameters{
+				RTPCodecCapability: webrtc.RTPCodecCapability{
+					MimeType:     mimePrefix + codecName,
+					ClockRate:    uint32(clockRate),
+					Channels:     channels,
+					SDPFmtpLine:  fmtpMap[pt],
+					RTCPFeedback: fbMap[pt],
+				},
+				PayloadType: webrtc.PayloadType(pt),
+			},
+			codecType: currentType,
+		})
+	}
+	return entries
+}
+
+// ExtractAnswerMids returns the ordered list of a=mid: values from an SDP.
+func ExtractAnswerMids(sdp string) []string {
+	sep := "\r\n"
+	if !strings.Contains(sdp, "\r\n") {
+		sep = "\n"
+	}
+	lines := strings.Split(sdp, sep)
+
+	var mids []string
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+		if strings.HasPrefix(bare, "a=mid:") {
+			mids = append(mids, strings.TrimRight(strings.TrimPrefix(bare, "a=mid:"), "\r"))
+		}
+	}
+	return mids
+}
+
+// TranslateAnswerMids rewrites an answer SDP so that its mid references match
+// the shadow's offer mids instead of the browser's. This is needed when the
+// browser assigns mids like "audio", "video" but Pion assigns "0", "1".
+// The remapping is positional: answer's first mid → shadow's first mid, etc.
+func TranslateAnswerMids(answerSDP, shadowOfferSDP string) string {
+	answerMids := ExtractAnswerMids(answerSDP)
+	shadowMids := ExtractAnswerMids(shadowOfferSDP)
+
+	if len(answerMids) == 0 || len(shadowMids) == 0 {
+		return answerSDP // nothing to translate
+	}
+
+	// Build positional remap: answerMid[i] → shadowMid[i].
+	remap := make(map[string]string)
+	needsTranslation := false
+	for i := 0; i < len(answerMids) && i < len(shadowMids); i++ {
+		if answerMids[i] != shadowMids[i] {
+			needsTranslation = true
+		}
+		remap[answerMids[i]] = shadowMids[i]
+	}
+
+	if !needsTranslation {
+		return answerSDP // mids already match
+	}
+
+	sep := "\r\n"
+	if !strings.Contains(answerSDP, "\r\n") {
+		sep = "\n"
+	}
+	lines := strings.Split(answerSDP, sep)
+	out := make([]string, 0, len(lines))
+
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+
+		// Remap a=mid: lines.
+		if strings.HasPrefix(bare, "a=mid:") {
+			oldMid := strings.TrimRight(strings.TrimPrefix(bare, "a=mid:"), "\r")
+			if newMid, ok := remap[oldMid]; ok {
+				out = append(out, "a=mid:"+newMid)
+				continue
+			}
+		}
+
+		// Remap a=group:BUNDLE line.
+		if strings.HasPrefix(bare, "a=group:BUNDLE") {
+			if m := bundleRe.FindStringSubmatch(bare); m != nil {
+				oldMids := strings.Fields(strings.TrimRight(m[1], "\r"))
+				newMids := make([]string, len(oldMids))
+				for i, om := range oldMids {
+					if nm, ok := remap[om]; ok {
+						newMids[i] = nm
+					} else {
+						newMids[i] = om
+					}
+				}
+				out = append(out, "a=group:BUNDLE "+strings.Join(newMids, " "))
+				continue
+			}
+		}
+
+		out = append(out, line)
+	}
+
+	return strings.Join(out, sep)
+}

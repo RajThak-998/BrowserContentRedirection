@@ -128,6 +128,7 @@ class Emitter {
                     bridgeId: payload.bridgeId,
                     sdpType: payload.sdpType ?? "unknown",
                     sdp: payload.sdp ?? "",
+                    iceServers: payload.iceServers ?? [],
                     timestamp: payload.timestamp ?? Date.now(),
                 },
             },
@@ -142,6 +143,21 @@ class Emitter {
                 payload: {
                     bridgeId: payload.bridgeId,
                     reason: payload.reason ?? "unknown",
+                    timestamp: payload.timestamp ?? Date.now(),
+                },
+            },
+            this._MAX_RETRIES
+        );
+    }
+
+    emitRtcShadowIceCandidate(payload) {
+        this._sendWithRetry(
+            {
+                type: "RTC_SHADOW_ICE_CANDIDATE",
+                payload: {
+                    bridgeId: payload.bridgeId,
+                    candidate: payload.candidate ?? "",
+                    sdpMid: payload.sdpMid ?? "0",
                     timestamp: payload.timestamp ?? Date.now(),
                 },
             },

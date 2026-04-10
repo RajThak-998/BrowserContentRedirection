@@ -6,6 +6,10 @@ export function HideWindow() {
   return window['go']['main']['App']['HideWindow']();
 }
 
+export function SendRelayAnswer(arg1, arg2) {
+  return window['go']['main']['App']['SendRelayAnswer'](arg1, arg2);
+}
+
 export function SendSdpAnswer(arg1) {
   return window['go']['main']['App']['SendSdpAnswer'](arg1);
 }
