@@ -191,7 +191,7 @@
 
     // ─── Prototype Patches ────────────────────────────────────────────────────
 
-    const RTC_WAIT_TIMEOUT_MS = 2000;
+    const RTC_WAIT_TIMEOUT_MS = 5000;
     const rtcStateByPeer = new WeakMap();
     const rtcReadyByBridgeId = new Map();
     const rtcWaitersByBridgeId = new Map();
@@ -318,7 +318,21 @@
     function dispatchShadowTrickleCandidates(pc, candidates) {
         let candidateLines = [];
         if (Array.isArray(candidates)) {
-            candidateLines = candidates.filter(line => typeof line === 'string' && line.trim().length > 0);
+            candidateLines = candidates.filter(line => {
+                if (typeof line !== 'string') return false;
+                const trimmed = line.trim();
+                if (trimmed.length === 0) return false;
+
+                // Filter out IPv6 candidates to prevent Teams proprietary parser crashes.
+                // Mobile hotspots generate IPv6 candidates, which severely break Teams'
+                // JS simulcast logic when trickled.
+                const parts = trimmed.split(' ');
+                if (parts.length > 4 && parts[4].includes(':')) {
+                    BCR_LOG('[BCR] Dropping IPv6 candidate to avoid Teams crash:', parts[4]);
+                    return false;
+                }
+                return true;
+            });
         }
 
         let mid = '0';
@@ -336,7 +350,7 @@
                         candidateStr = candidateStr.substring(10); // strictly remove "candidate:" if present natively
                     }
                     candidateStr = candidateStr.trim();
-                    
+
                     const candidateDict = {
                         candidate: candidateStr,
                         sdpMLineIndex: 0,
@@ -553,6 +567,39 @@
             enumerable: false,
         });
 
+        // ── ICE / Connection State Mocker ────────────────────────────────────
+        // Mask native Chrome's 'failed' and 'disconnected' states for managed connections
+        // to prevent Teams from terminating the call when the VDI network fails natively.
+        const origIceStateGetter = Object.getOwnPropertyDescriptor(rtcProto, 'iceConnectionState');
+        const origConnStateGetter = Object.getOwnPropertyDescriptor(rtcProto, 'connectionState');
+
+        function getMockedState(origGetter, pc) {
+            if (!origGetter) return undefined;
+            const realState = origGetter.call(pc);
+            const entry = rtcStateByPeer.get(pc);
+            // Only mask if we are actively managing via shadow proxy.
+            if (entry && entry.shadowCredentials && (realState === 'failed' || realState === 'disconnected')) {
+                return 'connected';
+            }
+            return realState;
+        }
+
+        if (origIceStateGetter && origIceStateGetter.get) {
+            Object.defineProperty(rtcProto, 'iceConnectionState', {
+                get() { return getMockedState(origIceStateGetter.get, this); },
+                configurable: true,
+                enumerable: true,
+            });
+        }
+
+        if (origConnStateGetter && origConnStateGetter.get) {
+            Object.defineProperty(rtcProto, 'connectionState', {
+                get() { return getMockedState(origConnStateGetter.get, this); },
+                configurable: true,
+                enumerable: true,
+            });
+        }
+
         // ── localDescription / currentLocalDescription getter patches ────────
         // The VDI app reads pc.localDescription to obtain the SDP it sends over
         // signaling. We intercept the getter to return a munged copy containing
@@ -602,7 +649,7 @@
                 // Determine if this setLocalDescription is just the subsequent application
                 // of the offer/answer we just generated upstream in createOffer/createAnswer.
                 const typeMatches = (description.type ?? '').toLowerCase() === (entry.lastCreateActionType ?? '').toLowerCase();
-                
+
                 if (typeMatches) {
                     isRedundant = true;
                     // Because the VDI app could have mutated the SDP structurally by stripping codecs
@@ -628,7 +675,7 @@
                 }
 
                 const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
-                
+
                 const currentEntry = ensureRtcState(this);
                 if (currentEntry.bridgeId !== entry.bridgeId) {
                     BCR_LOG('[BCR] BridgeId changed during setLocalDescription; fail-open with original SDP');
@@ -743,10 +790,10 @@
             });
 
             BCR_LOG('[BCR] Captured SDP type:', origDescription.type ?? actionType, 'direction=local build from', actionType, 'bridgeId=', entry.bridgeId);
-            
+
             // Wait for the freshly built shadow PC's credentials
             const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
-            
+
             const currentEntry = ensureRtcState(this);
             if (currentEntry.bridgeId !== entry.bridgeId) {
                 BCR_LOG('[BCR] BridgeId changed during', actionType, 'fail-open with original SDP');
@@ -760,7 +807,7 @@
 
                 const mungedSdp = mungeSdpTransport(origDescription.sdp, entry.shadowCredentials);
                 BCR_LOG('[BCR]', actionType, 'resolved and munged seamlessly bridgeId=', entry.bridgeId);
-                
+
                 // Must return an object that circumvents strict instanceof RTCSessionDescription checks inside RxJS / React data pipelines
                 return buildDescriptionLike(origDescription, mungedSdp);
             }
@@ -784,22 +831,32 @@
         // bcr_client so it can respond to the remote peer's connectivity checks.
         const origAddIceCandidate = rtcProto.addIceCandidate;
         rtcProto.addIceCandidate = function patchedAddIceCandidate(candidate, ...rest) {
+            const entry = rtcStateByPeer.get(this);
             if (candidate && candidate.candidate) {
-                const entry = rtcStateByPeer.get(this);
                 if (entry && entry.bridgeId) {
                     BCR_LOG('[BCR] Forwarding remote ICE candidate to shadow bridgeId=', entry.bridgeId);
                     emitShadowEvent('BCR_RTC_SHADOW_ICE_CANDIDATE', {
-                        bridgeId:  entry.bridgeId,
+                        bridgeId: entry.bridgeId,
                         candidate: candidate.candidate,
-                        sdpMid:    candidate.sdpMid ?? '0',
+                        sdpMid: candidate.sdpMid ?? '0',
                         timestamp: Date.now(),
                     });
                 }
             }
-            // Always call through — the browser's PC still needs to process this
-            // for its own ICE state machine (even if the real connection ends up
-            // going to the shadow).
-            return origAddIceCandidate.apply(this, [candidate, ...rest]);
+            
+            // Call through so the browser's PC can process it if it's healthy natively.
+            const aicPromise = origAddIceCandidate.apply(this, [candidate, ...rest]);
+            
+            // If we are managing this connection in the shadow PC, Teams' native PC
+            // often falls into a bad state (e.g. failed setRemoteDescription).
+            // We must swallow addIceCandidate rejections to avoid crashing Teams' UI
+            // with Unhandled Promise Rejections.
+            if (entry && entry.shadowCredentials && aicPromise && typeof aicPromise.catch === 'function') {
+                return aicPromise.catch((err) => {
+                     BCR_LOG('[BCR] addIceCandidate failed natively (swallowed for shadow PC):', err?.message || err);
+                });
+            }
+            return aicPromise;
         };
 
         // ── Trickle ICE overrides (addEventListener & onicecandidate) ──────────
@@ -809,7 +866,7 @@
         rtcProto.addEventListener = function patchedAddEventListener(type, listener, options) {
             if (type === 'icecandidate' && typeof listener === 'function') {
                 if (!listener.__bcrWrapper) {
-                    listener.__bcrWrapper = function(event) {
+                    listener.__bcrWrapper = function (event) {
                         if (event.isTrusted) return; // Drop native Chrome trickle!
                         return listener.apply(this, arguments);
                     };
@@ -836,7 +893,7 @@
                 set(listener) {
                     this.__bcrOnIceCandidate = listener;
                     if (typeof listener === 'function') {
-                        const wrapper = function(event) {
+                        const wrapper = function (event) {
                             if (event.isTrusted) return; // Drop native Chrome trickle!
                             return listener.apply(this, arguments);
                         };

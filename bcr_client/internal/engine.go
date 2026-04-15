@@ -530,20 +530,12 @@ func (e *Engine) createAlignedShadowPC(bridgeID string, browserOfferSDP string, 
 	return pc, nil
 }
 
-// parseRTPDirection converts an SDP direction string to Pion's RTPTransceiverDirection.
+// parseRTPDirection overrides the SDP direction string for Pion's RTPTransceiver.
+// Since the shadow PC simply consumes media locally and Teams handles sending,
+// and because Pion strictly requires AddTransceiverFromKind to use recvonly 
+// (throwing errors on inactive), we force all simulated transceivers to recvonly.
 func parseRTPDirection(dir string) webrtc.RTPTransceiverDirection {
-	switch dir {
-	case "sendrecv":
-		return webrtc.RTPTransceiverDirectionSendrecv
-	case "recvonly":
-		return webrtc.RTPTransceiverDirectionRecvonly
-	case "sendonly":
-		return webrtc.RTPTransceiverDirectionSendonly
-	case "inactive":
-		return webrtc.RTPTransceiverDirectionInactive
-	default:
-		return webrtc.RTPTransceiverDirectionSendrecv // RFC 4566 default
-	}
+	return webrtc.RTPTransceiverDirectionRecvonly
 }
 
 func (e *Engine) attachPeerStateLogging(bridgeID string, pc *webrtc.PeerConnection) {
@@ -806,6 +798,15 @@ func (e *Engine) applyRemoteDescription(conn *websocket.Conn, bridgeID string, s
 				e.logf("[bcr_client][shadow] answer mids translated bridgeId=%s", bridgeID)
 				answerSDP = translated
 			}
+
+			// Teams SFU aggressively changes payload types entirely for stuff like RTX
+			// and injects them in renegotiation Answers. To prevent Pion from dropping
+			// the call on "payload type not found", rigorously strip unadvertised ghost codecs.
+			scrubbed := ScrubGhostPayloadTypes(answerSDP, session.lastShadowOfferSDP)
+			if scrubbed != answerSDP {
+				e.logf("[bcr_client][shadow] answer scrubbed unregistered payload types bridgeId=%s", bridgeID)
+				answerSDP = scrubbed
+			}
 		}
 
 		if err := session.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answerSDP}); err != nil {
@@ -916,7 +917,7 @@ func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalP
 	if len(payload.IceServers) > 0 {
 		session.iceServers = payload.IceServers
 		e.logf("[bcr_client][shadow] stored %d ICE server(s) bridgeId=%s", len(payload.IceServers), payload.BridgeID)
-		
+
 		// Ensure the actively bound PC adopts these servers immediately before any Gathering begins!
 		if session.pc != nil {
 			_ = session.pc.SetConfiguration(webrtc.Configuration{

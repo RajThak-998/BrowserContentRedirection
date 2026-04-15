@@ -141,9 +141,6 @@ func parseSDPCodecs(sdp string) []sdpCodecEntry {
 			continue
 		}
 		codecName := m[2]
-		if sdpInternalCodecs[strings.ToLower(codecName)] {
-			continue
-		}
 		clockRate, err := strconv.ParseUint(m[3], 10, 32)
 		if err != nil {
 			continue
@@ -309,9 +306,6 @@ func ParseSDPCodecsStrict(sdp string) []sdpCodecEntry {
 			continue
 		}
 		codecName := m[2]
-		if sdpInternalCodecs[strings.ToLower(codecName)] {
-			continue
-		}
 		clockRate, err := strconv.ParseUint(m[3], 10, 32)
 		if err != nil {
 			continue
@@ -423,6 +417,66 @@ func TranslateAnswerMids(answerSDP, shadowOfferSDP string) string {
 				}
 				out = append(out, "a=group:BUNDLE "+strings.Join(newMids, " "))
 				continue
+			}
+		}
+
+		out = append(out, line)
+	}
+
+	return strings.Join(out, sep)
+}
+
+// ScrubGhostPayloadTypes removes any RTP payload types from the answer SDP that
+// were not present in the original offer SDP. This prevents Pion's MediaEngine
+// from panicking with "payload type not found" when remote servers dynamically
+// inject unregistered codecs like RTX or ULPFEC during renegotiation.
+func ScrubGhostPayloadTypes(answerSDP, offerSDP string) string {
+	offerValidPTs := make(map[string]bool)
+	for _, m := range rtpMapLineRe.FindAllStringSubmatch(offerSDP, -1) {
+		offerValidPTs[m[1]] = true
+	}
+
+	sep := "\r\n"
+	if !strings.Contains(answerSDP, "\r\n") {
+		sep = "\n"
+	}
+	lines := strings.Split(answerSDP, sep)
+	var out []string
+
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+
+		// 1. Scrub m= lines (e.g., "m=video 9 UDP/TLS/RTP/SAVPF 102 120")
+		if strings.HasPrefix(bare, "m=") {
+			parts := strings.Split(bare, " ")
+			if len(parts) >= 4 { // m=video port proto pt1 pt2...
+				validParts := parts[:3]
+				for _, pt := range parts[3:] {
+					if offerValidPTs[pt] {
+						validParts = append(validParts, pt)
+					}
+				}
+				// Edge case: if we removed ALL payload types, leave a dummy to prevent SDP syntax error
+				if len(validParts) == 3 && len(parts) > 3 {
+					validParts = append(validParts, parts[3]) 
+				}
+				out = append(out, strings.Join(validParts, " "))
+				continue
+			}
+		}
+
+		// 2. Scrub a=rtpmap, a=fmtp, a=rtcp-fb
+		if m := rtpMapLineRe.FindStringSubmatch(bare); m != nil {
+			if !offerValidPTs[m[1]] {
+				continue // strip
+			}
+		} else if m := fmtpLineRe.FindStringSubmatch(bare); m != nil {
+			if !offerValidPTs[m[1]] {
+				continue // strip
+			}
+		} else if m := rtcpFbRe.FindStringSubmatch(bare); m != nil {
+			if !offerValidPTs[m[1]] {
+				continue // strip
 			}
 		}
 
