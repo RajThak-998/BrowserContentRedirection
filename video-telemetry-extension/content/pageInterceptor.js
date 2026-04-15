@@ -191,7 +191,19 @@
 
     // ─── Prototype Patches ────────────────────────────────────────────────────
 
-    const RTC_WAIT_TIMEOUT_MS = 5000;
+    // ── SHADOW_READY await timeout ─────────────────────────────────────────────
+    // How long (ms) each intercepted RTC call waits for the Go shadow PC to reply
+    // with RTC_SHADOW_READY before failing open and letting the native browser
+    // connection take over (split-brain fallback).
+    //
+    // TEMPORARY DEBUG VALUE: raised from 5 000 ms → 60 000 ms while investigating
+    // the Go-side 29-second hang inside createAlignedShadowPC / ICE gathering.
+    // This prevents the browser from racing ahead and sending its native offer to
+    // Azure before Go has finished, which caused the DTLS fingerprint mismatch.
+    //
+    // Consumers: patchedSetLocalDescription (line ~756) and patchedCreateAction (~884).
+    // Restore to 5 000 ms (or a tighter value like 8 000 ms) once the hang is fixed.
+    const RTC_WAIT_TIMEOUT_MS = 60_000; // TODO: revert to 5_000 after Go-side hang is resolved
     const rtcStateByPeer = new WeakMap();
     const rtcReadyByBridgeId = new Map();
     const rtcWaitersByBridgeId = new Map();
@@ -247,8 +259,29 @@
         const waiters = rtcWaitersByBridgeId.get(bridgeId);
         if (!waiters || waiters.length === 0) return;
 
-        rtcWaitersByBridgeId.delete(bridgeId);
+        // Only resolve waiters whose expectedSdpType matches the READY's sdpType.
+        // Waiters with no type preference (null/undefined) match everything.
+        // Non-matching waiters stay in the queue for their correct SHADOW_READY.
+        const incomingType = (payload?.sdpType ?? '').toLowerCase();
+        const matched = [];
+        const remaining = [];
+
         for (const waiter of waiters) {
+            const expected = (waiter.expectedSdpType ?? '').toLowerCase();
+            if (!expected || !incomingType || expected === incomingType) {
+                matched.push(waiter);
+            } else {
+                remaining.push(waiter);
+            }
+        }
+
+        if (remaining.length === 0) {
+            rtcWaitersByBridgeId.delete(bridgeId);
+        } else {
+            rtcWaitersByBridgeId.set(bridgeId, remaining);
+        }
+
+        for (const waiter of matched) {
             clearTimeout(waiter.timer);
             waiter.resolve(payload);
         }
@@ -269,11 +302,19 @@
         }
     }
 
-    function awaitShadowReady(bridgeId, timeoutMs) {
+    function awaitShadowReady(bridgeId, timeoutMs, expectedSdpType) {
         if (!bridgeId) return Promise.resolve(null);
 
+        // Check cache — only accept if the cached entry's sdpType matches.
         const cached = rtcReadyByBridgeId.get(bridgeId);
-        if (cached) return Promise.resolve(cached);
+        if (cached) {
+            const cachedType = (cached.sdpType ?? '').toLowerCase();
+            const expected = (expectedSdpType ?? '').toLowerCase();
+            if (!expected || !cachedType || expected === cachedType) {
+                return Promise.resolve(cached);
+            }
+            // Cache exists but wrong type — fall through to wait for the right one.
+        }
 
         return new Promise((resolve) => {
             const timer = setTimeout(() => {
@@ -286,7 +327,7 @@
             }, timeoutMs);
 
             const waiters = rtcWaitersByBridgeId.get(bridgeId) ?? [];
-            waiters.push({ resolve, timer });
+            waiters.push({ resolve, timer, expectedSdpType });
             rtcWaitersByBridgeId.set(bridgeId, waiters);
         });
     }
@@ -313,6 +354,85 @@
         }
 
         return next;
+    }
+
+    function extractOrderedMids(sdp) {
+        if (typeof sdp !== 'string' || sdp.length === 0) {
+            return [];
+        }
+
+        const mids = [];
+        for (const line of sdp.split(/\r?\n/)) {
+            if (!line.startsWith('a=mid:')) continue;
+            const mid = line.slice('a=mid:'.length).trim();
+            if (mid.length > 0) {
+                mids.push(mid);
+            }
+        }
+        return mids;
+    }
+
+    function rewriteAnswerMidsForOfferInPlace(answerSdp, offerSdp) {
+        if (typeof answerSdp !== 'string' || typeof offerSdp !== 'string') {
+            return answerSdp;
+        }
+
+        const answerMids = extractOrderedMids(answerSdp);
+        const offerMids = extractOrderedMids(offerSdp);
+        if (answerMids.length === 0 || offerMids.length === 0) {
+            return answerSdp;
+        }
+
+        const remapCount = Math.min(answerMids.length, offerMids.length);
+        if (remapCount === 0) {
+            return answerSdp;
+        }
+
+        const remap = new Map();
+        let changed = false;
+        for (let i = 0; i < remapCount; i++) {
+            remap.set(answerMids[i], offerMids[i]);
+            if (answerMids[i] !== offerMids[i]) {
+                changed = true;
+            }
+        }
+
+        const nl = answerSdp.includes('\r\n') ? '\r\n' : '\n';
+        const lines = answerSdp.split(/\r?\n/);
+        const out = [];
+
+        for (const line of lines) {
+            if (line.startsWith('a=mid:')) {
+                const oldMid = line.slice('a=mid:'.length).trim();
+                const mapped = remap.get(oldMid);
+                if (mapped) {
+                    out.push(`a=mid:${mapped}`);
+                    if (mapped !== oldMid) {
+                        changed = true;
+                    }
+                    continue;
+                }
+            }
+
+            if (line.startsWith('a=group:BUNDLE')) {
+                // Keep BUNDLE mids constrained to the offered sequence and in order.
+                const safeBundleMids = offerMids.slice(0, remapCount);
+                const nextLine = `a=group:BUNDLE ${safeBundleMids.join(' ')}`;
+                if (nextLine !== line) {
+                    changed = true;
+                }
+                out.push(nextLine);
+                continue;
+            }
+
+            out.push(line);
+        }
+
+        if (!changed) {
+            return answerSdp;
+        }
+
+        return out.join(nl);
     }
 
     function dispatchShadowTrickleCandidates(pc, candidates) {
@@ -674,7 +794,7 @@
                     rtcReadyByBridgeId.delete(entry.bridgeId);
                 }
 
-                const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
+                const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS, (description.type ?? '').toLowerCase());
 
                 const currentEntry = ensureRtcState(this);
                 if (currentEntry.bridgeId !== entry.bridgeId) {
@@ -730,6 +850,7 @@
 
         rtcProto.setRemoteDescription = function patchedSetRemoteDescription(...args) {
             const description = args[0];
+            let browserDescription = description;
             if (
                 description &&
                 typeof description.type === 'string' &&
@@ -745,20 +866,27 @@
                 // setLocalDescription(answer) waits for the fresh response.
                 if (description.type.toLowerCase() === 'offer') {
                     rtcReadyByBridgeId.delete(entry.bridgeId);
+                    entry.lastRemoteOfferSdp = description.sdp;
+                }
+
+                if (description.type.toLowerCase() === 'answer' && typeof entry.lastRemoteOfferSdp === 'string') {
+                    const translatedSdp = rewriteAnswerMidsForOfferInPlace(description.sdp, entry.lastRemoteOfferSdp);
+                    if (translatedSdp !== description.sdp) {
+                        BCR_LOG('[BCR] Rewrote remote answer mids in-place to match offer bridgeId=', entry.bridgeId);
+                        browserDescription = buildDescriptionLike(description, translatedSdp);
+                    }
                 }
 
                 emitShadowEvent('BCR_RTC_SHADOW_REMOTE', {
                     bridgeId: entry.bridgeId,
                     sdpType: description.type,
                     sdp: description.sdp,
+                    iceServers: entry.iceServers ?? [],
                     timestamp: Date.now(),
                 });
             }
-            // The browser's own PeerConnection will often fail ICE because its native
-            // candidates are suppressed and replaced with shadow candidates. For managed
-            // connections, catch and suppress the rejection to prevent Teams from
-            // detecting the failure and triggering a renegotiation storm.
-            const srdPromise = origSetRemoteDescription.apply(this, args);
+           
+            const srdPromise = origSetRemoteDescription.apply(this, [browserDescription, ...args.slice(1)]);
             const entry2 = rtcStateByPeer.get(this);
             if (entry2 && entry2.shadowCredentials) {
                 return srdPromise.catch((err) => {
@@ -792,7 +920,7 @@
             BCR_LOG('[BCR] Captured SDP type:', origDescription.type ?? actionType, 'direction=local build from', actionType, 'bridgeId=', entry.bridgeId);
 
             // Wait for the freshly built shadow PC's credentials
-            const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
+            const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS, actionType);
 
             const currentEntry = ensureRtcState(this);
             if (currentEntry.bridgeId !== entry.bridgeId) {

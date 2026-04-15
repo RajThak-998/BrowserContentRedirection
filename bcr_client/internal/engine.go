@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,14 +19,21 @@ import (
 )
 
 type shadowSession struct {
-	pc                  *webrtc.PeerConnection
-	generation          int // increments on PC rebuild; guards stale OnTrack goroutines
-	updatedAt           time.Time
-	pendingRemoteAnswer *RTCShadowRemotePayload
-	pendingLocalAnswer  *RTCShadowLocalPayload
-	iceServers          []IceServer // captured from the browser's RTCPeerConnection config
-	lastShadowOfferSDP  string      // shadow's own offer SDP, used for mid comparison when applying answers
-	browserOfferSDP     string      // browser's offer SDP, used for aligned shadow PC creation
+	pc                    *webrtc.PeerConnection
+	generation            int // increments on PC rebuild; guards stale OnTrack goroutines
+	updatedAt             time.Time
+	pendingRemoteAnswer   *RTCShadowRemotePayload
+	pendingLocalAnswer    *RTCShadowLocalPayload
+	iceServers            []IceServer // captured from the browser's RTCPeerConnection config
+	lastShadowOfferSDP    string      // shadow's own offer SDP, used for mid comparison when applying answers
+	browserOfferSDP       string      // browser's offer SDP, used for aligned shadow PC creation
+	lastLocalOfferHash    string      // hash of last accepted local offer; used for dedupe
+	lastLocalOfferTime    time.Time   // timestamp of last accepted local offer; cooldown gate
+	connectedAt           time.Time   // timestamp when connectionState reached connected; used for no-track watchdog
+	iceConnectedAt        time.Time   // timestamp when iceConnectionState reached connected; used for no-track watchdog
+	dtlsStartedAt         time.Time   // timestamp when DTLS handshake began (state=new→connecting transition)
+	localDTLSFingerprint  string      // local DTLS fingerprint from shadow offer
+	remoteDTLSFingerprint string      // remote DTLS fingerprint from Teams answer
 }
 
 type Engine struct {
@@ -40,6 +49,7 @@ type Engine struct {
 
 	shadowMu       sync.Mutex
 	shadowSessions map[string]*shadowSession
+	activeBridgeID string
 
 	relayMu       sync.Mutex
 	relaySessions map[string]*relaySession
@@ -274,13 +284,20 @@ func (e *Engine) createAndSetLocalDescription(
 	var desc webrtc.SessionDescription
 	var err error
 
+	// ── TIMING: overall pipeline entry ───────────────────────────────────────
+	tPipelineStart := time.Now()
+	e.logf("[bcr_client][shadow][timing] createAndSetLocalDescription ENTER isOffer=%v bridgeId=%s", isOffer, bridgeID)
+
 	if isOffer {
 		// If we have the browser's offer SDP, build an aligned shadow PC that
 		// mirrors the browser's media sections (codec PTs, transceiver count,
 		// direction). This ensures Teams' answer is directly compatible.
 		if session.browserOfferSDP != "" {
-			e.logf("[bcr_client][shadow][stage=create_aligned_pc] bridgeId=%s", bridgeID)
+			e.logf("[bcr_client][shadow][stage=create_aligned_pc] bridgeId=%s total_elapsed=%dms", bridgeID, time.Since(tPipelineStart).Milliseconds())
+			tAlign := time.Now()
 			alignedPC, alignErr := e.createAlignedShadowPC(bridgeID, session.browserOfferSDP, session.iceServers)
+			e.logf("[bcr_client][shadow][timing] stage=create_aligned_pc_done bridgeId=%s alignElapsed=%dms total=%dms",
+				bridgeID, time.Since(tAlign).Milliseconds(), time.Since(tPipelineStart).Milliseconds())
 			if alignErr != nil {
 				e.logf("[bcr_client][shadow] createAlignedShadowPC failed bridgeId=%s err=%v — falling back to generic", bridgeID, alignErr)
 				// Fall through to generic transceiver setup below.
@@ -310,52 +327,78 @@ func (e *Engine) createAndSetLocalDescription(
 			}
 		}
 
-		e.logf("[bcr_client][shadow][stage=create_offer] bridgeId=%s transceivers=%d", bridgeID, len(session.pc.GetTransceivers()))
+		e.logf("[bcr_client][shadow][stage=create_offer] bridgeId=%s transceivers=%d total_elapsed=%dms",
+			bridgeID, len(session.pc.GetTransceivers()), time.Since(tPipelineStart).Milliseconds())
+		tCreateOffer := time.Now()
 		desc, err = session.pc.CreateOffer(nil)
+		e.logf("[bcr_client][shadow][timing] stage=create_offer_call bridgeId=%s elapsed=%dms total=%dms",
+			bridgeID, time.Since(tCreateOffer).Milliseconds(), time.Since(tPipelineStart).Milliseconds())
 	} else {
-		e.logf("[bcr_client][shadow][stage=create_answer] bridgeId=%s", bridgeID)
+		e.logf("[bcr_client][shadow][stage=create_answer] bridgeId=%s total_elapsed=%dms", bridgeID, time.Since(tPipelineStart).Milliseconds())
+		tCreateAnswer := time.Now()
 		desc, err = session.pc.CreateAnswer(nil)
+		e.logf("[bcr_client][shadow][timing] stage=create_answer_call bridgeId=%s elapsed=%dms total=%dms",
+			bridgeID, time.Since(tCreateAnswer).Milliseconds(), time.Since(tPipelineStart).Milliseconds())
 	}
 	if err != nil {
 		return e.handleSDPApplyFailure(conn, bridgeID, session, "create_sdp", err, false)
 	}
 
 	if isOffer {
-		e.logf("[bcr_client][shadow][stage=create_offer_ok] bridgeId=%s sdpLen=%d", bridgeID, len(desc.SDP))
+		e.logf("[bcr_client][shadow][stage=create_offer_ok] bridgeId=%s sdpLen=%d total_elapsed=%dms",
+			bridgeID, len(desc.SDP), time.Since(tPipelineStart).Milliseconds())
 		// Store shadow's own offer SDP for mid comparison when answer arrives.
 		session.lastShadowOfferSDP = desc.SDP
 	} else {
-		e.logf("[bcr_client][shadow][stage=create_answer_ok] bridgeId=%s sdpLen=%d", bridgeID, len(desc.SDP))
+		e.logf("[bcr_client][shadow][stage=create_answer_ok] bridgeId=%s sdpLen=%d total_elapsed=%dms",
+			bridgeID, len(desc.SDP), time.Since(tPipelineStart).Milliseconds())
 	}
 
+	tSetLocal := time.Now()
 	if err = session.pc.SetLocalDescription(desc); err != nil {
 		return e.handleSDPApplyFailure(conn, bridgeID, session, "set_local_desc", err, false)
 	}
+	e.logf("[bcr_client][shadow][timing] stage=set_local_desc_call bridgeId=%s elapsed=%dms total=%dms",
+		bridgeID, time.Since(tSetLocal).Milliseconds(), time.Since(tPipelineStart).Milliseconds())
 
 	session.updatedAt = time.Now()
-	e.logf("[bcr_client][shadow][stage=set_local_desc_ok] bridgeId=%s signalingState=%s",
-		bridgeID, session.pc.SignalingState().String())
+	e.logf("[bcr_client][shadow][stage=set_local_desc_ok] bridgeId=%s signalingState=%s total_elapsed=%dms",
+		bridgeID, session.pc.SignalingState().String(), time.Since(tPipelineStart).Milliseconds())
 
 	// Wait for ICE gathering to complete before sending SHADOW_READY.
 	// With TURN servers, gathering takes longer than host-only.
 	// The 2.5 s timeout is a safety net.
-	e.logf("[bcr_client][shadow][stage=ice_gathering] bridgeId=%s", bridgeID)
+	e.logf("[bcr_client][shadow][stage=ice_gathering] bridgeId=%s total_elapsed=%dms", bridgeID, time.Since(tPipelineStart).Milliseconds())
+	tGather := time.Now()
 	gatherDone := webrtc.GatheringCompletePromise(session.pc)
 	gatherCtx, gatherCancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer gatherCancel()
 	select {
 	case <-gatherDone:
-		e.logf("[bcr_client][shadow][stage=ice_gathered] bridgeId=%s", bridgeID)
+		e.logf("[bcr_client][shadow][stage=ice_gathered] bridgeId=%s gatherElapsed=%dms total=%dms",
+			bridgeID, time.Since(tGather).Milliseconds(), time.Since(tPipelineStart).Milliseconds())
 	case <-gatherCtx.Done():
-		e.logf("[bcr_client][shadow][stage=ice_gather_timeout] bridgeId=%s (proceeding)", bridgeID)
+		e.logf("[bcr_client][shadow][stage=ice_gather_timeout] bridgeId=%s gatherElapsed=%dms total=%dms (proceeding)",
+			bridgeID, time.Since(tGather).Milliseconds(), time.Since(tPipelineStart).Milliseconds())
 	}
 
-	if err = e.sendShadowReady(conn, bridgeID, session.pc); err != nil {
+	// Derive the SDP type tag for SHADOW_READY so the browser can distinguish
+	// offer-generated from answer-generated READY responses.
+	readySdpType := "answer"
+	if isOffer {
+		readySdpType = "offer"
+	}
+	tSendReady := time.Now()
+	if err = e.sendShadowReady(conn, bridgeID, session.pc, readySdpType); err != nil {
 		e.logf("[bcr_client][shadow] sendShadowReady failed bridgeId=%s err=%v", bridgeID, err)
 		e.sendShadowError(conn, bridgeID, "send_ready", err, true)
 		return false
 	}
+	e.logf("[bcr_client][shadow][timing] stage=send_ready_done bridgeId=%s elapsed=%dms total=%dms",
+		bridgeID, time.Since(tSendReady).Milliseconds(), time.Since(tPipelineStart).Milliseconds())
 
+	e.logf("[bcr_client][shadow][timing] createAndSetLocalDescription EXIT bridgeId=%s total=%dms",
+		bridgeID, time.Since(tPipelineStart).Milliseconds())
 	e.logf("[bcr_client][shadow][stage=ready_sent] bridgeId=%s", bridgeID)
 	return true
 }
@@ -377,7 +420,13 @@ func (e *Engine) iceServersToWebRTC(servers []IceServer) []webrtc.ICEServer {
 			ice.Credential = s.Credential
 			ice.CredentialType = webrtc.ICECredentialTypePassword
 		}
-		e.logf("[bcr_client][shadow] Applying ICE Server: %v", s.URLs)
+		// Log TURN URL + truncated username for TURN credential verification
+		userPreview := s.Username
+		if len(userPreview) > 20 {
+			userPreview = userPreview[:20] + "..."
+		}
+		e.logf("[bcr_client][shadow] Applying ICE Server: %v username=%q hasCred=%v",
+			s.URLs, userPreview, s.Credential != "")
 		out = append(out, ice)
 	}
 	return out
@@ -452,10 +501,23 @@ func (e *Engine) newShadowPeerConnectionFromOffer(bridgeID string, offerSDP stri
 //   - Adds transceivers matching each media m= section (same kind + direction).
 //   - Creates a dummy DataChannel for each m=application section so the BUNDLE
 //     group includes the data channel mid.
+//
+// TIMING DIAGNOSTIC: Every major stage is bracketed with time.Now() / time.Since()
+// so that the 29-second hang can be attributed to a specific sub-operation.
 func (e *Engine) createAlignedShadowPC(bridgeID string, browserOfferSDP string, servers []IceServer) (*webrtc.PeerConnection, error) {
+	// ── TIMING: overall entry ────────────────────────────────────────────────
+	tAlignedStart := time.Now()
+	e.logf("[bcr_client][shadow][timing] createAlignedShadowPC ENTER bridgeId=%s t=0ms", bridgeID)
+
+	// ── Stage 1: Parse codecs from browser SDP ───────────────────────────────
+	t1 := time.Now()
 	// Parse codecs with strict PT + rtcp-fb preservation.
 	strictCodecs := ParseSDPCodecsStrict(browserOfferSDP)
+	e.logf("[bcr_client][shadow][timing] stage=parse_codecs bridgeId=%s codecs=%d elapsed=%dms total=%dms",
+		bridgeID, len(strictCodecs), time.Since(t1).Milliseconds(), time.Since(tAlignedStart).Milliseconds())
 
+	// ── Stage 2: Build MediaEngine ───────────────────────────────────────────
+	t2 := time.Now()
 	mediaEngine := &webrtc.MediaEngine{}
 
 	if len(strictCodecs) == 0 {
@@ -475,29 +537,49 @@ func (e *Engine) createAlignedShadowPC(bridgeID string, browserOfferSDP string, 
 		e.logf("[bcr_client][shadow] createAlignedShadowPC: registered %d codecs from browser offer bridgeId=%s",
 			len(strictCodecs), bridgeID)
 	}
+	e.logf("[bcr_client][shadow][timing] stage=build_media_engine bridgeId=%s elapsed=%dms total=%dms",
+		bridgeID, time.Since(t2).Milliseconds(), time.Since(tAlignedStart).Milliseconds())
 
+	// ── Stage 3: Register default interceptors ───────────────────────────────
+	t3 := time.Now()
 	interceptorRegistry := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptorRegistry); err != nil {
 		return nil, fmt.Errorf("register default interceptors: %w", err)
 	}
+	e.logf("[bcr_client][shadow][timing] stage=register_interceptors bridgeId=%s elapsed=%dms total=%dms",
+		bridgeID, time.Since(t3).Milliseconds(), time.Since(tAlignedStart).Milliseconds())
 
+	// ── Stage 4: Create WebRTC API ───────────────────────────────────────────
+	t4 := time.Now()
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(mediaEngine),
 		webrtc.WithInterceptorRegistry(interceptorRegistry),
 	)
+	e.logf("[bcr_client][shadow][timing] stage=new_api bridgeId=%s elapsed=%dms total=%dms",
+		bridgeID, time.Since(t4).Milliseconds(), time.Since(tAlignedStart).Milliseconds())
 
+	// ── Stage 5: Create PeerConnection ──────────────────────────────────────
+	t5 := time.Now()
 	cfg := webrtc.Configuration{ICEServers: e.iceServersToWebRTC(servers)}
 	pc, err := api.NewPeerConnection(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("new peer connection: %w", err)
 	}
+	e.logf("[bcr_client][shadow][timing] stage=new_peer_connection bridgeId=%s elapsed=%dms total=%dms",
+		bridgeID, time.Since(t5).Milliseconds(), time.Since(tAlignedStart).Milliseconds())
+
 	e.attachPeerStateLogging(bridgeID, pc)
 
-	// Parse browser's m= sections and add matching transceivers / data channels.
+	// ── Stage 6: Parse browser m= sections ──────────────────────────────────
+	t6 := time.Now()
 	sections := ParseOfferMediaSections(browserOfferSDP)
-	e.logf("[bcr_client][shadow] createAlignedShadowPC: browser offer has %d m= sections bridgeId=%s", len(sections), bridgeID)
+	e.logf("[bcr_client][shadow][timing] stage=parse_media_sections bridgeId=%s sections=%d elapsed=%dms total=%dms",
+		bridgeID, len(sections), time.Since(t6).Milliseconds(), time.Since(tAlignedStart).Milliseconds())
 
+	// ── Stage 7: Add transceivers / data channels ────────────────────────────
+	t7 := time.Now()
 	for i, sec := range sections {
+		tSection := time.Now()
 		switch sec.Kind {
 		case "audio", "video":
 			codecType := webrtc.RTPCodecTypeAudio
@@ -525,26 +607,279 @@ func (e *Engine) createAlignedShadowPC(bridgeID string, browserOfferSDP string, 
 				// Non-fatal: proceed without data channel.
 			}
 		}
+		e.logf("[bcr_client][shadow][timing] stage=add_section section=%d kind=%s bridgeId=%s elapsed=%dms",
+			i, sec.Kind, bridgeID, time.Since(tSection).Milliseconds())
 	}
+	e.logf("[bcr_client][shadow][timing] stage=add_transceivers_done bridgeId=%s elapsed=%dms total=%dms",
+		bridgeID, time.Since(t7).Milliseconds(), time.Since(tAlignedStart).Milliseconds())
+
+	// ── TIMING: overall exit ─────────────────────────────────────────────────
+	e.logf("[bcr_client][shadow][timing] createAlignedShadowPC EXIT bridgeId=%s total=%dms",
+		bridgeID, time.Since(tAlignedStart).Milliseconds())
 
 	return pc, nil
 }
 
 // parseRTPDirection overrides the SDP direction string for Pion's RTPTransceiver.
 // Since the shadow PC simply consumes media locally and Teams handles sending,
-// and because Pion strictly requires AddTransceiverFromKind to use recvonly 
+// and because Pion strictly requires AddTransceiverFromKind to use recvonly
 // (throwing errors on inactive), we force all simulated transceivers to recvonly.
 func parseRTPDirection(dir string) webrtc.RTPTransceiverDirection {
 	return webrtc.RTPTransceiverDirectionRecvonly
 }
 
+// attachPeerStateLogging hooks state-change callbacks onto the shadow PC for diagnostics.
+// It also wires the DTLS transport state listener to track the new→connecting transition,
+// which is the definitive signal that the DTLS handshake has begun.
 func (e *Engine) attachPeerStateLogging(bridgeID string, pc *webrtc.PeerConnection) {
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		e.logf("[bcr_client][shadow] connectionState=%s bridgeId=%s", state.String(), bridgeID)
+		e.shadowMu.Lock()
+		if session, ok := e.shadowSessions[bridgeID]; ok {
+			// Log with DTLS state info for context
+			dtlsState := "unknown"
+			if session.dtlsStartedAt.IsZero() {
+				dtlsState = "not_started"
+			} else {
+				dtlsAge := time.Since(session.dtlsStartedAt).Milliseconds()
+				dtlsState = fmt.Sprintf("running_%dms", dtlsAge)
+			}
+			e.logf("[bcr_client][shadow] connectionState=%s bridgeId=%s dtls=%s localFp=%s remoteFp=%s",
+				state.String(), bridgeID, dtlsState,
+				truncateHash(session.localDTLSFingerprint),
+				truncateHash(session.remoteDTLSFingerprint))
+		}
+		e.shadowMu.Unlock()
+
+		switch state {
+		case webrtc.PeerConnectionStateConnected:
+			e.promoteActiveBridge(bridgeID, "pc_connected")
+			e.shadowMu.Lock()
+			if session, ok := e.shadowSessions[bridgeID]; ok {
+				now := time.Now()
+				if session.connectedAt.IsZero() {
+					session.connectedAt = now
+				}
+			}
+			e.shadowMu.Unlock()
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+			e.clearActiveBridgeIfMatch(bridgeID, "pc_"+state.String())
+		}
 	})
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		e.logf("[bcr_client][shadow] iceConnectionState=%s bridgeId=%s", state.String(), bridgeID)
+		switch state {
+		case webrtc.ICEConnectionStateConnected:
+			e.promoteActiveBridge(bridgeID, "ice_connected")
+			e.shadowMu.Lock()
+			if session, ok := e.shadowSessions[bridgeID]; ok {
+				now := time.Now()
+				if session.iceConnectedAt.IsZero() {
+					session.iceConnectedAt = now
+					// Start a 3-second watchdog: if OnTrack never fires, emit diagnostic log.
+					go e.watchForNoTrack(bridgeID, now)
+				}
+			}
+			e.shadowMu.Unlock()
+
+			// ── ICE-CONNECTED DIAGNOSTIC ──────────────────────────────────────
+			// Dump the full state at the moment of connection so we can see
+			// exactly whether DTLS starts and what the a=setup role is.
+			localDesc := pc.LocalDescription()
+			setupLine := "(no local desc)"
+			if localDesc != nil {
+				for _, line := range strings.Split(localDesc.SDP, "\n") {
+					if strings.HasPrefix(strings.TrimSpace(line), "a=setup:") {
+						setupLine = strings.TrimSpace(line)
+						break
+					}
+				}
+			}
+			e.logf("[bcr_client][shadow][diag] ICE_CONNECTED bridgeId=%s connState=%s sigState=%s setup=%s transceivers=%d",
+				bridgeID, pc.ConnectionState().String(), pc.SignalingState().String(),
+				setupLine, len(pc.GetTransceivers()))
+
+			// Poll at 500ms, 2s, and 5s to track DTLS progress
+			go func(bid string, p *webrtc.PeerConnection) {
+				for _, delay := range []time.Duration{500 * time.Millisecond, 2 * time.Second, 5 * time.Second} {
+					time.Sleep(delay)
+					cs := p.ConnectionState()
+					e.logf("[bcr_client][shadow][diag] DTLS_POLL bridgeId=%s connState=%s delay=%s",
+						bid, cs.String(), delay)
+					if cs == webrtc.PeerConnectionStateConnected ||
+						cs == webrtc.PeerConnectionStateClosed ||
+						cs == webrtc.PeerConnectionStateFailed {
+						return
+					}
+				}
+			}(bridgeID, pc)
+		case webrtc.ICEConnectionStateFailed, webrtc.ICEConnectionStateClosed:
+			e.clearActiveBridgeIfMatch(bridgeID, "ice_"+state.String())
+		}
 	})
+
+	// ── DTLS State Tracking ────────────────────────────────────────────────────
+	// Pion exposes DTLS transport state through the SCTP transport or directly
+	// via each transceiver's sender/receiver DTLSTransport. We hook the
+	// PeerConnection-level OnSignalingStateChange as a fallback probe, but the
+	// definitive hook is via OnConnectionStateChange correlated with dtlsStartedAt.
+	//
+	// The most reliable cross-version approach: poll the DTLS transport state
+	// immediately after ICE reaches "connected" in a short goroutine, or register
+	// a per-transceiver handler. We do both here.
+	//
+	// Pion v4 exposes pc.SCTP()?.Transport()?.State() for the data channel DTLS
+	// path. For media transceivers, we inspect sender/receiver after ICE connects.
+	pc.OnSignalingStateChange(func(state webrtc.SignalingState) {
+		e.logf("[bcr_client][shadow][dtls] signalingState=%s bridgeId=%s", state.String(), bridgeID)
+	})
+
+	// Wire up a goroutine that watches the actual DTLS transport objects once ICE
+	// is connected, and logs precisely when each transport moves new→connecting.
+	// This fires once per PC and self-terminates once DTLS is confirmed started.
+	go e.watchDTLSTransportStart(bridgeID, pc)
+}
+
+// watchDTLSTransportStart polls the shadow PC's DTLS transport states until it
+// observes the new→connecting transition or the PC closes. It writes the
+// dtlsStartedAt timestamp on the session so other callbacks can calculate DTLS age.
+//
+// Polling is used because Pion v4 does not expose an OnDTLSTransportStateChange
+// callback at the PeerConnection level; the DTLSTransport object itself has a
+// state getter but no listener registration API in the public pion/webrtc v4 surface.
+func (e *Engine) watchDTLSTransportStart(bridgeID string, pc *webrtc.PeerConnection) {
+	const (
+		pollInterval  = 50 * time.Millisecond
+		giveUpTimeout = 90 * time.Second // well beyond any realistic handshake window
+	)
+
+	deadline := time.Now().Add(giveUpTimeout)
+	var dtlsStartLogged bool
+
+	for time.Now().Before(deadline) {
+		time.Sleep(pollInterval)
+
+		// Guard: stop if the PC has been closed or replaced.
+		pcState := pc.ConnectionState()
+		if pcState == webrtc.PeerConnectionStateClosed {
+			return
+		}
+
+		// Walk all transceivers and check both sender and receiver DTLS transports.
+		for _, t := range pc.GetTransceivers() {
+			if sender := t.Sender(); sender != nil {
+				if dt := sender.Transport(); dt != nil {
+					state := dt.State()
+					if !dtlsStartLogged && state == webrtc.DTLSTransportStateConnecting {
+						dtlsStartLogged = true
+						now := time.Now()
+						e.logf("[bcr_client][shadow][dtls] DTLS state=connecting (new→connecting) bridgeId=%s at=%s",
+							bridgeID, now.Format(time.RFC3339Nano))
+						e.shadowMu.Lock()
+						if session, ok := e.shadowSessions[bridgeID]; ok && session.dtlsStartedAt.IsZero() {
+							session.dtlsStartedAt = now
+						}
+						e.shadowMu.Unlock()
+					}
+					if state == webrtc.DTLSTransportStateConnected {
+						e.logf("[bcr_client][shadow][dtls] DTLS state=connected bridgeId=%s", bridgeID)
+						return // handshake complete; nothing more to watch
+					}
+					if state == webrtc.DTLSTransportStateFailed || state == webrtc.DTLSTransportStateClosed {
+						e.logf("[bcr_client][shadow][dtls] DTLS state=%s bridgeId=%s — handshake failed",
+							state.String(), bridgeID)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	e.logf("[bcr_client][shadow][dtls] watchDTLSTransportStart gave up after %s bridgeId=%s dtlsStarted=%v",
+		giveUpTimeout, bridgeID, dtlsStartLogged)
+}
+
+// watchForNoTrack is a 3-second watchdog that fires if a bridge reaches ice_connected
+// but never delivers an OnTrack callback. This indicates either media is disabled,
+// sender is gating tracks, or the relay pathway has a break.
+func (e *Engine) watchForNoTrack(bridgeID string, iceConnectedTime time.Time) {
+	time.Sleep(3 * time.Second)
+
+	e.shadowMu.Lock()
+	session, ok := e.shadowSessions[bridgeID]
+	e.shadowMu.Unlock()
+
+	if !ok || session.pc == nil {
+		return
+	}
+
+	// Check if any tracks have been delivered via OnTrack.
+	// We infer this by checking the relay session state.
+	e.relayMu.Lock()
+	relay, relayOk := e.relaySessions[bridgeID]
+	e.relayMu.Unlock()
+
+	if relayOk && relay != nil && len(relay.localTracks) > 0 {
+		// Tracks are arriving; watchdog is satisfied.
+		return
+	}
+
+	// No tracks after 3 seconds of ice_connected:
+	// Log diagnostic with current PC state for debugging media-plane issues.
+	e.logf("[bcr_client][relay] connected_no_track diagnostic bridgeId=%s iceConnState=%s connState=%s age=%dms relayTracks=%d",
+		bridgeID,
+		session.pc.ICEConnectionState().String(),
+		session.pc.ConnectionState().String(),
+		time.Since(iceConnectedTime)/time.Millisecond,
+		0) // No relay tracks present
+}
+
+// promoteActiveBridge elects the connected bridge as active and tears down the
+// previous active bridge to avoid stale dual-bridge media pipelines.
+func (e *Engine) promoteActiveBridge(bridgeID, reason string) {
+	e.shadowMu.Lock()
+	if e.activeBridgeID == bridgeID {
+		e.shadowMu.Unlock()
+		return
+	}
+	oldActive := e.activeBridgeID
+	e.activeBridgeID = bridgeID
+	e.shadowMu.Unlock()
+
+	e.logf("[bcr_client][bridge] active bridge switched old=%s new=%s reason=%s", oldActive, bridgeID, reason)
+
+	if oldActive != "" && oldActive != bridgeID {
+		e.closeShadowSession(oldActive)
+	}
+}
+
+// clearActiveBridgeIfMatch clears the active marker when the current active
+// bridge has irrecoverably failed or closed.
+func (e *Engine) clearActiveBridgeIfMatch(bridgeID, reason string) {
+	e.shadowMu.Lock()
+	if e.activeBridgeID != bridgeID {
+		e.shadowMu.Unlock()
+		return
+	}
+	e.activeBridgeID = ""
+	e.shadowMu.Unlock()
+
+	e.logf("[bcr_client][bridge] active bridge cleared bridgeId=%s reason=%s", bridgeID, reason)
+}
+
+// shouldProcessBridgeTrack returns true when media for bridgeID should be
+// forwarded to the relay. The first observed media claims the active bridge
+// when no active bridge has been elected yet.
+func (e *Engine) shouldProcessBridgeTrack(bridgeID string) bool {
+	e.shadowMu.Lock()
+	defer e.shadowMu.Unlock()
+
+	if e.activeBridgeID == "" {
+		e.activeBridgeID = bridgeID
+		e.logf("[bcr_client][bridge] active bridge claimed by first media bridgeId=%s", bridgeID)
+		return true
+	}
+
+	return e.activeBridgeID == bridgeID
 }
 
 func (e *Engine) handleSDPApplyFailure(conn *websocket.Conn, bridgeID string, session *shadowSession, stage string, err error, retryable bool) bool {
@@ -604,6 +939,9 @@ func (e *Engine) closeShadowSession(bridgeID string) {
 	if ok {
 		delete(e.shadowSessions, bridgeID)
 	}
+	if e.activeBridgeID == bridgeID {
+		e.activeBridgeID = ""
+	}
 	e.shadowMu.Unlock()
 
 	if ok && session.pc != nil {
@@ -641,6 +979,24 @@ func mapSDPType(t string) webrtc.SDPType {
 
 func normalizeSDPType(t string) string {
 	return strings.ToLower(strings.TrimSpace(t))
+}
+
+// hashSDP returns a short hash of the SDP string for dedup detection.
+// Uses MD5 for speed; truncated to 8 chars for log readability.
+func hashSDP(sdp string) string {
+	h := md5.Sum([]byte(sdp))
+	return hex.EncodeToString(h[:])[:16]
+}
+
+// truncateHash returns first 12 chars of hash for log readability, or "" if empty.
+func truncateHash(hash string) string {
+	if hash == "" {
+		return "(none)"
+	}
+	if len(hash) > 12 {
+		return hash[:12]
+	}
+	return hash
 }
 
 func detectLocalIPv4() string {
@@ -685,7 +1041,7 @@ func writeJSONPacket(conn *websocket.Conn, packetType string, payload any) error
 	return conn.WriteMessage(websocket.TextMessage, out)
 }
 
-func (e *Engine) sendShadowReady(conn *websocket.Conn, bridgeID string, pc *webrtc.PeerConnection) error {
+func (e *Engine) sendShadowReady(conn *websocket.Conn, bridgeID string, pc *webrtc.PeerConnection, sdpType string) error {
 	localDesc := pc.LocalDescription()
 	if localDesc == nil {
 		return errors.New("local description is nil")
@@ -698,11 +1054,32 @@ func (e *Engine) sendShadowReady(conn *websocket.Conn, bridgeID string, pc *webr
 		return errors.New("failed to extract shadow credentials")
 	}
 
+	// Capture local DTLS fingerprint for later diagnostics
+	e.shadowMu.Lock()
+	if session, ok := e.shadowSessions[bridgeID]; ok {
+		session.localDTLSFingerprint = fingerprint
+	}
+	e.shadowMu.Unlock()
+
 	candidates := ExtractShadowCandidates(localDesc.SDP)
-	e.logf("[bcr_client][shadow] gathered %d candidate(s) bridgeId=%s", len(candidates), bridgeID)
+	// ── DIAGNOSTIC: classify candidate types so we can verify TURN allocation ──
+	hostCount, srflxCount, relayCount := 0, 0, 0
+	for _, c := range candidates {
+		switch {
+		case strings.Contains(c, " relay "):
+			relayCount++
+		case strings.Contains(c, " srflx "):
+			srflxCount++
+		case strings.Contains(c, " host "):
+			hostCount++
+		}
+	}
+	e.logf("[bcr_client][shadow] gathered %d candidate(s) bridgeId=%s host=%d srflx=%d relay=%d",
+		len(candidates), bridgeID, hostCount, srflxCount, relayCount)
 
 	resp := RTCShadowReadyPayload{
 		BridgeID:        bridgeID,
+		SDPType:         sdpType,
 		ICEUfrag:        ufrag,
 		ICEPwd:          pwd,
 		DTLSFingerprint: fingerprint,
@@ -716,7 +1093,7 @@ func (e *Engine) sendShadowReady(conn *websocket.Conn, bridgeID string, pc *webr
 		return err
 	}
 
-	e.logf("[bcr_client] RTC_SHADOW_READY bridgeId=%s", bridgeID)
+	e.logf("[bcr_client] RTC_SHADOW_READY bridgeId=%s sdpType=%s", bridgeID, sdpType)
 	return nil
 }
 
@@ -759,6 +1136,19 @@ func (e *Engine) applyRemoteDescription(conn *websocket.Conn, bridgeID string, s
 			session.pendingLocalAnswer = nil
 			e.registerOnTrack(bridgeID, session) // fresh OnTrack for this generation
 		} else {
+			// ── MVP GUARD: Don't renegotiate while DTLS handshake is pending ──
+			// If ICE hasn't connected (and thus DTLS hasn't started), applying a
+			// renegotiation offer to Pion can disrupt the DTLS transport setup,
+			// causing the handshake to never initiate. We skip this renegotiation
+			// and let the browser handle it natively (fail-open). Teams always
+			// sends follow-up renegotiations which will succeed after DTLS completes.
+			if session.iceConnectedAt.IsZero() {
+				e.logf("[bcr_client][shadow] skipping renegotiation (ICE/DTLS setup in progress) bridgeId=%s connState=%s",
+					bridgeID, session.pc.ConnectionState().String())
+				e.sendShadowError(conn, bridgeID, "renegotiate_deferred",
+					errors.New("ICE not connected yet, deferring renegotiation"), true)
+				return true
+			}
 			e.logf("[bcr_client][shadow][stage=renegotiate_in_place] bridgeId=%s connState=%s",
 				bridgeID, session.pc.ConnectionState().String())
 		}
@@ -809,6 +1199,32 @@ func (e *Engine) applyRemoteDescription(conn *websocket.Conn, bridgeID string, s
 			}
 		}
 
+		// Extract remote DTLS fingerprint for diagnostics
+		_, _, remoteFp := ExtractShadowCredentials(answerSDP)
+		session.remoteDTLSFingerprint = remoteFp
+		e.logf("[bcr_client][shadow] answer DTLS fingerprint bridgeId=%s local=%s remote=%s",
+			bridgeID, truncateHash(session.localDTLSFingerprint), truncateHash(remoteFp))
+
+		// ── DTLS ROLE DIAGNOSTIC: Extract a=setup: from the answer ──────────
+		// This determines who initiates the DTLS handshake:
+		//   active  → remote (Teams) sends ClientHello, we wait (passive)
+		//   passive → we send ClientHello, remote waits
+		//   actpass → ambiguous (shouldn't appear in answer per RFC 8842)
+		//   missing → DTLS deadlock (neither side initiates)
+		remoteSetup := "(missing)"
+		remoteCandCount := 0
+		for _, line := range strings.Split(answerSDP, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "a=setup:") {
+				remoteSetup = trimmed
+			}
+			if strings.HasPrefix(trimmed, "a=candidate:") {
+				remoteCandCount++
+			}
+		}
+		e.logf("[bcr_client][shadow][diag] ANSWER_SETUP bridgeId=%s remoteSetup=%s remoteCandidates=%d answerLen=%d",
+			bridgeID, remoteSetup, remoteCandCount, len(answerSDP))
+
 		if err := session.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answerSDP}); err != nil {
 			e.logf("[bcr_client][shadow] SetRemoteDescription(answer) failed bridgeId=%s err=%v", bridgeID, err)
 			return e.handleSDPApplyFailure(conn, bridgeID, session, "set_remote_answer", err, false)
@@ -839,11 +1255,42 @@ func (e *Engine) applyLocalDescription(conn *websocket.Conn, bridgeID string, se
 		// We do NOT use the intercepted browser SDP as input to SetLocalDescription.
 		// However, we DO use it to create an aligned shadow PC with matching codecs,
 		// transceivers, and directions so Teams' answer is directly compatible.
+
+		// Deduplicate same-bridge local offers: check SDP hash + cooldown.
+		// If the same bridge sends near-identical SDP within 2 seconds (before state stabilizes),
+		// skip processing to avoid churn-loop resets and media interruptions.
+		currentOfferHash := hashSDP(payload.SDP)
+		now := time.Now()
+		if session.lastLocalOfferHash == currentOfferHash &&
+			now.Sub(session.lastLocalOfferTime) < 2*time.Second &&
+			(state == webrtc.SignalingStateHaveLocalOffer) {
+			e.logf("[bcr_client][shadow] dedup same-bridge local offer bridgeId=%s hash=%s age=%dms state=%s",
+				bridgeID, currentOfferHash[:12], now.Sub(session.lastLocalOfferTime).Milliseconds(), state.String())
+			return true // Skip processing but report success
+		}
+		session.lastLocalOfferHash = currentOfferHash
+		session.lastLocalOfferTime = now
 		session.browserOfferSDP = payload.SDP
 
 		if state != webrtc.SignalingStateStable {
-			if !e.attemptImplicitRollback(session, bridgeID) && session.pc.SignalingState() != webrtc.SignalingStateStable {
-				e.logf("[bcr_client][shadow] local offer in non-stable state=%s bridgeId=%s; resetting shadow pc", state.String(), bridgeID)
+			// Only attempt rollback if we're in a state that rollback can handle.
+			// If rollback fails or is invalid, avoid double-reset; just proceed to controlled reset.
+			if state == webrtc.SignalingStateHaveLocalOffer || state == webrtc.SignalingStateHaveLocalPranswer ||
+				state == webrtc.SignalingStateHaveRemoteOffer || state == webrtc.SignalingStateHaveRemotePranswer {
+				if !e.attemptImplicitRollback(session, bridgeID) {
+					// Rollback failed: proceed to controlled reset without retry.
+					e.logf("[bcr_client][shadow] rollback failed / skipped bridgeId=%s state=%s; performing controlled reset",
+						bridgeID, state.String())
+					if err := e.resetShadowSessionPC(bridgeID, session); err != nil {
+						e.logf("[bcr_client][shadow] reset shadow pc failed bridgeId=%s: %v", bridgeID, err)
+						e.sendShadowError(conn, bridgeID, "reset_pc", err, true)
+						return false
+					}
+				}
+			} else {
+				// State not rollback-able: proceed directly to controlled reset.
+				e.logf("[bcr_client][shadow] local offer in non-rollback state=%s bridgeId=%s; performing reset",
+					state.String(), bridgeID)
 				if err := e.resetShadowSessionPC(bridgeID, session); err != nil {
 					e.logf("[bcr_client][shadow] reset shadow pc failed bridgeId=%s: %v", bridgeID, err)
 					e.sendShadowError(conn, bridgeID, "reset_pc", err, true)
@@ -897,8 +1344,48 @@ func (e *Engine) handleShadowRemote(conn *websocket.Conn, payload RTCShadowRemot
 		e.sendShadowError(conn, payload.BridgeID, "create_pc", err, true)
 		return
 	}
+
+	// ── TURN Credential Injection (answerer-path timing fix) ────────────────
+	// On the answerer path the browser fires:
+	//   setRemoteDescription(offer)  → BCR_RTC_SHADOW_REMOTE   ← we are here
+	//   createAnswer()               → BCR_RTC_SHADOW_LOCAL     ← arrives later
+	//   setLocalDescription(answer)
+	//
+	// Without this block, newShadowPeerConnectionFromOffer (called moments later
+	// inside applyRemoteDescription) would create the shadow PC with nil ICE
+	// servers. ICE gathering would complete without TURN, and the subsequent
+	// SetConfiguration call (in handleShadowLocal) arrives too late — Pion
+	// silently ignores TURN servers added after gathering has concluded.
+	//
+	// By storing the TURN credentials here (payload.IceServers carries the same
+	// values the constructor hook captured), session.iceServers is non-nil when
+	// newShadowPeerConnectionFromOffer reads it, and the very first ICE gather
+	// attempt uses the authenticated relay servers.
+	if len(payload.IceServers) > 0 {
+		// Only update if we don't already have a richer set (e.g. from a prior
+		// RTC_SHADOW_LOCAL on the same session).
+		if len(session.iceServers) == 0 {
+			session.iceServers = payload.IceServers
+			e.logf("[bcr_client][shadow] stored %d TURN server(s) from remote payload bridgeId=%s",
+				len(payload.IceServers), payload.BridgeID)
+			// Also push to the existing PC created by getOrCreateShadowSession so
+			// that any gathering that started before createAlignedShadowPC replaces
+			// it can also use TURN (belt-and-suspenders).
+			if session.pc != nil {
+				_ = session.pc.SetConfiguration(webrtc.Configuration{
+					ICEServers: e.iceServersToWebRTC(session.iceServers),
+				})
+			}
+		} else {
+			e.logf("[bcr_client][shadow] remote payload ICE servers ignored (session already has %d server(s)) bridgeId=%s",
+				len(session.iceServers), payload.BridgeID)
+		}
+	}
+	// ────────────────────────────────────────────────────────────────────────
+
 	e.applyRemoteDescription(conn, payload.BridgeID, session, payload)
 }
+
 
 func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalPayload) {
 	if payload.BridgeID == "" || payload.SDP == "" {

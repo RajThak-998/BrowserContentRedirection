@@ -113,6 +113,9 @@ class Emitter {
                     bridgeId: payload.bridgeId,
                     sdpType: payload.sdpType ?? "unknown",
                     sdp: payload.sdp ?? "",
+                    // Forward authenticated TURN credentials alongside the SDP so
+                    // the Go shadow PC can use them before its first ICE gather.
+                    iceServers: payload.iceServers ?? [],
                     timestamp: payload.timestamp ?? Date.now(),
                 },
             },

@@ -63,6 +63,12 @@ func (e *Engine) newRelayPeerConnection() (*webrtc.PeerConnection, error) {
 // a 200 ms settle window (so audio + video tracks are both added before the
 // offer SDP is generated).
 func (e *Engine) onShadowTrack(bridgeID string, gen int, track *webrtc.TrackRemote) {
+	if !e.shouldProcessBridgeTrack(bridgeID) {
+		e.logf("[bcr_client][relay] ignoring track from non-active bridge kind=%s codec=%s bridgeId=%s",
+			track.Kind(), track.Codec().MimeType, bridgeID)
+		return
+	}
+
 	e.logf("[bcr_client][relay] OnTrack kind=%s codec=%s ssrc=%d bridgeId=%s",
 		track.Kind(), track.Codec().MimeType, track.SSRC(), bridgeID)
 

@@ -37,10 +37,11 @@ type VideoUpdate struct {
 }
 
 type RTCShadowRemotePayload struct {
-	BridgeID  string `json:"bridgeId"`
-	SDPType   string `json:"sdpType"`
-	SDP       string `json:"sdp"`
-	Timestamp int64  `json:"timestamp"`
+	BridgeID   string      `json:"bridgeId"`
+	SDPType    string      `json:"sdpType"`
+	SDP        string      `json:"sdp"`
+	IceServers []IceServer `json:"iceServers,omitempty"`
+	Timestamp  int64       `json:"timestamp"`
 }
 
 type IceServer struct {
@@ -70,6 +71,7 @@ type RTCShadowClosePayload struct {
 
 type RTCShadowReadyPayload struct {
 	BridgeID        string   `json:"bridgeId"`
+	SDPType         string   `json:"sdpType"`                // "offer" or "answer" — which SDP flow generated this READY
 	ICEUfrag        string   `json:"iceUfrag"`
 	ICEPwd          string   `json:"icePwd"`
 	DTLSFingerprint string   `json:"dtlsFingerprint"`

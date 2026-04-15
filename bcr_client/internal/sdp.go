@@ -10,12 +10,12 @@ import (
 )
 
 var (
-	iceUfragRe       = regexp.MustCompile(`(?m)^a=ice-ufrag:(.+)$`)
-	icePwdRe         = regexp.MustCompile(`(?m)^a=ice-pwd:(.+)$`)
-	fingerprintRe    = regexp.MustCompile(`(?m)^a=fingerprint:(.+)$`)
-	candidateLineRe  = regexp.MustCompile(`(?m)^(a=candidate:[^\r\n]+)`)
-	rtpMapLineRe     = regexp.MustCompile(`^a=rtpmap:(\d+)\s+([^/\s]+)/(\d+)(?:/(\d+))?`)
-	fmtpLineRe       = regexp.MustCompile(`^a=fmtp:(\d+)\s+(.+)`)
+	iceUfragRe      = regexp.MustCompile(`(?m)^a=ice-ufrag:(.+)$`)
+	icePwdRe        = regexp.MustCompile(`(?m)^a=ice-pwd:(.+)$`)
+	fingerprintRe   = regexp.MustCompile(`(?m)^a=fingerprint:(.+)$`)
+	candidateLineRe = regexp.MustCompile(`(?m)^(a=candidate:[^\r\n]+)`)
+	rtpMapLineRe    = regexp.MustCompile(`^a=rtpmap:(\d+)\s+([^/\s]+)/(\d+)(?:/(\d+))?`)
+	fmtpLineRe      = regexp.MustCompile(`^a=fmtp:(\d+)\s+(.+)`)
 )
 
 // ExtractShadowCredentials parses ICE and DTLS credentials from a Pion-generated
@@ -436,6 +436,58 @@ func ScrubGhostPayloadTypes(answerSDP, offerSDP string) string {
 		offerValidPTs[m[1]] = true
 	}
 
+	// Build per-media fallback PTs from the offer and capture PT attribute lines
+	// so we can inject a valid codec definition if an answer section is left empty
+	// after ghost stripping.
+	offerMediaFirstPT := make(map[string]string)  // media kind -> first offered PT
+	offerPTAttrLines := make(map[string][]string) // PT -> offer codec attr lines
+	sepOffer := "\r\n"
+	if !strings.Contains(offerSDP, "\r\n") {
+		sepOffer = "\n"
+	}
+	offerLines := strings.Split(offerSDP, sepOffer)
+	currentOfferMedia := ""
+	for _, line := range offerLines {
+		bare := strings.TrimRight(line, "\r")
+
+		if strings.HasPrefix(bare, "m=") {
+			parts := strings.Split(bare, " ")
+			if len(parts) >= 4 {
+				currentOfferMedia = strings.TrimPrefix(parts[0], "m=")
+				if _, ok := offerMediaFirstPT[currentOfferMedia]; !ok {
+					for _, pt := range parts[3:] {
+						if offerValidPTs[pt] {
+							offerMediaFirstPT[currentOfferMedia] = pt
+							break
+						}
+					}
+				}
+			} else {
+				currentOfferMedia = ""
+			}
+			continue
+		}
+
+		if m := rtpMapLineRe.FindStringSubmatch(bare); m != nil {
+			if offerValidPTs[m[1]] {
+				offerPTAttrLines[m[1]] = append(offerPTAttrLines[m[1]], bare)
+			}
+			continue
+		}
+		if m := fmtpLineRe.FindStringSubmatch(bare); m != nil {
+			if offerValidPTs[m[1]] {
+				offerPTAttrLines[m[1]] = append(offerPTAttrLines[m[1]], bare)
+			}
+			continue
+		}
+		if m := rtcpFbRe.FindStringSubmatch(bare); m != nil {
+			if offerValidPTs[m[1]] {
+				offerPTAttrLines[m[1]] = append(offerPTAttrLines[m[1]], bare)
+			}
+			continue
+		}
+	}
+
 	sep := "\r\n"
 	if !strings.Contains(answerSDP, "\r\n") {
 		sep = "\n"
@@ -443,45 +495,84 @@ func ScrubGhostPayloadTypes(answerSDP, offerSDP string) string {
 	lines := strings.Split(answerSDP, sep)
 	var out []string
 
+	currentMedia := ""
+	currentAllowedPTs := make(map[string]bool)
+	currentFallbackPT := ""
+	currentFallbackSeen := false
+
+	flushSection := func() {
+		if currentFallbackPT == "" || currentFallbackSeen {
+			return
+		}
+		if attrs, ok := offerPTAttrLines[currentFallbackPT]; ok {
+			out = append(out, attrs...)
+			currentFallbackSeen = true
+		}
+	}
+
 	for _, line := range lines {
 		bare := strings.TrimRight(line, "\r")
 
 		// 1. Scrub m= lines (e.g., "m=video 9 UDP/TLS/RTP/SAVPF 102 120")
 		if strings.HasPrefix(bare, "m=") {
+			flushSection()
+			currentAllowedPTs = make(map[string]bool)
+			currentFallbackPT = ""
+			currentFallbackSeen = false
+
 			parts := strings.Split(bare, " ")
 			if len(parts) >= 4 { // m=video port proto pt1 pt2...
+				currentMedia = strings.TrimPrefix(parts[0], "m=")
 				validParts := parts[:3]
 				for _, pt := range parts[3:] {
 					if offerValidPTs[pt] {
 						validParts = append(validParts, pt)
+						currentAllowedPTs[pt] = true
 					}
 				}
-				// Edge case: if we removed ALL payload types, leave a dummy to prevent SDP syntax error
-				if len(validParts) == 3 && len(parts) > 3 {
-					validParts = append(validParts, parts[3]) 
+
+				if len(validParts) == 3 {
+					if fallbackPT, ok := offerMediaFirstPT[currentMedia]; ok && fallbackPT != "" {
+						validParts = append(validParts, fallbackPT)
+						currentAllowedPTs[fallbackPT] = true
+						currentFallbackPT = fallbackPT
+					}
 				}
+
 				out = append(out, strings.Join(validParts, " "))
 				continue
 			}
+			currentMedia = ""
 		}
 
 		// 2. Scrub a=rtpmap, a=fmtp, a=rtcp-fb
 		if m := rtpMapLineRe.FindStringSubmatch(bare); m != nil {
-			if !offerValidPTs[m[1]] {
+			if len(currentAllowedPTs) > 0 && !currentAllowedPTs[m[1]] {
 				continue // strip
+			}
+			if currentFallbackPT != "" && m[1] == currentFallbackPT {
+				currentFallbackSeen = true
 			}
 		} else if m := fmtpLineRe.FindStringSubmatch(bare); m != nil {
-			if !offerValidPTs[m[1]] {
+			if len(currentAllowedPTs) > 0 && !currentAllowedPTs[m[1]] {
 				continue // strip
 			}
+			if currentFallbackPT != "" && m[1] == currentFallbackPT {
+				currentFallbackSeen = true
+			}
 		} else if m := rtcpFbRe.FindStringSubmatch(bare); m != nil {
-			if !offerValidPTs[m[1]] {
+			if len(currentAllowedPTs) > 0 && !currentAllowedPTs[m[1]] {
 				continue // strip
+			}
+			if currentFallbackPT != "" && m[1] == currentFallbackPT {
+				currentFallbackSeen = true
 			}
 		}
 
 		out = append(out, line)
 	}
+
+	flushSection()
 
 	return strings.Join(out, sep)
 }
