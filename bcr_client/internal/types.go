@@ -89,16 +89,13 @@ type RTCShadowErrorPayload struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
-// RTCShadowCandidatePayload carries a single trickle-ICE candidate in either
-// direction: extension → engine (remote peer's candidate) or engine → extension
-// (shadow PC's candidate, for post-gather trickle if needed).
-
-// MediaSection represents a parsed m= section from a browser SDP offer.
-// Used to create structurally-matching transceivers on the shadow PC so that
-// the shadow's offer aligns with the browser's offer.
-type MediaSection struct {
-	Kind      string // "audio", "video", "application"
-	Direction string // "sendrecv", "recvonly", "sendonly", "inactive"
-	Mid       string // "0", "1", "audio", etc. — from a=mid: line
+// CodecInfo is a minimal PT → codec descriptor used by the raw transport layer.
+// It avoids importing pion/webrtc in sdp.go while carrying the information the
+// relay needs to create TrackLocalStaticRTP with the correct MIME and clock rate.
+type CodecInfo struct {
+	MimeType    string // e.g. "audio/opus", "video/VP8", "video/H264"
+	ClockRate   uint32 // e.g. 90000 for video, 48000 for Opus
+	Channels    uint16 // e.g. 2 for stereo Opus, 0 for video
+	PayloadType uint8  // the dynamic PT negotiated in the browser SDP
 }
 

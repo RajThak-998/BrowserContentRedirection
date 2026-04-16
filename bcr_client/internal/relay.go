@@ -1,47 +1,78 @@
 package engine
 
-// relay.go — Local Pion relay PC that bridges received RTP from the shadow PC
-// to the Wails WebRTC frontend.
+// relay.go — Local Pion relay PC that bridges raw decrypted RTP from the shadow
+// transport to the Wails WebRTC frontend.
 //
-// Flow:
-//   shadow PC (remote peer) ── OnTrack ──► relaySession ──► TrackLocalStaticRTP
-//                                                                    │
-//                                             Pion relay PC offer ◄─┘
-//                                                    │
-//                                         Wails WebView (onRelayOffer)
-//                                                    │  answer
-//                                         engine.HandleRelayAnswer ◄─┘
-//                                                    │
-//                              ICE+DTLS (localhost) ─┘
-//                                 video.srcObject = stream
+// Flow (new raw transport architecture):
+//
+//   rawShadowSession (SRTP decrypted) ─── onRTPPacket callback ───►
+//   engine.onRawRTPPacket ──► relaySession (TrackLocalStaticRTP per SSRC)
+//                                             │  relay PC offer
+//                                   Wails WebView (onRelayOffer)
+//                                             │  answer
+//                              engine.HandleRelayAnswer ◄─┘
+//                                             │
+//                           ICE+DTLS (localhost) ─┘
+//                              video.srcObject = stream
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
 // relaySession holds the local Pion PeerConnection that streams media to the
-// Wails WebView, plus bookkeeping for the settle-timer and offer state.
+// Wails WebView. localTracks is keyed by SSRC string so each media stream gets
+// its own track regardless of codec PT changes.
 type relaySession struct {
 	bridgeID    string
 	pc          *webrtc.PeerConnection
-	localTracks map[string]*webrtc.TrackLocalStaticRTP // trackID → local track
+	localTracks map[string]*webrtc.TrackLocalStaticRTP // ssrcKey → local track
 
 	mu          sync.Mutex
 	settleTimer *time.Timer
 	offerSent   bool
 }
 
-// newRelayPeerConnection creates a plain PeerConnection for localhost relay.
-// No STUN/TURN needed — relay PC talks only to the Wails WebView on the same machine.
-func (e *Engine) newRelayPeerConnection() (*webrtc.PeerConnection, error) {
+// newRelayPeerConnectionWithCodecs creates a relay PeerConnection whose MediaEngine
+// is seeded with the exact PT numbers from the Teams SFU negotiation (captured
+// from the browser's SDP). By using Teams' PTs in the relay offer, the Wails
+// frontend will receive packets with matching PT numbers and decode them correctly.
+func (e *Engine) newRelayPeerConnectionWithCodecs(codecs map[uint8]CodecInfo) (*webrtc.PeerConnection, error) {
 	me := &webrtc.MediaEngine{}
-	if err := me.RegisterDefaultCodecs(); err != nil {
-		return nil, fmt.Errorf("relay: registerDefaultCodecs: %w", err)
+
+	registered := 0
+	for pt, codec := range codecs {
+		codecType := webrtc.RTPCodecTypeAudio
+		if strings.Contains(strings.ToUpper(codec.MimeType), "VIDEO") {
+			codecType = webrtc.RTPCodecTypeVideo
+		}
+		err := me.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:  codec.MimeType,
+				ClockRate: codec.ClockRate,
+				Channels:  codec.Channels,
+			},
+			PayloadType: webrtc.PayloadType(pt),
+		}, codecType)
+		if err != nil {
+			e.logf("[bcr_client][relay] registerCodec skip pt=%d mime=%s: %v", pt, codec.MimeType, err)
+		} else {
+			registered++
+		}
+	}
+
+	if registered == 0 {
+		// Safety fallback: no codecs from SDP — use Pion defaults.
+		e.logf("[bcr_client][relay] no codecs from ptMap — falling back to RegisterDefaultCodecs")
+		if err := me.RegisterDefaultCodecs(); err != nil {
+			return nil, fmt.Errorf("relay: registerDefaultCodecs: %w", err)
+		}
 	}
 
 	ir := &interceptor.Registry{}
@@ -56,30 +87,23 @@ func (e *Engine) newRelayPeerConnection() (*webrtc.PeerConnection, error) {
 	return api.NewPeerConnection(webrtc.Configuration{})
 }
 
-// onShadowTrack is called by the shadow PC's OnTrack callback whenever the
-// remote peer's media stream starts arriving. It creates (or reuses) a relay
-// session, injects a TrackLocalStaticRTP per incoming track, and starts an
-// RTP forwarding goroutine. The relay offer is sent to the Wails frontend after
-// a 200 ms settle window (so audio + video tracks are both added before the
-// offer SDP is generated).
-func (e *Engine) onShadowTrack(bridgeID string, gen int, track *webrtc.TrackRemote) {
+// onRawRTPPacket is the entry point for each inbound decrypted RTP packet from
+// the rawShadowSession's SRTP read loop. It routes the packet to the relay layer:
+//
+//  1. Looks up the codec for the packet's payload type in ptCodecMap.
+//  2. Creates the relay session (with Teams' PTs) on first call for a bridge.
+//  3. Creates a TrackLocalStaticRTP per unique SSRC (first packet for each track).
+//  4. Starts the 200ms settle timer after the last new track before offer creation.
+//  5. Writes every subsequent packet to the existing local track.
+func (e *Engine) onRawRTPPacket(bridgeID string, pkt *rtp.Packet, ptCodecMap map[uint8]CodecInfo) {
 	if !e.shouldProcessBridgeTrack(bridgeID) {
-		e.logf("[bcr_client][relay] ignoring track from non-active bridge kind=%s codec=%s bridgeId=%s",
-			track.Kind(), track.Codec().MimeType, bridgeID)
 		return
 	}
 
-	e.logf("[bcr_client][relay] OnTrack kind=%s codec=%s ssrc=%d bridgeId=%s",
-		track.Kind(), track.Codec().MimeType, track.SSRC(), bridgeID)
-
-	// Create a local track that will carry RTP to the Wails frontend.
-	localTrack, err := webrtc.NewTrackLocalStaticRTP(
-		track.Codec().RTPCodecCapability,
-		track.ID(),
-		track.StreamID(),
-	)
-	if err != nil {
-		e.logf("[bcr_client][relay] NewTrackLocalStaticRTP failed bridgeId=%s err=%v", bridgeID, err)
+	// Look up codec for this packet's payload type.
+	codec, ok := ptCodecMap[pkt.Header.PayloadType]
+	if !ok {
+		// RTX, padding-only, or unknown PT — drop silently.
 		return
 	}
 
@@ -87,10 +111,10 @@ func (e *Engine) onShadowTrack(bridgeID string, gen int, track *webrtc.TrackRemo
 	e.relayMu.Lock()
 	session, ok := e.relaySessions[bridgeID]
 	if !ok {
-		relayPC, pcErr := e.newRelayPeerConnection()
-		if pcErr != nil {
+		relayPC, err := e.newRelayPeerConnectionWithCodecs(ptCodecMap)
+		if err != nil {
 			e.relayMu.Unlock()
-			e.logf("[bcr_client][relay] newRelayPeerConnection failed bridgeId=%s err=%v", bridgeID, pcErr)
+			e.logf("[bcr_client][relay] newRelayPeerConnectionWithCodecs failed bridgeId=%s: %v", bridgeID, err)
 			return
 		}
 		session = &relaySession{
@@ -102,29 +126,60 @@ func (e *Engine) onShadowTrack(bridgeID string, gen int, track *webrtc.TrackRemo
 	}
 	e.relayMu.Unlock()
 
-	// Add the local track to the relay PC.
-	session.mu.Lock()
-	session.localTracks[track.ID()] = localTrack
-	if _, addErr := session.pc.AddTrack(localTrack); addErr != nil {
-		session.mu.Unlock()
-		e.logf("[bcr_client][relay] AddTrack failed bridgeId=%s err=%v", bridgeID, addErr)
-		return
-	}
+	ssrcKey := fmt.Sprintf("%d", pkt.SSRC)
 
-	// Settle timer: wait 200 ms after the last OnTrack before creating the offer.
-	// In practice this window accommodates both audio and video arriving nearly
-	// simultaneously, guaranteeing a complete multi-track SDP.
-	if session.settleTimer != nil {
-		session.settleTimer.Reset(200 * time.Millisecond)
-	} else {
-		session.settleTimer = time.AfterFunc(200*time.Millisecond, func() {
-			e.createAndSendRelayOffer(bridgeID, session)
-		})
+	session.mu.Lock()
+	localTrack, hasTrack := session.localTracks[ssrcKey]
+	if !hasTrack {
+		// First packet for this SSRC → create a dedicated local track.
+		cap := codecInfoToCapability(codec)
+		var trackErr error
+		localTrack, trackErr = webrtc.NewTrackLocalStaticRTP(cap, ssrcKey, bridgeID)
+		if trackErr != nil {
+			session.mu.Unlock()
+			e.logf("[bcr_client][relay] NewTrackLocalStaticRTP failed ssrc=%d bridgeId=%s: %v",
+				pkt.SSRC, bridgeID, trackErr)
+			return
+		}
+		session.localTracks[ssrcKey] = localTrack
+
+		if _, addErr := session.pc.AddTrack(localTrack); addErr != nil {
+			session.mu.Unlock()
+			e.logf("[bcr_client][relay] AddTrack failed ssrc=%d bridgeId=%s: %v",
+				pkt.SSRC, bridgeID, addErr)
+			return
+		}
+		e.logf("[bcr_client][relay] new track ssrc=%d pt=%d mime=%s bridgeId=%s",
+			pkt.SSRC, pkt.Header.PayloadType, codec.MimeType, bridgeID)
+
+		// Settle timer: wait 200ms after the last new track before issuing the
+		// offer, so both audio and video tracks are in the SDP.
+		if session.settleTimer != nil {
+			session.settleTimer.Reset(200 * time.Millisecond)
+		} else {
+			session.settleTimer = time.AfterFunc(200*time.Millisecond, func() {
+				e.createAndSendRelayOffer(bridgeID, session)
+			})
+		}
 	}
 	session.mu.Unlock()
 
-	// Start per-track RTP forwarding.
-	go e.forwardRTP(bridgeID, gen, track, localTrack)
+	// Forward the decrypted RTP packet to the local relay track.
+	// WriteRTP sends the packet as-is; the frontend decodes using the PT that
+	// was negotiated from the Teams-sourced relay offer (same PT).
+	_ = localTrack.WriteRTP(pkt)
+}
+
+// codecInfoToCapability converts a CodecInfo (from sdp.go) to the
+// webrtc.RTPCodecCapability needed by webrtc.NewTrackLocalStaticRTP.
+// PayloadType is NOT part of RTPCodecCapability — it lives in RTPCodecParameters.
+// The actual PT in transmitted RTP packets comes from pkt.Header.PayloadType.
+func codecInfoToCapability(c CodecInfo) webrtc.RTPCodecCapability {
+	return webrtc.RTPCodecCapability{
+		MimeType:  c.MimeType,
+		ClockRate: c.ClockRate,
+		Channels:  c.Channels,
+	}
 }
 
 // createAndSendRelayOffer generates the relay PC's local offer (after ICE
@@ -187,39 +242,6 @@ func (e *Engine) HandleRelayAnswer(bridgeID, sdp string) error {
 
 	e.logf("[bcr_client][relay] relay answer applied — ICE/DTLS establishing bridgeId=%s", bridgeID)
 	return nil
-}
-
-// forwardRTP reads RTP packets from the shadow track and writes them to the
-// local relay track, making them available to the Wails WebView's ontrack stream.
-// The goroutine exits when the shadow PC generation changes (PC was rebuilt) or
-// when the remote track is closed.
-func (e *Engine) forwardRTP(bridgeID string, gen int, remote *webrtc.TrackRemote, local *webrtc.TrackLocalStaticRTP) {
-	e.logf("[bcr_client][relay][fwd] start kind=%s codec=%s gen=%d bridgeId=%s",
-		remote.Kind(), remote.Codec().MimeType, gen, bridgeID)
-	defer e.logf("[bcr_client][relay][fwd] stop kind=%s gen=%d bridgeId=%s",
-		remote.Kind(), gen, bridgeID)
-
-	for {
-		// Guard: stop if the shadow PC was rebuilt (stale generation).
-		e.shadowMu.Lock()
-		sess, ok := e.shadowSessions[bridgeID]
-		currentGen := 0
-		if ok {
-			currentGen = sess.generation
-		}
-		e.shadowMu.Unlock()
-
-		if !ok || currentGen != gen {
-			return
-		}
-
-		pkt, _, err := remote.ReadRTP()
-		if err != nil {
-			return
-		}
-		// Non-fatal write errors (relay PC not yet connected) — keep reading.
-		_ = local.WriteRTP(pkt)
-	}
 }
 
 // closeRelaySession closes the relay PC for a bridge and removes it from the map.
