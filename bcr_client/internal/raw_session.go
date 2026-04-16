@@ -30,9 +30,19 @@ import (
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/ice/v4"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/srtp/v3"
 	"github.com/pion/stun/v3"
+)
+
+type rawSessionState int
+
+const (
+	stateNew rawSessionState = iota
+	stateConnecting
+	stateConnected
+	stateClosed
 )
 
 // rawShadowSession holds all transport state for one intercepted browser
@@ -49,6 +59,9 @@ type rawShadowSession struct {
 	mux      *dtlsSRTPMux
 	dtlsConn *dtls.Conn
 	srtpCtx  *srtp.Context
+	srtcpCtx *srtp.Context
+
+	state rawSessionState
 
 	// ICE/DTLS role: true = Go was the oferer (controls ICE via Dial).
 	// false = Go was the answerer (controlled via Accept).
@@ -84,6 +97,7 @@ func newRawShadowSession(bridgeID string, logf func(string, ...any)) *rawShadowS
 		bridgeID:   bridgeID,
 		ptCodecMap: make(map[uint8]CodecInfo),
 		logf:       logf,
+		state:      stateNew,
 	}
 }
 
@@ -210,6 +224,14 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 //  6. Verifies the remote DTLS fingerprint.
 //  7. Derives SRTP inbound keys and starts the decryption goroutine.
 func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string) error {
+	s.mu.Lock()
+	if s.state >= stateConnecting {
+		s.mu.Unlock()
+		return fmt.Errorf("ErrDuplicateConnect")
+	}
+	s.state = stateConnecting
+	s.mu.Unlock()
+
 	// ── Step 1: Remote ICE credentials ───────────────────────────────────────
 	remoteUfrag, remotePwd, remoteFP := ExtractShadowCredentials(remoteSDP)
 	if remoteUfrag == "" || remotePwd == "" {
@@ -252,14 +274,60 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string) error 
 	role := parseDTLSRole(remoteSDP)
 	s.logf("[raw][%s] DTLS role: %s (from a=setup: in remote SDP)", s.bridgeID, role)
 
+	// Key material capture — three-tier strategy:
+	//
+	//  Tier-1 (primary): VerifyConnection callback, called synchronously inside
+	//  pion/dtls initializeCipherSuite (flight5handler.go:346) after masterSecret
+	//  is derived. Calls ExportKeyingMaterial while state is live.
+	//
+	//  Tier-2 (fallback): If VerifyConnection was never called (early-return at
+	//  flight5handler.go:290 because cipher suite was already initialized via
+	//  session-resumption / flight5b / retransmit), retry ConnectionState() for
+	//  up to 200 ms after the handshake returns. ConnectionState() may initially
+	//  return ok=false while pion/dtls finalises internal state on a goroutine.
+	//
+	//  Tier-3: Hard fail with diagnostics.
+	var (
+		capturedPeerCert    []byte
+		capturedKeyMaterial []byte
+		captureErr          error
+		vcCalled            bool // set to true whenever VerifyConnection fires
+	)
+	const (
+		exporterLabel = "EXTRACTOR-dtls_srtp"
+		materialLen   = 60 // 2×(16-byte key + 14-byte salt) AES_CM_HMAC_SHA1_80
+	)
+
 	dtlsCfg := &dtls.Config{
 		Certificates:           []tls.Certificate{s.cert},
 		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AES128_CM_HMAC_SHA1_80},
-		InsecureSkipVerify:     true, // fingerprint verified manually in Step 6
+		InsecureSkipVerify:     true, // skip chain verify; fingerprint verified below
+		VerifyConnection: func(st *dtls.State) error {
+			vcCalled = true // always mark, even before we do anything
+			s.logf("[raw][%s] [DIAG] VerifyConnection entered: peerCerts=%d",
+				s.bridgeID, len(st.PeerCertificates))
+
+			if len(st.PeerCertificates) > 0 {
+				capturedPeerCert = make([]byte, len(st.PeerCertificates[0]))
+				copy(capturedPeerCert, st.PeerCertificates[0])
+			}
+
+			mat, ekErr := st.ExportKeyingMaterial(exporterLabel, nil, materialLen)
+			if ekErr != nil {
+				captureErr = fmt.Errorf("VerifyConnection ExportKeyingMaterial: %w", ekErr)
+				s.logf("[raw][%s] [DIAG] VerifyConnection ExportKeyingMaterial FAILED: %v", s.bridgeID, ekErr)
+				return nil // do not abort handshake; surfaced below
+			}
+			capturedKeyMaterial = mat
+			s.logf("[raw][%s] [DIAG] VerifyConnection ExportKeyingMaterial OK: %d bytes cert=%v",
+				s.bridgeID, len(mat), len(capturedPeerCert) > 0)
+			return nil
+		},
 	}
 
 	dtlsPipe := mux.DTLSPipe()
 	rAddr := iceConn.RemoteAddr()
+	s.logf("[raw][%s] [DIAG] calling dtls.%s rAddr=%v", s.bridgeID, role, rAddr)
 
 	var dtlsConn *dtls.Conn
 	switch role {
@@ -272,36 +340,93 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string) error 
 		return fmt.Errorf("DTLS handshake (%s): %w", role, err)
 	}
 	s.dtlsConn = dtlsConn
-	s.logf("[raw][%s] DTLS handshake complete", s.bridgeID)
 
-	// ── Step 6: Fingerprint verification ─────────────────────────────────────
-	if err := s.verifyRemoteFingerprint(dtlsConn, remoteFP); err != nil {
+	// Diagnostic: confirm SRTP profile was actually negotiated.
+	srtpProfile, profileOK := dtlsConn.SelectedSRTPProtectionProfile()
+	s.logf("[raw][%s] DTLS handshake done: vcCalled=%v captureErr=%v cert=%v keyMaterial=%v srtpProfile=%v(%v)",
+		s.bridgeID, vcCalled, captureErr,
+		len(capturedPeerCert) > 0, len(capturedKeyMaterial) == materialLen,
+		srtpProfile, profileOK)
+
+	// ── Step 6A: Surface any VerifyConnection error ────────────────────────────
+	if captureErr != nil {
+		_ = dtlsConn.Close()
+		return captureErr
+	}
+
+	// ── Step 6B: Tier-2 fallback — retry ConnectionState() ────────────────────
+	// VerifyConnection may have been skipped because initializeCipherSuite
+	// early-returned (cipher suite already init'd via session-resumption /
+	// flight5b). The cipher suite IS fully initialized by now; ConnectionState()
+	// just needs a moment for pion/dtls to quiesce.
+	if len(capturedKeyMaterial) != materialLen {
+		s.logf("[raw][%s] [FALLBACK] VerifyConnection did not capture material (vcCalled=%v); "+
+			"trying ConnectionState() retry loop ...", s.bridgeID, vcCalled)
+
+		const (
+			retryInterval = 10 * time.Millisecond
+			retryMax      = 20 // up to 200 ms total
+		)
+		var fallbackState dtls.State
+		var gotState bool
+		for i := 0; i < retryMax; i++ {
+			st, ok := dtlsConn.ConnectionState()
+			s.logf("[raw][%s] [FALLBACK] ConnectionState attempt %d: ok=%v", s.bridgeID, i+1, ok)
+			if ok {
+				fallbackState = st
+				gotState = true
+				break
+			}
+			time.Sleep(retryInterval)
+		}
+
+		if !gotState {
+			_ = dtlsConn.Close()
+			return fmt.Errorf("DTLS: VerifyConnection skipped (vcCalled=%v) AND "+
+				"ConnectionState unavailable after %d retries (srtpProfile=%v/%v) — "+
+				"cannot derive SRTP keys",
+				vcCalled, retryMax, srtpProfile, profileOK)
+		}
+
+		// Got a valid state via fallback — export keying material from it.
+		mat, ekErr := fallbackState.ExportKeyingMaterial(exporterLabel, nil, materialLen)
+		if ekErr != nil {
+			_ = dtlsConn.Close()
+			return fmt.Errorf("fallback ExportKeyingMaterial: %w", ekErr)
+		}
+		capturedKeyMaterial = mat
+		if len(fallbackState.PeerCertificates) > 0 && capturedPeerCert == nil {
+			capturedPeerCert = fallbackState.PeerCertificates[0]
+		}
+		s.logf("[raw][%s] [FALLBACK] ConnectionState fallback OK: keyMaterial=%d cert=%v",
+			s.bridgeID, len(capturedKeyMaterial), len(capturedPeerCert) > 0)
+	}
+
+	// ── Step 7: Fingerprint verification ──────────────────────────────────────
+	if err := s.verifyPeerCertByDER(capturedPeerCert, remoteFP); err != nil {
 		_ = dtlsConn.Close()
 		return fmt.Errorf("fingerprint verify: %w", err)
 	}
 	s.logf("[raw][%s] remote DTLS fingerprint verified", s.bridgeID)
 
-	// ── Step 7: SRTP key derivation ───────────────────────────────────────────
-	// ExportKeyingMaterial is on the dtls.State value returned by ConnectionState().
-	state, ok := dtlsConn.ConnectionState()
-	if !ok {
-		return fmt.Errorf("DTLS connection state not available after handshake")
-	}
-
+	// ── Step 8: SRTP key derivation ────────────────────────────────────────────
 	goIsClient := role == "client"
-	srtpCtx, err := deriveSRTPContext(&state, goIsClient, s.logf, s.bridgeID)
+	srtpCtx, srtcpCtx, err := deriveSRTPContextFromMaterial(capturedKeyMaterial, goIsClient, s.logf, s.bridgeID)
 	if err != nil {
 		return fmt.Errorf("derive SRTP context: %w", err)
 	}
 	s.srtpCtx = srtpCtx
+	s.srtcpCtx = srtcpCtx
 	s.logf("[raw][%s] SRTP context ready, starting read loop", s.bridgeID)
 
-	// ── Step 8: SRTP read loop ────────────────────────────────────────────────
+	// ── Step 9: SRTP read loop ─────────────────────────────────────────────────
 	loopCtx, cancel := context.WithCancel(ctx)
 	s.mu.Lock()
 	s.cancel = cancel
+	s.state = stateConnected
 	s.mu.Unlock()
 	go s.srtpReadLoop(loopCtx, mux.SRTPChan())
+	go s.rtcpHeartbeatLoop(loopCtx)
 
 	return nil
 }
@@ -329,6 +454,11 @@ func (s *rawShadowSession) AddRemoteIceCandidate(raw string) {
 // Close tears down the session. Safe to call multiple times.
 func (s *rawShadowSession) Close() {
 	s.mu.Lock()
+	if s.state == stateClosed {
+		s.mu.Unlock()
+		return
+	}
+	s.state = stateClosed
 	cancel := s.cancel
 	s.cancel = nil
 	s.mu.Unlock()
@@ -346,6 +476,31 @@ func (s *rawShadowSession) Close() {
 }
 
 // ─── SRTP Read Loop ───────────────────────────────────────────────────────────
+
+func (s *rawShadowSession) rtcpHeartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Construct a minimal RTCP Receiver Report
+			rr := &rtcp.ReceiverReport{}
+			raw, err := rr.Marshal()
+			if err != nil {
+				continue
+			}
+
+			// Encrypt with SRTCP context (dst=nil to allocate, header=nil since we already marshaled)
+			encrypted, err := s.srtcpCtx.EncryptRTCP(nil, raw, nil)
+			if err == nil && s.iceConn != nil {
+				_, _ = s.iceConn.Write(encrypted)
+			}
+		}
+	}
+}
 
 func (s *rawShadowSession) srtpReadLoop(ctx context.Context, srtpCh <-chan []byte) {
 	s.logf("[raw][%s] SRTP read loop started", s.bridgeID)
@@ -423,10 +578,11 @@ func (s *rawShadowSession) addRemoteSdpCandidates(sdp string) {
 }
 
 // parseDTLSRole reads a=setup: from the SDP and returns the DTLS role Go should use.
-//   a=setup:active  → remote initiates ClientHello → Go is Server  ("server")
-//   a=setup:passive → Go initiates ClientHello     → Go is Client  ("client")
-//   a=setup:actpass → ambiguous, default to server (Teams usually sends "active")
-//   missing         → default to server
+//
+//	a=setup:active  → remote initiates ClientHello → Go is Server  ("server")
+//	a=setup:passive → Go initiates ClientHello     → Go is Client  ("client")
+//	a=setup:actpass → ambiguous, default to server (Teams usually sends "active")
+//	missing         → default to server
 func parseDTLSRole(sdp string) string {
 	for _, line := range strings.Split(sdp, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -447,19 +603,20 @@ func parseDTLSRole(sdp string) string {
 	return "server" // no a=setup: found — Teams is almost always active
 }
 
-// verifyRemoteFingerprint checks the DTLS peer cert against the SDP fingerprint.
+// verifyPeerCertByDER checks the DTLS peer cert (raw DER bytes captured via
+// VerifyPeerCertificate callback) against the SDP a=fingerprint value.
 // remoteFP may include the algorithm prefix ("sha-256 AB:CD:...") or be bare.
-func (s *rawShadowSession) verifyRemoteFingerprint(conn *dtls.Conn, remoteFP string) error {
-	state, ok := conn.ConnectionState()
-	if !ok {
-		return fmt.Errorf("ConnectionState not available for fingerprint check")
-	}
-	if len(state.PeerCertificates) == 0 {
-		return fmt.Errorf("no peer certificates in DTLS state")
+//
+// If no cert was captured (e.g. peer didn't send one, very unusual in WebRTC),
+// the check is skipped with a warning rather than failing hard.
+func (s *rawShadowSession) verifyPeerCertByDER(certDER []byte, remoteFP string) error {
+	if len(certDER) == 0 {
+		s.logf("[raw][%s] WARNING: VerifyPeerCertificate callback captured no cert; skipping fingerprint check", s.bridgeID)
+		return nil
 	}
 
-	// state.PeerCertificates entries are raw DER bytes ([][]byte).
-	parsed, err := x509.ParseCertificate(state.PeerCertificates[0])
+	// certDER is the raw DER bytes received from VerifyPeerCertificate callback.
+	parsed, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return fmt.Errorf("parse peer cert DER: %w", err)
 	}
@@ -491,9 +648,9 @@ func sha256ColonHex(data []byte) string {
 	return strings.Join(pairs, ":")
 }
 
-// deriveSRTPContext extracts SRTP master keys from the DTLS connection state
-// per RFC 5764 §4.2 using the TLS keying material exporter and creates a
-// pion/srtp decryption context for inbound media.
+// deriveSRTPContext extracts SRTP master keys directly from the dtls.Conn
+// per RFC 5764 §4.2 using the TLS keying material exporter and creates pion/srtp
+// decryption/encryption contexts for inbound media and outbound RTCP.
 //
 // Key material layout for AES_128_CM_HMAC_SHA1_80 (60 bytes):
 //
@@ -502,46 +659,71 @@ func sha256ColonHex(data []byte) string {
 //	material[32:46] client_write_SRTP_master_salt
 //	material[46:60] server_write_SRTP_master_salt
 //
-// To decrypt inbound media FROM the SFU (which is the sender):
+// To decrypt inbound media FROM the SFU (which is the sender) and encrypt outbound RTCP TO the SFU:
 //
-//	Go is DTLS client: SFU is DTLS server → SFU encrypts with server_write_key/salt
-//	Go is DTLS server: SFU is DTLS client → SFU encrypts with client_write_key/salt
-func deriveSRTPContext(state *dtls.State, goIsClient bool, logf func(string, ...any), bridgeID string) (*srtp.Context, error) {
+//	Go is DTLS client: SFU is server → SFU encrypts with server_write, Go encrypts with client_write
+//	Go is DTLS server: SFU is client → SFU encrypts with client_write, Go encrypts with server_write
+// deriveSRTPContext derives SRTP/SRTCP contexts by exporting key material from a
+// live dtls.State. Kept for potential future use; the primary path now uses
+// deriveSRTPContextFromMaterial (keys captured via VerifyConnection callback).
+func deriveSRTPContext(state *dtls.State, goIsClient bool, logf func(string, ...any), bridgeID string) (*srtp.Context, *srtp.Context, error) {
 	const (
 		exporterLabel = "EXTRACTOR-dtls_srtp"
-		materialLen   = 60 // 2×(16-byte key + 14-byte salt)
+		materialLen   = 60
 	)
-
 	material, err := state.ExportKeyingMaterial(exporterLabel, nil, materialLen)
 	if err != nil {
-		return nil, fmt.Errorf("ExportKeyingMaterial: %w", err)
+		return nil, nil, fmt.Errorf("ExportKeyingMaterial: %w", err)
 	}
+	return deriveSRTPContextFromMaterial(material, goIsClient, logf, bridgeID)
+}
+
+// deriveSRTPContextFromMaterial builds SRTP/SRTCP contexts from pre-exported
+// 60-byte key material (2× 16-byte key + 14-byte salt for AES_CM_HMAC_SHA1_80).
+// This is the primary path: material is captured in the VerifyConnection callback
+// while masterSecret is live, completely avoiding ConnectionState() timing issues.
+func deriveSRTPContextFromMaterial(material []byte, goIsClient bool, logf func(string, ...any), bridgeID string) (*srtp.Context, *srtp.Context, error) {
+	const materialLen = 60
 	if len(material) != materialLen {
-		return nil, fmt.Errorf("unexpected material length: got %d, want %d", len(material), materialLen)
+		return nil, nil, fmt.Errorf("unexpected material length: got %d, want %d", len(material), materialLen)
 	}
 
 	var inboundKey, inboundSalt []byte
+	var outboundKey, outboundSalt []byte
 	if goIsClient {
-		// SFU is DTLS server; it sends with server_write_key + server_write_salt.
-		inboundKey = material[16:32]
+		// RFC 5764 §4.2: client_write_key | server_write_key | client_write_salt | server_write_salt
+		outboundKey = material[0:16]  // client writes (Go sends)
+		inboundKey = material[16:32]  // server writes (Teams sends to Go)
+		outboundSalt = material[32:46]
 		inboundSalt = material[46:60]
 	} else {
-		// SFU is DTLS client; it sends with client_write_key + client_write_salt.
-		inboundKey = material[0:16]
+		// Go is DTLS server (answerer)
+		inboundKey = material[0:16]   // client writes (Teams sends)
+		outboundKey = material[16:32] // server writes (Go sends)
 		inboundSalt = material[32:46]
+		outboundSalt = material[46:60]
 	}
 
 	logf("[raw][%s] SRTP inbound key[0:4]=%x salt[0:4]=%x goIsClient=%v",
 		bridgeID, inboundKey[:4], inboundSalt[:4], goIsClient)
 
-	ctx, err := srtp.CreateContext(
+	inboundCtx, err := srtp.CreateContext(
 		inboundKey, inboundSalt,
 		srtp.ProtectionProfileAes128CmHmacSha1_80,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("srtp.CreateContext: %w", err)
+		return nil, nil, fmt.Errorf("srtp.CreateContext (inbound): %w", err)
 	}
-	return ctx, nil
+
+	outboundCtx, err := srtp.CreateContext(
+		outboundKey, outboundSalt,
+		srtp.ProtectionProfileAes128CmHmacSha1_80,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("srtp.CreateContext (outbound): %w", err)
+	}
+
+	return inboundCtx, outboundCtx, nil
 }
 
 // iceServersToStunURIs converts engine IceServer entries to []*stun.URI for

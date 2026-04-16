@@ -12,6 +12,21 @@ package engine
 //
 // dtlsPacketConnAdapter wraps the DTLS channel into a net.PacketConn so that
 // dtls.Client() / dtls.Server() can consume it without knowing about the mux.
+//
+// ── Why Set*Deadline are NO-OPs ──────────────────────────────────────────────
+// pion/dtls v3 wraps our adapter in netctx.NewPacketConn (from pion/transport/v3).
+// netctx.ReadFromContext implements context cancellation by calling
+//   p.nextConn.SetReadDeadline(veryOld)
+// on the underlying conn when the context fires. If we forward that call to
+// iceConn, it kills the mux readLoop (which reads from the same iceConn on a
+// separate goroutine), draining dtlsCh and making ALL subsequent ReadFrom calls
+// return EOF instantly — so pion/dtls gets "context.Canceled" rather than real
+// server data, the DTLS handshake silently fails, and dtls.Client() returns nil
+// with an uninitialized cipher suite (srtpProfile=0, ConnectionState ok=false).
+//
+// Our ReadFrom blocks on a Go channel, NOT on iceConn, so SetReadDeadline on
+// iceConn has zero effect on unblocking it anyway. Cancellation is handled
+// exclusively via the adapter's own `closed` channel, closed by Close().
 
 import (
 	"io"
@@ -79,6 +94,7 @@ func (m *dtlsSRTPMux) readLoop() {
 		first := pkt[0]
 		switch {
 		case first >= 20 && first <= 63: // DTLS record
+			m.logf("[raw][%s] mux: DTLS pkt first=0x%02x len=%d → dtlsCh", m.bridgeID, first, n)
 			select {
 			case m.dtlsCh <- pkt:
 			default:
@@ -107,26 +123,35 @@ func (m *dtlsSRTPMux) SRTPChan() <-chan []byte { return m.srtpCh }
 // to dtls.Client() / dtls.Server(). Writes go directly to the ice.Conn so DTLS
 // handshake records reach the remote peer.
 func (m *dtlsSRTPMux) DTLSPipe() net.PacketConn {
-	return &dtlsPacketConnAdapter{mux: m}
+	return &dtlsPacketConnAdapter{
+		mux:    m,
+		closed: make(chan struct{}),
+	}
 }
 
 // dtlsPacketConnAdapter implements net.PacketConn over the DTLS channel of a
 // dtlsSRTPMux. It satisfies the interface required by dtls.Client / dtls.Server.
 //
-// ReadFrom blocks until a DTLS packet is available on the channel (or the
-// channel is closed). WriteTo delegates to the underlying ice.Conn.Write so
-// DTLS records are transmitted on the established UDP 5-tuple.
+// ReadFrom blocks until a DTLS packet is available on the channel, the channel
+// is closed, or Close() is called. WriteTo delegates to the underlying ice.Conn.
+// Set*Deadline are deliberate NO-OPs — see package-level comment for rationale.
 type dtlsPacketConnAdapter struct {
-	mux *dtlsSRTPMux
+	mux       *dtlsSRTPMux
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func (a *dtlsPacketConnAdapter) ReadFrom(p []byte) (int, net.Addr, error) {
-	pkt, ok := <-a.mux.dtlsCh
-	if !ok {
-		return 0, nil, io.EOF
+	select {
+	case pkt, ok := <-a.mux.dtlsCh:
+		if !ok {
+			return 0, nil, io.EOF
+		}
+		n := copy(p, pkt)
+		return n, a.mux.iceConn.RemoteAddr(), nil
+	case <-a.closed:
+		return 0, nil, net.ErrClosed
 	}
-	n := copy(p, pkt)
-	return n, a.mux.iceConn.RemoteAddr(), nil
 }
 
 func (a *dtlsPacketConnAdapter) WriteTo(p []byte, _ net.Addr) (int, error) {
@@ -134,22 +159,19 @@ func (a *dtlsPacketConnAdapter) WriteTo(p []byte, _ net.Addr) (int, error) {
 	return a.mux.iceConn.Write(p)
 }
 
-// Close is a deliberate no-op. The rawShadowSession owns the lifecycle of both
-// the ice.Conn and the mux; closing this adapter must not prematurely shut them down.
-func (a *dtlsPacketConnAdapter) Close() error { return nil }
+// Close signals ReadFrom to unblock and return net.ErrClosed. It does NOT touch
+// the underlying iceConn or the mux readLoop — those are owned by rawShadowSession.
+func (a *dtlsPacketConnAdapter) Close() error {
+	a.closeOnce.Do(func() { close(a.closed) })
+	return nil
+}
 
 func (a *dtlsPacketConnAdapter) LocalAddr() net.Addr {
 	return a.mux.iceConn.LocalAddr()
 }
 
-func (a *dtlsPacketConnAdapter) SetDeadline(t time.Time) error {
-	return a.mux.iceConn.SetDeadline(t)
-}
+// Set*Deadline intentionally do nothing. See package-level comment.
+func (a *dtlsPacketConnAdapter) SetDeadline(t time.Time) error      { return nil }
+func (a *dtlsPacketConnAdapter) SetReadDeadline(t time.Time) error  { return nil }
+func (a *dtlsPacketConnAdapter) SetWriteDeadline(t time.Time) error { return nil }
 
-func (a *dtlsPacketConnAdapter) SetReadDeadline(t time.Time) error {
-	return a.mux.iceConn.SetReadDeadline(t)
-}
-
-func (a *dtlsPacketConnAdapter) SetWriteDeadline(t time.Time) error {
-	return a.mux.iceConn.SetWriteDeadline(t)
-}

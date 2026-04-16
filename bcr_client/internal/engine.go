@@ -269,8 +269,13 @@ func (e *Engine) triggerConnect(conn *websocket.Conn, bridgeID string, session *
 
 		e.logf("[raw][%s] triggering ICE+DTLS+SRTP connect", bridgeID)
 		if err := session.Connect(ctx, remoteSDP); err != nil {
+			if strings.Contains(err.Error(), "ErrDuplicateConnect") {
+				e.logf("[raw][%s] Ignoring duplicate remote connect request", bridgeID)
+				return
+			}
 			e.logf("[raw][%s] Connect failed: %v", bridgeID, err)
 			e.sendShadowError(conn, bridgeID, "connect_failed", err, true)
+			e.closeShadowSession(bridgeID)
 			return
 		}
 		e.promoteActiveBridge(bridgeID, "srtp_ready")
