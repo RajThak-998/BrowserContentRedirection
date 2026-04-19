@@ -103,7 +103,17 @@ func (e *Engine) onRawRTPPacket(bridgeID string, pkt *rtp.Packet, ptCodecMap map
 	// Look up codec for this packet's payload type.
 	codec, ok := ptCodecMap[pkt.Header.PayloadType]
 	if !ok {
-		// RTX, padding-only, or unknown PT — drop silently.
+		// Log the first occurrence of each unknown PT.
+		e.unknownPTMu.Lock()
+		if _, seen := e.unknownPTs[pkt.Header.PayloadType]; !seen {
+			if e.unknownPTs == nil {
+				e.unknownPTs = make(map[uint8]bool)
+			}
+			e.unknownPTs[pkt.Header.PayloadType] = true
+			e.logf("[bcr_client][relay] unknown PT=%d SSRC=%d (not in ptCodecMap, %d codecs registered) bridgeId=%s",
+				pkt.Header.PayloadType, pkt.SSRC, len(ptCodecMap), bridgeID)
+		}
+		e.unknownPTMu.Unlock()
 		return
 	}
 

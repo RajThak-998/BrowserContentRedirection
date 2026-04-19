@@ -35,6 +35,13 @@ type Engine struct {
 
 	relayMu       sync.Mutex
 	relaySessions map[string]*relaySession
+
+	connectMu   sync.Mutex
+	bridgeRetry map[string]bridgeRetryState
+
+	// Diagnostic: track unknown PTs to avoid log spam.
+	unknownPTMu sync.Mutex
+	unknownPTs  map[uint8]bool
 }
 
 func New(cfg Config, cb Callbacks) *Engine {
@@ -50,6 +57,7 @@ func New(cfg Config, cb Callbacks) *Engine {
 		},
 		rawSessions:   make(map[string]*rawShadowSession),
 		relaySessions: make(map[string]*relaySession),
+		bridgeRetry:   make(map[string]bridgeRetryState),
 	}
 }
 
@@ -234,6 +242,12 @@ func (e *Engine) getOrCreateRawSession(bridgeID string) *rawShadowSession {
 	// Callback is set once at creation; it is safe to read ptCodecMap since
 	// that map is populated before Init() starts (in handleShadowLocal).
 	session.onRTPPacket = func(pkt *rtp.Packet) {
+		// Track video SSRCs so the RTCP heartbeat loop can send PLI.
+		if codec, ok := session.ptCodecMap[pkt.Header.PayloadType]; ok {
+			if strings.Contains(strings.ToUpper(codec.MimeType), "VIDEO") {
+				session.trackVideoSSRC(pkt.SSRC)
+			}
+		}
 		e.onRawRTPPacket(bridgeID, pkt, session.ptCodecMap)
 	}
 	e.rawSessions[bridgeID] = session
@@ -260,27 +274,110 @@ func (e *Engine) closeShadowSession(bridgeID string) {
 	e.closeRelaySession(bridgeID)
 }
 
-// triggerConnect runs rawSession.Connect() in a goroutine, promoting the bridge
-// on success and sending RTC_SHADOW_ERROR on failure.
-func (e *Engine) triggerConnect(conn *websocket.Conn, bridgeID string, session *rawShadowSession, remoteSDP string) {
+type bridgeRetryState struct {
+	attempts    int
+	lastAttempt time.Time
+	cooldown    bool
+	cooldownEnd time.Time
+}
+
+const (
+	maxConnectAttempts = 3
+	retryBaseDelay     = 500 * time.Millisecond
+	cooldownDuration   = 10 * time.Second
+)
+
+// triggerConnect starts a Connect attempt for the given generation token.
+// It is the *only* call-site that transitions a session into stateConnecting.
+func (e *Engine) triggerConnect(conn *websocket.Conn, bridgeID string, session *rawShadowSession, remoteSDP string, sdpType string, gen uint32) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		e.logf("[raw][%s] triggering ICE+DTLS+SRTP connect", bridgeID)
-		if err := session.Connect(ctx, remoteSDP); err != nil {
-			if strings.Contains(err.Error(), "ErrDuplicateConnect") {
-				e.logf("[raw][%s] Ignoring duplicate remote connect request", bridgeID)
+		e.logf("[raw][%s] triggering ICE+DTLS+SRTP connect gen=%d", bridgeID, gen)
+		err := session.Connect(ctx, remoteSDP, gen)
+		if err != nil {
+			if strings.Contains(err.Error(), "ErrDuplicateConnect") || strings.Contains(err.Error(), "ErrStaleGeneration") {
+				e.logf("[raw][%s] glare/stale-gen rejected connect gen=%d: %v", bridgeID, gen, err)
 				return
 			}
-			e.logf("[raw][%s] Connect failed: %v", bridgeID, err)
-			e.sendShadowError(conn, bridgeID, "connect_failed", err, true)
+			
+			e.logf("[raw][%s] Connect failed gen=%d: %v", bridgeID, gen, err)
+			
+			e.connectMu.Lock()
+			rs := e.bridgeRetry[bridgeID]
+			rs.attempts++
+			if rs.attempts >= maxConnectAttempts {
+				rs.cooldown = true
+				rs.cooldownEnd = time.Now().Add(cooldownDuration)
+				e.bridgeRetry[bridgeID] = rs
+				e.connectMu.Unlock()
+
+				e.logf("[raw][%s] max attempts (%d) reached — entering %s cool-down",
+					bridgeID, maxConnectAttempts, cooldownDuration)
+				e.sendShadowError(conn, bridgeID, "cooldown", err, false)
+				e.closeShadowSession(bridgeID)
+				return
+			}
+			backoff := retryBaseDelay * time.Duration(1<<rs.attempts)
+			e.bridgeRetry[bridgeID] = rs
+			e.connectMu.Unlock()
+
+			// Cache state to pass to new session
+			session.mu.Lock()
+			iceServers := session.iceServers
+			ptCodecMap := session.ptCodecMap
+			session.mu.Unlock()
+
 			e.closeShadowSession(bridgeID)
+			newSession := e.getOrCreateRawSession(bridgeID)
+			
+			newSession.mu.Lock()
+			newSession.iceServers = iceServers
+			newSession.ptCodecMap = ptCodecMap
+			newSession.isOfferer = (sdpType == "offer")
+			newSession.mu.Unlock()
+
+			go e.retryBridge(conn, bridgeID, newSession, remoteSDP, sdpType, backoff)
 			return
 		}
+
+		e.connectMu.Lock()
+		rs := e.bridgeRetry[bridgeID]
+		rs.attempts = 0
+		rs.cooldown = false
+		e.bridgeRetry[bridgeID] = rs
+		e.connectMu.Unlock()
+
 		e.promoteActiveBridge(bridgeID, "srtp_ready")
 		e.logf("[raw][%s] transport up — SRTP decryption active", bridgeID)
 	}()
+}
+
+func (e *Engine) retryBridge(conn *websocket.Conn, bridgeID string, session *rawShadowSession, remoteSDP string, sdpType string, backoff time.Duration) {
+	e.logf("[raw][%s] delaying retry attempt by %s", bridgeID, backoff)
+	time.Sleep(backoff)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ready, err := session.Init(ctx, sdpType)
+	if err != nil {
+		e.logf("[raw][%s] retry Init failed: %v", bridgeID, err)
+		e.sendShadowError(conn, bridgeID, "retry_init", err, true)
+		return
+	}
+
+	if err := writeJSONPacket(conn, "RTC_SHADOW_READY", ready); err != nil {
+		e.logf("[raw][%s] send SHADOW_READY failed: %v", bridgeID, err)
+	}
+	e.logf("[bcr_client] RTC_SHADOW_READY (retry) sent bridgeId=%s sdpType=%s", bridgeID, sdpType)
+
+	session.mu.Lock()
+	gen := session.generation
+	session.mu.Unlock()
+
+	e.triggerConnect(conn, bridgeID, session, remoteSDP, sdpType, gen)
 }
 
 // ─── handleShadowLocal ────────────────────────────────────────────────────────
@@ -301,9 +398,10 @@ func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalP
 
 	// Guard: if Init() is already in progress or done, skip (dedup).
 	session.mu.Lock()
-	if session.iceAgent != nil {
+	if session.state != stateNew {
+		currentState := session.state
 		session.mu.Unlock()
-		e.logf("[raw][%s] Init already in progress — ignoring duplicate %s sdp", bridgeID, sdpType)
+		e.logf("[raw][%s] Init already in progress — ignoring duplicate %s sdp (state=%v)", bridgeID, sdpType, currentState)
 		return
 	}
 	session.mu.Unlock()
@@ -344,10 +442,11 @@ func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalP
 		if sdpType == "answer" {
 			session.mu.Lock()
 			rSDP := session.remoteOfferSDP
+			gen := session.generation
 			session.mu.Unlock()
 
 			if rSDP != "" {
-				e.triggerConnect(conn, bridgeID, session, rSDP)
+				e.triggerConnect(conn, bridgeID, session, rSDP, sdpType, gen)
 			} else {
 				e.logf("[raw][%s] Init(answer) done — waiting for remote offer SDP", bridgeID)
 			}
@@ -370,7 +469,52 @@ func (e *Engine) handleShadowRemote(conn *websocket.Conn, payload RTCShadowRemot
 	sdpType := normalizeSDPType(payload.SDPType)
 	bridgeID := payload.BridgeID
 
+	// ── Cool-down guard ──────────────────────────────────────────────────────
+	e.connectMu.Lock()
+	rs := e.bridgeRetry[bridgeID]
+	if rs.cooldown && time.Now().Before(rs.cooldownEnd) {
+		remaining := time.Until(rs.cooldownEnd).Round(time.Millisecond)
+		e.connectMu.Unlock()
+		e.logf("[raw][%s] SHADOW_REMOTE rejected — in cool-down for %s more", bridgeID, remaining)
+		return
+	}
+	if rs.cooldown && time.Now().After(rs.cooldownEnd) {
+		rs.cooldown = false
+		rs.attempts = 0
+		e.bridgeRetry[bridgeID] = rs
+	}
+	e.connectMu.Unlock()
+
 	session := e.getOrCreateRawSession(bridgeID)
+
+	// ── Glare guard ──────────────────────────────────────────────────────────
+	session.mu.Lock()
+	currentState := session.state
+	sdpHash := hashSDP(payload.SDP)
+	isDuplicate := sdpHash == session.lastRemoteSDPHash
+	gen := session.generation
+	session.mu.Unlock()
+
+	switch currentState {
+	case stateConnecting:
+		e.logf("[raw][%s] SHADOW_REMOTE %s rejected — session is CONNECTING (glare suppressed)", bridgeID, sdpType)
+		return
+	case stateConnected:
+		e.logf("[raw][%s] SHADOW_REMOTE %s rejected — session is CONNECTED (renegotiation not supported)", bridgeID, sdpType)
+		return
+	case stateClosed:
+		e.logf("[raw][%s] SHADOW_REMOTE %s rejected — session is CLOSED", bridgeID, sdpType)
+		return
+	}
+
+	if isDuplicate {
+		e.logf("[raw][%s] SHADOW_REMOTE %s rejected — duplicate SDP (hash=%s)", bridgeID, sdpType, sdpHash[:8])
+		return
+	}
+
+	session.mu.Lock()
+	session.lastRemoteSDPHash = sdpHash
+	session.mu.Unlock()
 
 	// Store ICE servers if the remote payload carries them (answerer-path timing).
 	if len(payload.IceServers) > 0 && len(session.iceServers) == 0 {
@@ -382,7 +526,7 @@ func (e *Engine) handleShadowRemote(conn *websocket.Conn, payload RTCShadowRemot
 	case "answer":
 		// Offerer path: SFU answered our (munged) offer. Trigger ICE+DTLS+SRTP.
 		e.logf("[bcr_client] RTC_SHADOW_REMOTE answer bridgeId=%s sdpLen=%d", bridgeID, len(payload.SDP))
-		e.triggerConnect(conn, bridgeID, session, payload.SDP)
+		e.triggerConnect(conn, bridgeID, session, payload.SDP, "offer", gen)
 
 	case "offer":
 		// Answerer path: SFU is the oferer. Store the remote offer SDP so that
@@ -390,12 +534,12 @@ func (e *Engine) handleShadowRemote(conn *websocket.Conn, payload RTCShadowRemot
 		e.logf("[bcr_client] RTC_SHADOW_REMOTE offer bridgeId=%s sdpLen=%d", bridgeID, len(payload.SDP))
 		session.mu.Lock()
 		session.remoteOfferSDP = payload.SDP
-		initDone := session.initDone
+		isReady := session.state == stateReady
 		session.mu.Unlock()
 
-		if initDone {
+		if isReady {
 			// Init(answer) already completed before this offer arrived — connect now.
-			e.triggerConnect(conn, bridgeID, session, payload.SDP)
+			e.triggerConnect(conn, bridgeID, session, payload.SDP, "answer", gen)
 		}
 
 	default:
