@@ -33,8 +33,8 @@ type Engine struct {
 	rawSessions    map[string]*rawShadowSession
 	activeBridgeID string
 
-	relayMu       sync.Mutex
-	relaySessions map[string]*relaySession
+	relayMu    sync.Mutex
+	webmMuxers map[string]*webmMuxer
 
 	connectMu   sync.Mutex
 	bridgeRetry map[string]bridgeRetryState
@@ -55,9 +55,9 @@ func New(cfg Config, cb Callbacks) *Engine {
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
-		rawSessions:   make(map[string]*rawShadowSession),
-		relaySessions: make(map[string]*relaySession),
-		bridgeRetry:   make(map[string]bridgeRetryState),
+		rawSessions: make(map[string]*rawShadowSession),
+		webmMuxers:  make(map[string]*webmMuxer),
+		bridgeRetry: make(map[string]bridgeRetryState),
 	}
 }
 
@@ -271,7 +271,21 @@ func (e *Engine) closeShadowSession(bridgeID string) {
 		session.Close()
 	}
 
-	e.closeRelaySession(bridgeID)
+	e.closeWebMMuxer(bridgeID)
+}
+
+func (e *Engine) closeWebMMuxer(bridgeID string) {
+	e.relayMu.Lock()
+	muxer, ok := e.webmMuxers[bridgeID]
+	if ok {
+		delete(e.webmMuxers, bridgeID)
+	}
+	e.relayMu.Unlock()
+
+	if ok && muxer != nil {
+		muxer.Close()
+		e.logf("[bcr_client][webm] muxer closed bridgeId=%s", bridgeID)
+	}
 }
 
 type bridgeRetryState struct {
@@ -401,6 +415,12 @@ func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalP
 	if session.state != stateNew {
 		currentState := session.state
 		session.mu.Unlock()
+
+		if currentState == stateConnected || currentState == stateConnecting || currentState == stateReady {
+			e.handleRenegotiationLocal(conn, session, bridgeID, sdpType, payload.SDP)
+			return
+		}
+
 		e.logf("[raw][%s] Init already in progress — ignoring duplicate %s sdp (state=%v)", bridgeID, sdpType, currentState)
 		return
 	}
@@ -417,6 +437,17 @@ func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalP
 	// need to decrypt and relay.
 	session.ptCodecMap = ParsePTCodecMap(payload.SDP)
 	e.logf("[raw][%s] parsed %d codec(s) from local %s SDP", bridgeID, len(session.ptCodecMap), sdpType)
+
+	// Extract video SSRCs from the local SDP so PLI can fire as soon as SRTP
+	// is ready, before any video packets arrive (breaks the PLI deadlock).
+	videoSSRCs := ExtractVideoSSRCs(payload.SDP)
+	for _, ssrc := range videoSSRCs {
+		session.trackVideoSSRC(ssrc)
+	}
+	if len(videoSSRCs) > 0 {
+		e.logf("[raw][%s] extracted %d video SSRC(s) from local %s SDP for proactive PLI: %v",
+			bridgeID, len(videoSSRCs), sdpType, videoSSRCs)
+	}
 
 	// Mark ICE role: offerer = controlling (Dial), answerer = controlled (Accept).
 	session.isOfferer = sdpType == "offer"
@@ -496,11 +527,12 @@ func (e *Engine) handleShadowRemote(conn *websocket.Conn, payload RTCShadowRemot
 	session.mu.Unlock()
 
 	switch currentState {
-	case stateConnecting:
-		e.logf("[raw][%s] SHADOW_REMOTE %s rejected — session is CONNECTING (glare suppressed)", bridgeID, sdpType)
-		return
-	case stateConnected:
-		e.logf("[raw][%s] SHADOW_REMOTE %s rejected — session is CONNECTED (renegotiation not supported)", bridgeID, sdpType)
+	case stateConnecting, stateConnected:
+		if sdpType == "offer" || sdpType == "answer" {
+			e.handleRenegotiationRemote(session, bridgeID, sdpType, payload.SDP)
+		}
+		e.logf("[raw][%s] SHADOW_REMOTE %s handled — session is %v (codec map updated, transport unchanged)",
+			bridgeID, sdpType, currentState)
 		return
 	case stateClosed:
 		e.logf("[raw][%s] SHADOW_REMOTE %s rejected — session is CLOSED", bridgeID, sdpType)
@@ -526,12 +558,16 @@ func (e *Engine) handleShadowRemote(conn *websocket.Conn, payload RTCShadowRemot
 	case "answer":
 		// Offerer path: SFU answered our (munged) offer. Trigger ICE+DTLS+SRTP.
 		e.logf("[bcr_client] RTC_SHADOW_REMOTE answer bridgeId=%s sdpLen=%d", bridgeID, len(payload.SDP))
+		// Extract video SSRCs from the answer so PLI can fire as soon as SRTP is ready.
+		e.mergeCodecsAndSSRCs(session, bridgeID, "answer", payload.SDP)
 		e.triggerConnect(conn, bridgeID, session, payload.SDP, "offer", gen)
 
 	case "offer":
 		// Answerer path: SFU is the oferer. Store the remote offer SDP so that
 		// once Init(answer) finishes, Connect() can use it.
 		e.logf("[bcr_client] RTC_SHADOW_REMOTE offer bridgeId=%s sdpLen=%d", bridgeID, len(payload.SDP))
+		// Extract video SSRCs from the offer so PLI can fire as soon as SRTP is ready.
+		e.mergeCodecsAndSSRCs(session, bridgeID, "offer", payload.SDP)
 		session.mu.Lock()
 		session.remoteOfferSDP = payload.SDP
 		isReady := session.state == stateReady
@@ -657,6 +693,79 @@ func (e *Engine) shouldProcessBridgeTrack(bridgeID string) bool {
 	}
 
 	return e.activeBridgeID == bridgeID
+}
+
+// ─── Codec & SSRC Merging ─────────────────────────────────────────────────────
+
+// mergeCodecsAndSSRCs parses an SDP for new codec PTs and video SSRCs,
+// merging them into the session. This is called for both initial answers
+// and renegotiation offers/answers.
+//
+// The video SSRC extraction is critical: it breaks the PLI chicken-and-egg
+// deadlock where the SFU won't send video without PLI, but we can't send
+// PLI without knowing the SSRC. By parsing SSRCs from the SDP, the RTCP
+// heartbeat loop can proactively send PLI before any video packets arrive.
+func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpType, sdp string) {
+	// Merge codec PTs
+	newCodecs := ParsePTCodecMap(sdp)
+	session.mu.Lock()
+	added := 0
+	for pt, info := range newCodecs {
+		if _, exists := session.ptCodecMap[pt]; !exists {
+			session.ptCodecMap[pt] = info
+			added++
+		}
+	}
+	session.mu.Unlock()
+	if added > 0 {
+		e.logf("[raw][%s] renegotiation %s: merged %d new codec(s) into ptCodecMap (total=%d)",
+			bridgeID, sdpType, added, len(session.ptCodecMap))
+	}
+
+	// Extract video SSRCs and inject them for proactive PLI
+	videoSSRCs := ExtractVideoSSRCs(sdp)
+	for _, ssrc := range videoSSRCs {
+		session.trackVideoSSRC(ssrc)
+	}
+	if len(videoSSRCs) > 0 {
+		e.logf("[raw][%s] extracted %d video SSRC(s) from %s SDP for proactive PLI: %v",
+			bridgeID, len(videoSSRCs), sdpType, videoSSRCs)
+	}
+}
+
+// ─── Renegotiation Handlers ───────────────────────────────────────────────────
+
+func (e *Engine) handleRenegotiationLocal(conn *websocket.Conn, session *rawShadowSession, bridgeID string, sdpType string, sdp string) {
+	e.logf("[raw][%s] SHADOW_LOCAL %s during active session — treating as renegotiation", bridgeID, sdpType)
+	
+	// Update codecs and SSRCs from the new local SDP
+	e.mergeCodecsAndSSRCs(session, bridgeID, sdpType, sdp)
+
+	// Fetch existing transport credentials
+	ready, err := session.GetTransportCredentials(sdpType)
+	if err != nil {
+		e.logf("[raw][%s] failed to get transport credentials for renegotiation: %v", bridgeID, err)
+		return
+	}
+
+	// Send SHADOW_READY to unblock the frontend's createAnswer/createOffer await
+	if err := writeJSONPacket(conn, "RTC_SHADOW_READY", ready); err != nil {
+		e.logf("[raw][%s] send SHADOW_READY for renegotiation failed: %v", bridgeID, err)
+		return
+	}
+	e.logf("[raw][%s] [Renegotiation Answer Sent] SHADOW_READY sent bridgeId=%s sdpType=%s", bridgeID, bridgeID, sdpType)
+}
+
+func (e *Engine) handleRenegotiationRemote(session *rawShadowSession, bridgeID string, sdpType string, sdp string) {
+	e.logf("[raw][%s] [Renegotiation Offer/Answer Received] Parsing remote %s SDP", bridgeID, sdpType)
+	
+	// Log the exact track mapping and m-lines
+	sections := ExtractMediaSections(sdp)
+	for _, sec := range sections {
+		e.logf("[raw][%s] [Renegotiation Track Mapping] Section: m=%s %s %s", bridgeID, sec.Type, sec.Port, sec.Protocol)
+	}
+
+	e.mergeCodecsAndSSRCs(session, bridgeID, sdpType, sdp)
 }
 
 // ─── Utility Functions ────────────────────────────────────────────────────────

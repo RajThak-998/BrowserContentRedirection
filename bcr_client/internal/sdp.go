@@ -144,3 +144,85 @@ func ParsePTCodecMap(sdp string) map[uint8]CodecInfo {
 
 	return out
 }
+
+// ssrcLineRe matches "a=ssrc:<decimal> ..." lines.
+var ssrcLineRe = regexp.MustCompile(`^a=ssrc:(\d+)\s`)
+
+// ExtractVideoSSRCs returns deduplicated SSRC values declared in m=video
+// sections of the SDP via a=ssrc: lines.
+//
+// This is critical for breaking the PLI chicken-and-egg deadlock: the SFU
+// won't send video without receiving a PLI, but we can only send PLI if we
+// know the target SSRC. By extracting SSRCs from the SDP we can proactively
+// send PLI before any video packets arrive.
+func ExtractVideoSSRCs(sdp string) []uint32 {
+	sep := "\r\n"
+	if !strings.Contains(sdp, "\r\n") {
+		sep = "\n"
+	}
+	lines := strings.Split(sdp, sep)
+
+	inVideoSection := false
+	seen := make(map[uint32]bool)
+	var out []uint32
+
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+
+		if strings.HasPrefix(bare, "m=video") {
+			inVideoSection = true
+			continue
+		}
+		if strings.HasPrefix(bare, "m=") {
+			inVideoSection = false
+			continue
+		}
+		if !inVideoSection {
+			continue
+		}
+
+		m := ssrcLineRe.FindStringSubmatch(bare)
+		if m == nil {
+			continue
+		}
+		ssrc64, err := strconv.ParseUint(m[1], 10, 32)
+		if err != nil {
+			continue
+		}
+		ssrc := uint32(ssrc64)
+		if !seen[ssrc] {
+			seen[ssrc] = true
+			out = append(out, ssrc)
+		}
+	}
+
+	return out
+}
+
+// ExtractMediaSections parses an SDP blob and returns a list of MediaSections,
+// which contain the type, port, protocol, and formats for each m= line.
+// This is used for diagnostic logging during renegotiation.
+func ExtractMediaSections(sdp string) []MediaSection {
+	sep := "\r\n"
+	if !strings.Contains(sdp, "\r\n") {
+		sep = "\n"
+	}
+	lines := strings.Split(sdp, sep)
+
+	var sections []MediaSection
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+		if strings.HasPrefix(bare, "m=") {
+			parts := strings.Split(bare[2:], " ")
+			if len(parts) >= 4 {
+				sections = append(sections, MediaSection{
+					Type:     parts[0],
+					Port:     parts[1],
+					Protocol: parts[2],
+					Formats:  parts[3:],
+				})
+			}
+		}
+	}
+	return sections
+}

@@ -106,6 +106,10 @@ type rawShadowSession struct {
 	// Set by the engine after session creation.
 	onRTPPacket func(pkt *rtp.Packet)
 
+	// localCredentials stores the generated ICE/DTLS transport credentials.
+	// Used to respond to renegotiation SHADOW_LOCAL events.
+	localCredentials *RTCShadowReadyPayload
+
 	logf func(string, ...any)
 }
 
@@ -225,7 +229,7 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	s.state = stateReady
 	s.mu.Unlock()
 
-	return &RTCShadowReadyPayload{
+	ready := &RTCShadowReadyPayload{
 		BridgeID:        s.bridgeID,
 		SDPType:         sdpType,
 		ICEUfrag:        ufrag,
@@ -235,7 +239,31 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 		Candidates:      candsCopy,
 		GeneratedAt:     time.Now().UnixMilli(),
 		ExpiresAt:       time.Now().Add(60 * time.Second).UnixMilli(),
-	}, nil
+	}
+
+	s.mu.Lock()
+	s.localCredentials = ready
+	s.mu.Unlock()
+
+	return ready, nil
+}
+
+// GetTransportCredentials returns a copy of the active ICE/DTLS credentials,
+// updated with the specified sdpType and fresh expiration timestamps.
+func (s *rawShadowSession) GetTransportCredentials(sdpType string) (*RTCShadowReadyPayload, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.localCredentials == nil {
+		return nil, fmt.Errorf("no transport credentials available")
+	}
+
+	ready := *s.localCredentials
+	ready.SDPType = sdpType
+	ready.GeneratedAt = time.Now().UnixMilli()
+	ready.ExpiresAt = time.Now().Add(60 * time.Second).UnixMilli()
+
+	return &ready, nil
 }
 
 // ─── Phase 2 ─────────────────────────────────────────────────────────────────

@@ -10,10 +10,6 @@ type Callbacks struct {
 	OnVideoChunk  func(data []byte)
 	OnVideoUpdate func(update VideoUpdate)
 	OnLog         func(message string)
-	// OnRelayOffer is called when the Pion relay PC has a local offer ready for
-	// the Wails WebRTC frontend. bridgeID identifies the shadow session; sdp is
-	// the full offer SDP the frontend must call setRemoteDescription with.
-	OnRelayOffer func(bridgeID, sdp string)
 }
 
 type Packet struct {
@@ -97,5 +93,13 @@ type CodecInfo struct {
 	ClockRate   uint32 // e.g. 90000 for video, 48000 for Opus
 	Channels    uint16 // e.g. 2 for stereo Opus, 0 for video
 	PayloadType uint8  // the dynamic PT negotiated in the browser SDP
+}
+
+// MediaSection represents a single m= line and its associated formats.
+type MediaSection struct {
+	Type     string
+	Port     string
+	Protocol string
+	Formats  []string
 }
 
