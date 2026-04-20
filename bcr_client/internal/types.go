@@ -7,9 +7,9 @@ type Config struct {
 }
 
 type Callbacks struct {
-	OnVideoChunk  func(data []byte)
-	OnVideoUpdate func(update VideoUpdate)
-	OnLog         func(message string)
+	OnLoopbackOffer func(bridgeID string, sdp string)
+	OnVideoUpdate   func(update VideoUpdate)
+	OnLog           func(message string)
 }
 
 type Packet struct {

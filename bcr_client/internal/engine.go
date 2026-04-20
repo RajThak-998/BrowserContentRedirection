@@ -33,8 +33,8 @@ type Engine struct {
 	rawSessions    map[string]*rawShadowSession
 	activeBridgeID string
 
-	relayMu    sync.Mutex
-	webmMuxers map[string]*webmMuxer
+	relayMu          sync.Mutex
+	loopbackSessions map[string]*loopbackSession
 
 	connectMu   sync.Mutex
 	bridgeRetry map[string]bridgeRetryState
@@ -55,9 +55,9 @@ func New(cfg Config, cb Callbacks) *Engine {
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
-		rawSessions: make(map[string]*rawShadowSession),
-		webmMuxers:  make(map[string]*webmMuxer),
-		bridgeRetry: make(map[string]bridgeRetryState),
+		rawSessions:      make(map[string]*rawShadowSession),
+		loopbackSessions: make(map[string]*loopbackSession),
+		bridgeRetry:      make(map[string]bridgeRetryState),
 	}
 }
 
@@ -206,9 +206,7 @@ func (e *Engine) readDataLoop(conn *websocket.Conn) {
 			continue
 		}
 
-		if e.cb.OnVideoChunk != nil {
-			e.cb.OnVideoChunk(message)
-		}
+		e.logf("[bcr_client] dropped legacy binary media chunk (%d bytes) - loopback active", len(message))
 	}
 }
 
@@ -271,20 +269,20 @@ func (e *Engine) closeShadowSession(bridgeID string) {
 		session.Close()
 	}
 
-	e.closeWebMMuxer(bridgeID)
+	e.closeLoopbackSession(bridgeID)
 }
 
-func (e *Engine) closeWebMMuxer(bridgeID string) {
+func (e *Engine) closeLoopbackSession(bridgeID string) {
 	e.relayMu.Lock()
-	muxer, ok := e.webmMuxers[bridgeID]
+	session, ok := e.loopbackSessions[bridgeID]
 	if ok {
-		delete(e.webmMuxers, bridgeID)
+		delete(e.loopbackSessions, bridgeID)
 	}
 	e.relayMu.Unlock()
 
-	if ok && muxer != nil {
-		muxer.Close()
-		e.logf("[bcr_client][webm] muxer closed bridgeId=%s", bridgeID)
+	if ok && session != nil {
+		session.Close()
+		e.logf("[bcr_client][loopback] session closed bridgeId=%s", bridgeID)
 	}
 }
 
@@ -864,4 +862,17 @@ func (e *Engine) logf(format string, args ...any) {
 		return
 	}
 	fmt.Println(msg)
+}
+
+// SetLoopbackAnswer applies the frontend's answer to the local loopback PC
+func (e *Engine) SetLoopbackAnswer(bridgeID string, sdp string) {
+	e.relayMu.Lock()
+	session, ok := e.loopbackSessions[bridgeID]
+	e.relayMu.Unlock()
+
+	if ok && session != nil {
+		session.SetRemoteDescription(sdp)
+	} else {
+		e.logf("[bcr_client][loopback] no active loopback session for bridgeId=%s to set answer", bridgeID)
+	}
 }

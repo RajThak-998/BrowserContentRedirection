@@ -72,6 +72,11 @@ type rawShadowSession struct {
 	seenPTs   map[uint8]int64 // PT → count
 	seenPTsMu sync.Mutex
 
+	// Track the highest sequence number received for each incoming SSRC
+	// Used for constructing valid RTCP Receiver Reports.
+	incomingSeqs   map[uint32]uint32
+	incomingSeqsMu sync.Mutex
+
 	state rawSessionState
 
 	// generation is an atomically-incrementing token attached to every async
@@ -552,15 +557,35 @@ func (s *rawShadowSession) rtcpHeartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Fetch the highest sequence number for each incoming SSRC
+			var reports []rtcp.ReceptionReport
+			s.incomingSeqsMu.Lock()
+			for ssrc, seq := range s.incomingSeqs {
+				reports = append(reports, rtcp.ReceptionReport{
+					SSRC:               ssrc,
+					FractionLost:       0,
+					TotalLost:          0,
+					LastSequenceNumber: seq, // 32-bit: lower 16 bits contain the highest sequence number received
+					Delay:              0,
+				})
+			}
+			s.incomingSeqsMu.Unlock()
+
 			// Build a compound RTCP packet: Receiver Report + PLI for each video SSRC.
-			pkts := []rtcp.Packet{&rtcp.ReceiverReport{}}
+			// Use a non-zero SSRC as the SenderSSRC to avoid SFU drops. We just use a dummy value 1.
+			senderSSRC := uint32(1)
+			pkts := []rtcp.Packet{&rtcp.ReceiverReport{
+				SSRC:    senderSSRC,
+				Reports: reports,
+			}}
 
 			// Add PLI (Picture Loss Indication) for each known video SSRC.
 			// Without PLI, the SFU will not send video keyframes and the client
 			// cannot decode the video stream.
 			for _, ssrc := range s.getVideoSSRCs() {
 				pkts = append(pkts, &rtcp.PictureLossIndication{
-					MediaSSRC: ssrc,
+					SenderSSRC: senderSSRC,
+					MediaSSRC:  ssrc,
 				})
 			}
 
@@ -606,6 +631,22 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 		// Likely RTCP (PT 200-207) or corrupt packet — drop silently.
 		return
 	}
+
+	// Update the highest received sequence number for this SSRC
+	s.incomingSeqsMu.Lock()
+	if s.incomingSeqs == nil {
+		s.incomingSeqs = make(map[uint32]uint32)
+	}
+	currentHighest := s.incomingSeqs[header.SSRC]
+	
+	// Handle sequence number wrap-around (very basic check)
+	// If the difference is huge, it might be a wrap-around or a very old packet.
+	// For mock RR purposes, we just take the highest numeric value or if it wrapped.
+	if currentHighest == 0 || (header.SequenceNumber > uint16(currentHighest) && (header.SequenceNumber-uint16(currentHighest)) < 30000) || (uint16(currentHighest) > header.SequenceNumber && (uint16(currentHighest)-header.SequenceNumber) > 30000) {
+		// Just store the 16-bit sequence number (the higher 16 bits of HighestSequenceNo are cycles, but we mock it as 0 cycles for now)
+		s.incomingSeqs[header.SSRC] = uint32(header.SequenceNumber)
+	}
+	s.incomingSeqsMu.Unlock()
 
 	decrypted, err := s.srtpCtx.DecryptRTP(nil, encrypted, &header)
 	if err != nil {

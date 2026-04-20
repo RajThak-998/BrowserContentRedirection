@@ -16,8 +16,8 @@ func main() {
 		engine.Config{ListenAddr: ":8081"},
 		engine.Callbacks{
 			// Keep noisy telemetry disabled while validating connection/shadow flow.
-			OnVideoChunk:  nil,
-			OnVideoUpdate: nil,
+			OnLoopbackOffer: nil,
+			OnVideoUpdate:   nil,
 			OnLog: func(message string) {
 				log.Println(message)
 			},

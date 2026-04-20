@@ -10,6 +10,10 @@ export function SendSdpAnswer(arg1) {
   return window['go']['main']['App']['SendSdpAnswer'](arg1);
 }
 
+export function SetLoopbackAnswer(arg1, arg2) {
+  return window['go']['main']['App']['SetLoopbackAnswer'](arg1, arg2);
+}
+
 export function SetWindowPosition(arg1, arg2) {
   return window['go']['main']['App']['SetWindowPosition'](arg1, arg2);
 }

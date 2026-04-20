@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"log"
 	"math"
 	"net"
@@ -42,9 +41,8 @@ func (a *App) startup(ctx context.Context) {
 	a.mediaEngine = engine.New(
 		engine.Config{ListenAddr: ":8081"},
 		engine.Callbacks{
-			OnVideoChunk: func(data []byte) {
-				base64Str := base64.StdEncoding.EncodeToString(data)
-				runtime.EventsEmit(a.ctx, "onVideoChunk", base64Str)
+			OnLoopbackOffer: func(bridgeID string, sdp string) {
+				runtime.EventsEmit(a.ctx, "onLocalLoopbackOffer", bridgeID, sdp)
 			},
 			OnVideoUpdate: func(update engine.VideoUpdate) {
 				b := update.Payload.ScreenBounds
@@ -118,6 +116,13 @@ func (a *App) SendSdpAnswer(sdp string) {
 		}
 	} else {
 		log.Println("Cannot send SDP Answer: No active TCP connection.")
+	}
+}
+
+// SetLoopbackAnswer takes the SDP answer from Javascript and passes it to the loopback session
+func (a *App) SetLoopbackAnswer(bridgeID string, sdp string) {
+	if a.mediaEngine != nil {
+		a.mediaEngine.SetLoopbackAnswer(bridgeID, sdp)
 	}
 }
 
