@@ -514,10 +514,10 @@
 
     // ── SDP Codec Pinning ──────────────────────────────────────────────────────
     // Preferred codecs for the BCR pipeline. By constraining the SDP to a single
-    // video codec (VP8) and audio codec (Opus), we prevent the SFU from switching
+    // video codec (H264) and audio codec (Opus), we prevent the SFU from switching
     // codecs mid-session, which would trigger renegotiation cascades that crash
     // the external player's decoder pipeline.
-    const BCR_PREFERRED_VIDEO_CODEC = 'VP8';
+    const BCR_PREFERRED_VIDEO_CODEC = 'H264';
     const BCR_PREFERRED_AUDIO_CODEC = 'opus';
 
     /**
@@ -531,7 +531,7 @@
      *   4. Rewrite the m= line's format list to only include kept PTs.
      *
      * @param {string} sdp — The SDP to filter.
-     * @param {string} preferVideo — Preferred video codec name (case-insensitive), e.g. 'VP8'.
+    * @param {string} preferVideo — Preferred video codec name (case-insensitive), e.g. 'H264'.
      * @param {string} preferAudio — Preferred audio codec name (case-insensitive), e.g. 'opus'.
      * @returns {string} — The filtered SDP.
      */
@@ -1027,17 +1027,36 @@
                 const entry = ensureRtcState(this);
                 entry.lastSeen = performance.now();
 
+                const descType = description.type.toLowerCase();
+                let effectiveRemoteSdp = description.sdp;
+
+                // Aggressive renegotiation pinning: scrub remote offers before any
+                // downstream processing so H264/VP9 never leak into Go state.
+                if (descType === 'offer') {
+                    const scrubbedOfferSdp = filterSdpToPreferredCodecs(description.sdp);
+                    if (scrubbedOfferSdp !== description.sdp) {
+                        BCR_LOG('[BCR] Scrubbed remote offer to preferred codecs bridgeId=', entry.bridgeId);
+                    }
+                    effectiveRemoteSdp = scrubbedOfferSdp;
+                    try {
+                        description.sdp = scrubbedOfferSdp;
+                    } catch (_) {
+                        // Description may be immutable in some runtimes.
+                    }
+                    browserDescription = buildDescriptionLike(description, scrubbedOfferSdp);
+                }
+
                 BCR_LOG('[BCR] Captured SDP type:', description.type, 'direction=remote bridgeId=', entry.bridgeId);
 
                 // When a new remote offer arrives, the shadow PC will be rebuilt with
                 // fresh credentials. Invalidate any stale SHADOW_READY so the upcoming
                 // setLocalDescription(answer) waits for the fresh response.
-                if (description.type.toLowerCase() === 'offer') {
+                if (descType === 'offer') {
                     rtcReadyByBridgeId.delete(entry.bridgeId);
-                    entry.lastRemoteOfferSdp = description.sdp;
+                    entry.lastRemoteOfferSdp = effectiveRemoteSdp;
                 }
 
-                if (description.type.toLowerCase() === 'answer' && typeof entry.lastRemoteOfferSdp === 'string') {
+                if (descType === 'answer' && typeof entry.lastRemoteOfferSdp === 'string') {
                     const translatedSdp = rewriteAnswerMidsForOfferInPlace(description.sdp, entry.lastRemoteOfferSdp);
                     if (translatedSdp !== description.sdp) {
                         BCR_LOG('[BCR] Rewrote remote answer mids in-place to match offer bridgeId=', entry.bridgeId);
@@ -1048,7 +1067,7 @@
                 emitShadowEvent('BCR_RTC_SHADOW_REMOTE', {
                     bridgeId: entry.bridgeId,
                     sdpType: description.type,
-                    sdp: description.sdp,
+                    sdp: effectiveRemoteSdp,
                     iceServers: entry.iceServers ?? [],
                     timestamp: Date.now(),
                 });
@@ -1080,7 +1099,7 @@
             // ── SDP Codec Pinning ─────────────────────────────────────────────
             // Filter the SDP to only advertise the preferred codecs BEFORE
             // sending it to Go and to the SFU. This constrains the SFU to use
-            // only VP8 + Opus, preventing mid-session codec switches that would
+            // only H264 + Opus, preventing mid-session codec switches that would
             // trigger renegotiation cascades in the loopback player.
             const pinnedSdp = filterSdpToPreferredCodecs(origDescription.sdp);
 
