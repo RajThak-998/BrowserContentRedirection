@@ -19,6 +19,14 @@ window.onload = function () {
     let isWebRTCLive = false;
     let localPCs = {};
 
+    // ── Video Element Optimization ──────────────────────────────────────────
+    // Pre-configure the video element for low-latency WebRTC playback.
+    // With codec pinning (VP8 + Opus only), we know exactly what media will
+    // arrive and can optimize accordingly.
+    videoElement.autoplay = true;
+    videoElement.playsInline = true;
+    videoElement.muted = false;
+
     // Sync HTML5 Video Fullscreen with Native Window Fullscreen
     videoElement.addEventListener('fullscreenchange', () => {
         if (document.fullscreenElement) {
@@ -45,9 +53,13 @@ window.onload = function () {
             });
 
             pc.ontrack = (event) => {
-                logTerminal(`[Loopback] Stream track received! track.kind=${event.track.kind}`);
+                logTerminal(`[Loopback] Stream track received! track.kind=${event.track.kind} codec-pinned=VP8+Opus`);
                 if (videoElement.srcObject !== event.streams[0]) {
                     videoElement.srcObject = event.streams[0];
+                    // Ensure playback starts immediately with the pinned codec stream
+                    videoElement.play().catch(e => {
+                        logTerminal(`[Loopback] Autoplay blocked, will retry: ${e}`);
+                    });
                 }
             };
 
@@ -81,5 +93,5 @@ window.onload = function () {
         }
     });
 
-    logTerminal("WebRTC Loopback UI ready. Waiting for payloads...");
+    logTerminal("WebRTC Loopback UI ready (codec-pinned: VP8+Opus). Waiting for payloads...");
 };

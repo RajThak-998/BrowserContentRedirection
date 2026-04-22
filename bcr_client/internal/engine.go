@@ -48,6 +48,15 @@ func New(cfg Config, cb Callbacks) *Engine {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":8081"
 	}
+	// Default preferred codecs: VP8 for video, Opus for audio.
+	// The browser extension strips all other codecs from the SDP; this is
+	// the Go-side safety net that drops any PTs that slip through.
+	if cfg.PreferredCodecs.Video == "" {
+		cfg.PreferredCodecs.Video = "VP8"
+	}
+	if cfg.PreferredCodecs.Audio == "" {
+		cfg.PreferredCodecs.Audio = "opus"
+	}
 
 	return &Engine{
 		cfg: cfg,
@@ -433,6 +442,11 @@ func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalP
 	// Parse PT → codec map from the LOCAL SDP. The browser's SDP contains the
 	// codec PTs that the remote SFU will use to send media — exactly what we
 	// need to decrypt and relay.
+	//
+	// NOTE: We store the FULL codec map (no preferred filter). The SFU may
+	// renegotiate with different PT numbers, and we must accept any PT it sends.
+	// The extension's SDP codec pinning constrains WHAT the SFU sends;
+	// this map just lets us identify the packets when they arrive.
 	session.ptCodecMap = ParsePTCodecMap(payload.SDP)
 	e.logf("[raw][%s] parsed %d codec(s) from local %s SDP", bridgeID, len(session.ptCodecMap), sdpType)
 
@@ -704,7 +718,11 @@ func (e *Engine) shouldProcessBridgeTrack(bridgeID string) bool {
 // PLI without knowing the SSRC. By parsing SSRCs from the SDP, the RTCP
 // heartbeat loop can proactively send PLI before any video packets arrive.
 func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpType, sdp string) {
-	// Merge codec PTs
+	// Merge codec PTs — accept ALL codecs from remote SDPs without filtering.
+	// The SFU may assign different PT numbers during renegotiation (e.g. VP8
+	// at PT=107 instead of PT=96). We must accept any PT so the relay can
+	// identify incoming packets. The extension's SDP pinning constrains what
+	// the SFU sends; this map just provides the PT→codec lookup.
 	newCodecs := ParsePTCodecMap(sdp)
 	session.mu.Lock()
 	added := 0

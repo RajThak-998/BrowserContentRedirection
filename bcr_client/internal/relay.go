@@ -64,11 +64,18 @@ func (e *Engine) onRawRTPPacket(bridgeID string, pkt *rtp.Packet, ptCodecMap map
 	e.relayMu.Lock()
 	session, ok := e.loopbackSessions[bridgeID]
 	if !ok {
-		session = newLoopbackSession(bridgeID, e.logf, e.cb.OnLoopbackOffer, ptCodecMap)
+		// Pass a preferred-filtered codec map for track PRE-CREATION only
+		// (so the loopback creates VP8+opus tracks upfront, not 10 tracks
+		// for every codec the SFU listed). The full ptCodecMap is passed
+		// to WriteRTP for runtime PT identification.
+		filteredForPreCreate := FilterPTCodecMapToPreferred(ptCodecMap, e.cfg.PreferredCodecs)
+		session = newLoopbackSession(bridgeID, e.logf, e.cb.OnLoopbackOffer, filteredForPreCreate)
 		e.loopbackSessions[bridgeID] = session
 	}
 	e.relayMu.Unlock()
 
-	// Forward the decrypted RTP packet to the loopback session
+	// Forward the decrypted RTP packet to the loopback session.
+	// Pass the FULL ptCodecMap so WriteRTP can identify any PT the SFU sends,
+	// even if it uses a PT number we didn't pre-create a track for.
 	session.WriteRTP(pkt, ptCodecMap)
 }

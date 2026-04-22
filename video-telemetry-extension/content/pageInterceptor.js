@@ -512,6 +512,167 @@
         }, candidateLines.length * 20 + 80);
     }
 
+    // ── SDP Codec Pinning ──────────────────────────────────────────────────────
+    // Preferred codecs for the BCR pipeline. By constraining the SDP to a single
+    // video codec (VP8) and audio codec (Opus), we prevent the SFU from switching
+    // codecs mid-session, which would trigger renegotiation cascades that crash
+    // the external player's decoder pipeline.
+    const BCR_PREFERRED_VIDEO_CODEC = 'VP8';
+    const BCR_PREFERRED_AUDIO_CODEC = 'opus';
+
+    /**
+     * filterSdpToPreferredCodecs — Strip all codecs from the SDP except the
+     * preferred video and audio codecs.
+     *
+     * For each m=video / m=audio section:
+     *   1. Parse all a=rtpmap: lines to find the PT(s) for the preferred codec.
+     *   2. Find associated RTX PTs via a=fmtp:<rtx_pt> apt=<base_pt>.
+     *   3. Keep only the a=rtpmap:, a=fmtp:, and a=rtcp-fb: lines for kept PTs.
+     *   4. Rewrite the m= line's format list to only include kept PTs.
+     *
+     * @param {string} sdp — The SDP to filter.
+     * @param {string} preferVideo — Preferred video codec name (case-insensitive), e.g. 'VP8'.
+     * @param {string} preferAudio — Preferred audio codec name (case-insensitive), e.g. 'opus'.
+     * @returns {string} — The filtered SDP.
+     */
+    function filterSdpToPreferredCodecs(sdp, preferVideo = BCR_PREFERRED_VIDEO_CODEC, preferAudio = BCR_PREFERRED_AUDIO_CODEC) {
+        if (typeof sdp !== 'string' || sdp.length === 0) return sdp;
+
+        const nl = sdp.includes('\r\n') ? '\r\n' : '\n';
+        const lines = sdp.split(/\r?\n/);
+        const output = [];
+
+        let inMediaSection = false;
+        let currentMediaType = ''; // 'audio', 'video', or ''
+        let sectionLines = [];
+        let mLineIndex = -1;
+
+        function flushSection() {
+            if (!inMediaSection || sectionLines.length === 0) return;
+
+            if (currentMediaType !== 'audio' && currentMediaType !== 'video') {
+                // Non-audio/video section (e.g. m=application) — pass through unchanged
+                output.push(...sectionLines);
+                sectionLines = [];
+                return;
+            }
+
+            const preferCodec = currentMediaType === 'video'
+                ? preferVideo.toLowerCase()
+                : preferAudio.toLowerCase();
+
+            // Step 1: Parse all rtpmap lines to build PT → codec name map
+            const ptToCodec = new Map(); // PT string → codec name (lowercase)
+            const rtpmapRegex = /^a=rtpmap:(\d+)\s+([^\s/]+)/;
+            for (const line of sectionLines) {
+                const m = line.match(rtpmapRegex);
+                if (m) {
+                    ptToCodec.set(m[1], m[2].toLowerCase());
+                }
+            }
+
+            // Step 2: Find the base PT(s) for the preferred codec
+            const keepPTs = new Set();
+            for (const [pt, codec] of ptToCodec) {
+                if (codec === preferCodec) {
+                    keepPTs.add(pt);
+                }
+            }
+
+            // If preferred codec not found in this section, pass through unchanged
+            // (safety: don't break the SDP if the SFU doesn't offer our preferred codec)
+            if (keepPTs.size === 0) {
+                BCR_LOG(`[BCR] Codec pin: preferred ${preferCodec} not found in m=${currentMediaType}, passing through unchanged`);
+                output.push(...sectionLines);
+                sectionLines = [];
+                return;
+            }
+
+            // Step 3: Find RTX PTs associated with kept base PTs
+            // RTX lines look like: a=fmtp:<rtx_pt> apt=<base_pt>
+            const aptRegex = /^a=fmtp:(\d+)\s+apt=(\d+)/;
+            for (const line of sectionLines) {
+                const m = line.match(aptRegex);
+                if (m && keepPTs.has(m[2])) {
+                    keepPTs.add(m[1]); // Add the RTX PT
+                }
+            }
+
+            // Step 4: Rewrite the m= line to only include kept PTs
+            // m= line format: m=<type> <port> <protocol> <pt1> <pt2> ...
+            const filteredLines = [];
+            for (let i = 0; i < sectionLines.length; i++) {
+                const line = sectionLines[i];
+
+                if (line.startsWith('m=')) {
+                    // Rewrite m= line with only the kept PTs
+                    const parts = line.split(/\s+/);
+                    // parts[0] = m=video/m=audio, parts[1] = port, parts[2] = protocol, rest = PTs
+                    if (parts.length >= 4) {
+                        const keptFormatList = parts.slice(3).filter(pt => keepPTs.has(pt));
+                        if (keptFormatList.length > 0) {
+                            filteredLines.push(`${parts[0]} ${parts[1]} ${parts[2]} ${keptFormatList.join(' ')}`);
+                        } else {
+                            // Fallback: keep original if filtering would remove all PTs
+                            filteredLines.push(line);
+                        }
+                    } else {
+                        filteredLines.push(line);
+                    }
+                    continue;
+                }
+
+                // Step 5: Filter codec-specific attribute lines
+                const ptMatch = line.match(/^a=(?:rtpmap|fmtp|rtcp-fb):(\d+)\s/);
+                if (ptMatch) {
+                    if (keepPTs.has(ptMatch[1])) {
+                        filteredLines.push(line);
+                    }
+                    // Drop lines for non-kept PTs
+                    continue;
+                }
+
+                // Keep all non-codec lines (ice, dtls, mid, direction, ssrc, etc.)
+                filteredLines.push(line);
+            }
+
+            const keptCodecNames = [...keepPTs].map(pt => ptToCodec.get(pt) ?? 'rtx').join(', ');
+            BCR_LOG(`[BCR] Codec pin: m=${currentMediaType} kept PTs=[${[...keepPTs].join(',')}] codecs=[${keptCodecNames}]`);
+
+            output.push(...filteredLines);
+            sectionLines = [];
+        }
+
+        for (const line of lines) {
+            if (line.startsWith('m=')) {
+                // Flush previous section before starting a new one
+                flushSection();
+
+                inMediaSection = true;
+                if (line.startsWith('m=audio')) {
+                    currentMediaType = 'audio';
+                } else if (line.startsWith('m=video')) {
+                    currentMediaType = 'video';
+                } else {
+                    currentMediaType = '';
+                }
+                sectionLines.push(line);
+                continue;
+            }
+
+            if (inMediaSection) {
+                sectionLines.push(line);
+            } else {
+                output.push(line);
+            }
+        }
+
+        // Flush the last section
+        flushSection();
+
+        return output.join(nl);
+    }
+
     function mungeSdpTransport(sdp, shadow) {
         if (typeof sdp !== 'string' || !shadow) return sdp;
 
@@ -733,7 +894,9 @@
             if (!desc || !desc.sdp) return desc;
             const entry = rtcStateByPeer.get(pc);
             if (!entry || !entry.shadowCredentials) return desc;
-            const mungedSdp = mungeSdpTransport(desc.sdp, entry.shadowCredentials);
+            // Apply codec pinning + transport munging so Teams only sees our pinned codecs.
+            const pinnedSdp = filterSdpToPreferredCodecs(desc.sdp);
+            const mungedSdp = mungeSdpTransport(pinnedSdp, entry.shadowCredentials);
             // Return a plain object that looks like RTCSessionDescription
             return { type: desc.type, sdp: mungedSdp };
         }
@@ -780,10 +943,13 @@
             }
 
             if (!isRedundant) {
+                // Apply codec pinning before sending to Go
+                const pinnedSdp = filterSdpToPreferredCodecs(description.sdp);
+
                 emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
                     bridgeId: entry.bridgeId,
                     sdpType: description.type ?? 'unknown',
-                    sdp: description.sdp,
+                    sdp: pinnedSdp,
                     iceServers: entry.iceServers ?? [],
                     timestamp: Date.now(),
                 });
@@ -824,11 +990,13 @@
             const result = await origSetLocalDescription.apply(this, [chromeSafeDescription, ...args.slice(1)]);
 
             // After Chrome accepts the original SDP, mutate the argument if the framework reads it later.
+            // Apply codec pinning + transport munging so Teams only sees our pinned codecs.
             if (entry.shadowCredentials) {
-                const targetSdp = mungeSdpTransport(origSdpString, entry.shadowCredentials);
+                const pinnedForMutation = filterSdpToPreferredCodecs(origSdpString);
+                const targetSdp = mungeSdpTransport(pinnedForMutation, entry.shadowCredentials);
                 try {
                     description.sdp = targetSdp;
-                    BCR_LOG('[BCR] Description object mutated with shadow SDP bridgeId=', entry.bridgeId);
+                    BCR_LOG('[BCR] Description object mutated with codec-pinned shadow SDP bridgeId=', entry.bridgeId);
                 } catch (_) {
                     BCR_LOG('[BCR] Description object mutation failed (frozen) bridgeId=', entry.bridgeId);
                 }
@@ -909,10 +1077,17 @@
             entry.lastSeen = performance.now();
             entry.lastCreateActionType = actionType;
 
+            // ── SDP Codec Pinning ─────────────────────────────────────────────
+            // Filter the SDP to only advertise the preferred codecs BEFORE
+            // sending it to Go and to the SFU. This constrains the SFU to use
+            // only VP8 + Opus, preventing mid-session codec switches that would
+            // trigger renegotiation cascades in the loopback player.
+            const pinnedSdp = filterSdpToPreferredCodecs(origDescription.sdp);
+
             emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
                 bridgeId: entry.bridgeId,
                 sdpType: origDescription.type ?? actionType,
-                sdp: origDescription.sdp,
+                sdp: pinnedSdp,
                 iceServers: entry.iceServers ?? [],
                 timestamp: Date.now(),
             });
@@ -930,11 +1105,15 @@
 
             if (shadowReady) {
                 entry.shadowCredentials = shadowReady;
-                // Store the original SDP so we can retrieve it in setLocalDescription later.
+                // Store the original (unfiltered) SDP so Chrome's setLocalDescription
+                // sees what it generated internally. The codec-pinned SDP is only for
+                // the SFU signaling path.
                 entry.lastOriginalLocalSdp = origDescription.sdp;
 
-                const mungedSdp = mungeSdpTransport(origDescription.sdp, entry.shadowCredentials);
-                BCR_LOG('[BCR]', actionType, 'resolved and munged seamlessly bridgeId=', entry.bridgeId);
+                // Munge transport creds on top of the codec-pinned SDP.
+                // This is the SDP that reaches the SFU: pinned codecs + shadow ICE/DTLS.
+                const mungedSdp = mungeSdpTransport(pinnedSdp, entry.shadowCredentials);
+                BCR_LOG('[BCR]', actionType, 'resolved, codec-pinned, and munged bridgeId=', entry.bridgeId);
 
                 // Must return an object that circumvents strict instanceof RTCSessionDescription checks inside RxJS / React data pipelines
                 return buildDescriptionLike(origDescription, mungedSdp);

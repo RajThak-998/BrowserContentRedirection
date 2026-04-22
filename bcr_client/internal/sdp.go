@@ -226,3 +226,51 @@ func ExtractMediaSections(sdp string) []MediaSection {
 	}
 	return sections
 }
+
+// FilterPTCodecMapToPreferred filters a PT→CodecInfo map, keeping only entries
+// whose encoding name matches the preferred video or audio codec.
+//
+// This is a Go-side safety net: the browser extension's SDP codec pinning
+// should already constrain the SFU to a single codec, but renegotiation SDPs
+// might sneak through additional codecs. This filter ensures the relay and
+// loopback layers never see unexpected codec PTs.
+//
+// If preferred.Video or preferred.Audio is empty, all codecs of that media type
+// are kept (no filtering for that type).
+func FilterPTCodecMapToPreferred(ptMap map[uint8]CodecInfo, preferred PreferredCodecs) map[uint8]CodecInfo {
+	if preferred.Video == "" && preferred.Audio == "" {
+		return ptMap // no filtering configured
+	}
+
+	wantVideo := strings.ToLower(preferred.Video)
+	wantAudio := strings.ToLower(preferred.Audio)
+
+	filtered := make(map[uint8]CodecInfo, len(ptMap))
+	for pt, info := range ptMap {
+		lowerMime := strings.ToLower(info.MimeType)
+
+		if strings.HasPrefix(lowerMime, "video/") {
+			if wantVideo == "" {
+				filtered[pt] = info // no video filter
+			} else if strings.Contains(lowerMime, wantVideo) {
+				filtered[pt] = info
+			}
+			continue
+		}
+
+		if strings.HasPrefix(lowerMime, "audio/") {
+			if wantAudio == "" {
+				filtered[pt] = info // no audio filter
+			} else if strings.Contains(lowerMime, wantAudio) {
+				filtered[pt] = info
+			}
+			continue
+		}
+
+		// Unknown media type — keep it (e.g. data channel codecs)
+		filtered[pt] = info
+	}
+
+	return filtered
+}
+

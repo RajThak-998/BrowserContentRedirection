@@ -19,9 +19,12 @@ type loopbackSession struct {
 
 	// Map of PayloadType to the local track where we write decrypted RTP
 	tracks map[uint8]*webrtc.TrackLocalStaticRTP
-	
+
 	// Track the current codecs we know about to detect when to add tracks
 	ptCodecMap map[uint8]CodecInfo
+
+	// Whether the initial offer (with pre-created tracks) has been emitted.
+	initialOfferSent bool
 }
 
 func newLoopbackSession(
@@ -54,10 +57,28 @@ func (ls *loopbackSession) initPC() {
 	}
 	ls.pc = pc
 
-	// We intentionally DO NOT preload tracks here.
-	// We use "Lazy Track Loading" - tracks will be dynamically added in WriteRTP
-	// when the first actual RTP packet for a payload type arrives.
-	// This prevents crashing WebKit with 10 empty tracks at startup.
+	// ── Pre-create tracks for all known codecs ──────────────────────────────
+	// Because the SDP codec pinning guarantees only VP8 + Opus will arrive,
+	// we can create exactly the tracks we need upfront. This avoids mid-stream
+	// renegotiation that destabilizes WebKit's decoder pipeline.
+	//
+	// If ptCodecMap is empty (shouldn't happen with codec pinning), we fall
+	// back to lazy track loading in WriteRTP.
+	preCreated := 0
+	for pt, codecInfo := range ls.ptCodecMap {
+		ls.addTrackLocked(pt, codecInfo)
+		if _, ok := ls.tracks[pt]; ok {
+			preCreated++
+		}
+	}
+
+	if preCreated > 0 {
+		ls.logf("[bcr_client][loopback][%s] pre-created %d track(s) from pinned codec map", ls.bridgeID, preCreated)
+		ls.renegotiateLocked()
+		ls.initialOfferSent = true
+	} else {
+		ls.logf("[bcr_client][loopback][%s] no codecs in ptCodecMap — will lazy-load tracks on first RTP", ls.bridgeID)
+	}
 }
 
 func (ls *loopbackSession) addTrackLocked(pt uint8, codecInfo CodecInfo) {
@@ -115,13 +136,14 @@ func (ls *loopbackSession) renegotiateLocked() {
 	}
 
 	ls.logf("[bcr_client][loopback][%s] generated local loopback offer, emitting to frontend", ls.bridgeID)
-	
+
 	// Emit to frontend (asynchronous to avoid blocking)
 	go ls.onLoopbackOffer(ls.bridgeID, offer.SDP)
 }
 
 // WriteRTP routes incoming RTP packets to the correct local track.
-// If a new PT is encountered, it will dynamically add a track and trigger renegotiation.
+// With codec pinning, tracks are pre-created so this is a fast-path lookup.
+// If an unexpected PT arrives (fallback), it will dynamically add a track.
 func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet, currentCodecMap map[uint8]CodecInfo) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
@@ -132,13 +154,15 @@ func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet, currentCodecMap map[uint8]C
 
 	track, ok := ls.tracks[pkt.Header.PayloadType]
 	if !ok {
-		// This PT is not tracked. Check if it's in the codec map.
+		// Fallback: This PT wasn't in the pre-created set. Check if it's in the codec map.
 		codecInfo, known := currentCodecMap[pkt.Header.PayloadType]
 		if !known {
 			return // unknown codec entirely
 		}
 
-		// Update our internal map and add the track
+		// Dynamic track addition (fallback path — should be rare with codec pinning)
+		ls.logf("[bcr_client][loopback][%s] fallback: dynamically adding track for unexpected PT=%d codec=%s",
+			ls.bridgeID, pkt.Header.PayloadType, codecInfo.MimeType)
 		ls.ptCodecMap[pkt.Header.PayloadType] = codecInfo
 		ls.addTrackLocked(pkt.Header.PayloadType, codecInfo)
 		ls.renegotiateLocked()
