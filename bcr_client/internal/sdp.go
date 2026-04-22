@@ -273,4 +273,3 @@ func FilterPTCodecMapToPreferred(ptMap map[uint8]CodecInfo, preferred PreferredC
 
 	return filtered
 }
-

@@ -77,7 +77,7 @@ type RTCShadowClosePayload struct {
 
 type RTCShadowReadyPayload struct {
 	BridgeID        string   `json:"bridgeId"`
-	SDPType         string   `json:"sdpType"`                // "offer" or "answer" — which SDP flow generated this READY
+	SDPType         string   `json:"sdpType"` // "offer" or "answer" — which SDP flow generated this READY
 	ICEUfrag        string   `json:"iceUfrag"`
 	ICEPwd          string   `json:"icePwd"`
 	DTLSFingerprint string   `json:"dtlsFingerprint"`
@@ -112,4 +112,3 @@ type MediaSection struct {
 	Protocol string
 	Formats  []string
 }
-

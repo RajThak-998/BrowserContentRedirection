@@ -358,7 +358,7 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 
 	dtlsCfg := &dtls.Config{
 		Certificates:           []tls.Certificate{s.cert},
-		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AES128_CM_HMAC_SHA1_80},
+		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AES128_CM_HMAC_SHA1_80, dtls.SRTP_AEAD_AES_128_GCM},
 		InsecureSkipVerify:     true, // skip chain verify; fingerprint verified below
 		VerifyConnection: func(st *dtls.State) error {
 			vcCalled = true
@@ -638,7 +638,7 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 		s.incomingSeqs = make(map[uint32]uint32)
 	}
 	currentHighest := s.incomingSeqs[header.SSRC]
-	
+
 	// Handle sequence number wrap-around (very basic check)
 	// If the difference is huge, it might be a wrap-around or a very old packet.
 	// For mock RR purposes, we just take the highest numeric value or if it wrapped.

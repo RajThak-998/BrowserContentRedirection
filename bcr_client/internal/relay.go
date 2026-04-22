@@ -26,6 +26,39 @@ func (e *Engine) onRawRTPPacket(bridgeID string, pkt *rtp.Packet, ptCodecMap map
 		return
 	}
 
+	// Strict drop filter: only forward RTP whose PT is currently allowlisted by
+	// preferred codecs (H264/Opus by default). Everything else is fail-closed.
+	strictPTMap := FilterPTCodecMapToPreferred(ptCodecMap, e.cfg.PreferredCodecs)
+	if _, allowed := strictPTMap[pkt.Header.PayloadType]; !allowed {
+		codec, known := ptCodecMap[pkt.Header.PayloadType]
+		e.unknownPTMu.Lock()
+		if e.strictDropPTs == nil {
+			e.strictDropPTs = make(map[uint8]bool)
+		}
+		if _, seen := e.strictDropPTs[pkt.Header.PayloadType]; !seen {
+			e.strictDropPTs[pkt.Header.PayloadType] = true
+			if known {
+				e.logf("[raw][%s] strict-drop PT=%d codec=%s SSRC=%d (not in preferred allowlist video=%q audio=%q)",
+					bridgeID,
+					pkt.Header.PayloadType,
+					codec.MimeType,
+					pkt.SSRC,
+					e.cfg.PreferredCodecs.Video,
+					e.cfg.PreferredCodecs.Audio,
+				)
+			} else {
+				e.logf("[raw][%s] strict-drop PT=%d SSRC=%d (unknown PT, %d codecs registered)",
+					bridgeID,
+					pkt.Header.PayloadType,
+					pkt.SSRC,
+					len(ptCodecMap),
+				)
+			}
+		}
+		e.unknownPTMu.Unlock()
+		return
+	}
+
 	// Look up codec for this packet's payload type.
 	codec, ok := ptCodecMap[pkt.Header.PayloadType]
 	if ok {
@@ -65,7 +98,7 @@ func (e *Engine) onRawRTPPacket(bridgeID string, pkt *rtp.Packet, ptCodecMap map
 	session, ok := e.loopbackSessions[bridgeID]
 	if !ok {
 		// Pass a preferred-filtered codec map for track PRE-CREATION only
-		// (so the loopback creates VP8+opus tracks upfront, not 10 tracks
+		// (so the loopback creates preferred tracks upfront, not 10 tracks
 		// for every codec the SFU listed). The full ptCodecMap is passed
 		// to WriteRTP for runtime PT identification.
 		filteredForPreCreate := FilterPTCodecMapToPreferred(ptCodecMap, e.cfg.PreferredCodecs)
@@ -74,8 +107,6 @@ func (e *Engine) onRawRTPPacket(bridgeID string, pkt *rtp.Packet, ptCodecMap map
 	}
 	e.relayMu.Unlock()
 
-	// Forward the decrypted RTP packet to the loopback session.
-	// Pass the FULL ptCodecMap so WriteRTP can identify any PT the SFU sends,
-	// even if it uses a PT number we didn't pre-create a track for.
-	session.WriteRTP(pkt, ptCodecMap)
+	// Forward only strict-allowlisted RTP to loopback.
+	session.WriteRTP(pkt)
 }

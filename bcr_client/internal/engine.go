@@ -40,19 +40,20 @@ type Engine struct {
 	bridgeRetry map[string]bridgeRetryState
 
 	// Diagnostic: track unknown PTs to avoid log spam.
-	unknownPTMu sync.Mutex
-	unknownPTs  map[uint8]bool
+	unknownPTMu   sync.Mutex
+	unknownPTs    map[uint8]bool
+	strictDropPTs map[uint8]bool
 }
 
 func New(cfg Config, cb Callbacks) *Engine {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":8081"
 	}
-	// Default preferred codecs: VP8 for video, Opus for audio.
+	// Default preferred codecs: H264 for video, Opus for audio.
 	// The browser extension strips all other codecs from the SDP; this is
 	// the Go-side safety net that drops any PTs that slip through.
 	if cfg.PreferredCodecs.Video == "" {
-		cfg.PreferredCodecs.Video = "VP8"
+		cfg.PreferredCodecs.Video = "H264"
 	}
 	if cfg.PreferredCodecs.Audio == "" {
 		cfg.PreferredCodecs.Audio = "opus"
@@ -322,9 +323,9 @@ func (e *Engine) triggerConnect(conn *websocket.Conn, bridgeID string, session *
 				e.logf("[raw][%s] glare/stale-gen rejected connect gen=%d: %v", bridgeID, gen, err)
 				return
 			}
-			
+
 			e.logf("[raw][%s] Connect failed gen=%d: %v", bridgeID, gen, err)
-			
+
 			e.connectMu.Lock()
 			rs := e.bridgeRetry[bridgeID]
 			rs.attempts++
@@ -352,7 +353,7 @@ func (e *Engine) triggerConnect(conn *websocket.Conn, bridgeID string, session *
 
 			e.closeShadowSession(bridgeID)
 			newSession := e.getOrCreateRawSession(bridgeID)
-			
+
 			newSession.mu.Lock()
 			newSession.iceServers = iceServers
 			newSession.ptCodecMap = ptCodecMap
@@ -719,7 +720,7 @@ func (e *Engine) shouldProcessBridgeTrack(bridgeID string) bool {
 // heartbeat loop can proactively send PLI before any video packets arrive.
 func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpType, sdp string) {
 	// Merge codec PTs — accept ALL codecs from remote SDPs without filtering.
-	// The SFU may assign different PT numbers during renegotiation (e.g. VP8
+	// The SFU may assign different PT numbers during renegotiation (e.g. H264
 	// at PT=107 instead of PT=96). We must accept any PT so the relay can
 	// identify incoming packets. The extension's SDP pinning constrains what
 	// the SFU sends; this map just provides the PT→codec lookup.
@@ -753,7 +754,7 @@ func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpTyp
 
 func (e *Engine) handleRenegotiationLocal(conn *websocket.Conn, session *rawShadowSession, bridgeID string, sdpType string, sdp string) {
 	e.logf("[raw][%s] SHADOW_LOCAL %s during active session — treating as renegotiation", bridgeID, sdpType)
-	
+
 	// Update codecs and SSRCs from the new local SDP
 	e.mergeCodecsAndSSRCs(session, bridgeID, sdpType, sdp)
 
@@ -774,7 +775,7 @@ func (e *Engine) handleRenegotiationLocal(conn *websocket.Conn, session *rawShad
 
 func (e *Engine) handleRenegotiationRemote(session *rawShadowSession, bridgeID string, sdpType string, sdp string) {
 	e.logf("[raw][%s] [Renegotiation Offer/Answer Received] Parsing remote %s SDP", bridgeID, sdpType)
-	
+
 	// Log the exact track mapping and m-lines
 	sections := ExtractMediaSections(sdp)
 	for _, sec := range sections {

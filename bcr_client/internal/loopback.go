@@ -20,11 +20,17 @@ type loopbackSession struct {
 	// Map of PayloadType to the local track where we write decrypted RTP
 	tracks map[uint8]*webrtc.TrackLocalStaticRTP
 
+	// One-time logging guard for dropped RTP PTs with no local track.
+	droppedPTs map[uint8]bool
+
 	// Track the current codecs we know about to detect when to add tracks
 	ptCodecMap map[uint8]CodecInfo
 
 	// Whether the initial offer (with pre-created tracks) has been emitted.
 	initialOfferSent bool
+
+	// Renegotiation safety: coalesce requests while an offer is in-flight.
+	renegotiateQueued bool
 }
 
 func newLoopbackSession(
@@ -38,6 +44,7 @@ func newLoopbackSession(
 		logf:            logf,
 		onLoopbackOffer: onLoopbackOffer,
 		tracks:          make(map[uint8]*webrtc.TrackLocalStaticRTP),
+		droppedPTs:      make(map[uint8]bool),
 		ptCodecMap:      ptCodecMap,
 	}
 
@@ -58,7 +65,7 @@ func (ls *loopbackSession) initPC() {
 	ls.pc = pc
 
 	// ── Pre-create tracks for all known codecs ──────────────────────────────
-	// Because the SDP codec pinning guarantees only VP8 + Opus will arrive,
+	// Because the SDP codec pinning guarantees only preferred video + Opus will arrive,
 	// we can create exactly the tracks we need upfront. This avoids mid-stream
 	// renegotiation that destabilizes WebKit's decoder pipeline.
 	//
@@ -124,6 +131,13 @@ func (ls *loopbackSession) renegotiateLocked() {
 		return
 	}
 
+	if ls.pc.SignalingState() != webrtc.SignalingStateStable {
+		// Queue a single follow-up renegotiation and avoid re-entering SetLocal.
+		ls.renegotiateQueued = true
+		ls.logf("[bcr_client][loopback][%s] renegotiation deferred: signalingState=%s", ls.bridgeID, ls.pc.SignalingState().String())
+		return
+	}
+
 	offer, err := ls.pc.CreateOffer(nil)
 	if err != nil {
 		ls.logf("[bcr_client][loopback][%s] failed to create offer: %v", ls.bridgeID, err)
@@ -135,6 +149,8 @@ func (ls *loopbackSession) renegotiateLocked() {
 		return
 	}
 
+	ls.renegotiateQueued = false
+
 	ls.logf("[bcr_client][loopback][%s] generated local loopback offer, emitting to frontend", ls.bridgeID)
 
 	// Emit to frontend (asynchronous to avoid blocking)
@@ -142,9 +158,9 @@ func (ls *loopbackSession) renegotiateLocked() {
 }
 
 // WriteRTP routes incoming RTP packets to the correct local track.
-// With codec pinning, tracks are pre-created so this is a fast-path lookup.
-// If an unexpected PT arrives (fallback), it will dynamically add a track.
-func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet, currentCodecMap map[uint8]CodecInfo) {
+// With strict codec pinning, tracks are pre-created and unexpected PTs are
+// dropped immediately (no dynamic AddTrack/renegotiation fallback).
+func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 
@@ -154,26 +170,16 @@ func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet, currentCodecMap map[uint8]C
 
 	track, ok := ls.tracks[pkt.Header.PayloadType]
 	if !ok {
-		// Fallback: This PT wasn't in the pre-created set. Check if it's in the codec map.
-		codecInfo, known := currentCodecMap[pkt.Header.PayloadType]
-		if !known {
-			return // unknown codec entirely
+		if !ls.droppedPTs[pkt.Header.PayloadType] {
+			ls.droppedPTs[pkt.Header.PayloadType] = true
+			ls.logf("[bcr_client][loopback][%s] strict-drop PT=%d (no pre-created local track)",
+				ls.bridgeID, pkt.Header.PayloadType)
 		}
-
-		// Dynamic track addition (fallback path — should be rare with codec pinning)
-		ls.logf("[bcr_client][loopback][%s] fallback: dynamically adding track for unexpected PT=%d codec=%s",
-			ls.bridgeID, pkt.Header.PayloadType, codecInfo.MimeType)
-		ls.ptCodecMap[pkt.Header.PayloadType] = codecInfo
-		ls.addTrackLocked(pkt.Header.PayloadType, codecInfo)
-		ls.renegotiateLocked()
-
-		track = ls.tracks[pkt.Header.PayloadType]
+		return
 	}
 
-	if track != nil {
-		if err := track.WriteRTP(pkt); err != nil {
-			// Don't log every error as it will flood if connection is closing
-		}
+	if err := track.WriteRTP(pkt); err != nil {
+		// Don't log every error as it will flood if connection is closing
 	}
 }
 
@@ -197,6 +203,11 @@ func (ls *loopbackSession) SetRemoteDescription(sdp string) {
 	}
 
 	ls.logf("[bcr_client][loopback][%s] applied remote description from frontend successfully", ls.bridgeID)
+
+	if ls.renegotiateQueued {
+		ls.logf("[bcr_client][loopback][%s] processing queued renegotiation after remote answer", ls.bridgeID)
+		ls.renegotiateLocked()
+	}
 }
 
 func (ls *loopbackSession) Close() error {
