@@ -31,6 +31,15 @@ type loopbackSession struct {
 
 	// Renegotiation safety: coalesce requests while an offer is in-flight.
 	renegotiateQueued bool
+
+	// lastOfferSDP caches the most recent completed offer SDP (i.e., after
+	// ICE gathering finished). Used by GetLastOffer() so ReEmitAllLoopbackOffers
+	// can recover from cold-start timing races where the first offer fired
+	// before the frontend's EventsOn listener was registered.
+	lastOfferSDP string
+
+	// writeErrCount tracks consecutive WriteRTP errors for sampled logging.
+	writeErrCount uint64
 }
 
 func newLoopbackSession(
@@ -56,7 +65,27 @@ func (ls *loopbackSession) initPC() {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 
-	// Configuration with no ICE servers because this is entirely local loopback.
+	// ── PeerConnection for local loopback ───────────────────────────────────
+	//
+	// IMPORTANT: We use the standard webrtc.NewPeerConnection() with the
+	// package-level default API. This ensures:
+	//
+	//   1. The default MediaEngine is used, which has ALL standard codecs
+	//      (Opus, VP8, VP9, H264, etc.) registered with correct parameters.
+	//      Using webrtc.NewAPI(WithSettingEngine(...)) without WithMediaEngine
+	//      creates a BARE MediaEngine with ZERO codecs — the resulting SDP has
+	//      no payload types and is rejected by the browser.
+	//
+	//   2. ICE candidates use the machine's real network interface IP (e.g.
+	//      10.x.x.x), NOT 127.0.0.1. WebKit/Safari SILENTLY FILTERS loopback
+	//      candidates as a security measure — setRemoteDescription hangs
+	//      forever (never resolves/rejects) when the offer SDP contains only
+	//      127.0.0.1 candidates. SetNAT1To1IPs(127.0.0.1) is explicitly
+	//      documented as wrong usage by pion/webrtc.
+	//
+	//   3. No ICE servers are configured since both peers (Go Pion and Wails
+	//      WebView) are on the same machine. Host candidates are sufficient.
+	//
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		ls.logf("[bcr_client][loopback][%s] failed to create PeerConnection: %v", ls.bridgeID, err)
@@ -64,13 +93,10 @@ func (ls *loopbackSession) initPC() {
 	}
 	ls.pc = pc
 
-	// ── Pre-create tracks for all known codecs ──────────────────────────────
-	// Because the SDP codec pinning guarantees only preferred video + Opus will arrive,
-	// we can create exactly the tracks we need upfront. This avoids mid-stream
+	// ── Pre-create tracks for all known preferred codecs ────────────────────
+	// Because the SDP codec pinning guarantees only H264 + Opus will arrive,
+	// we create exactly the tracks we need upfront. This avoids mid-stream
 	// renegotiation that destabilizes WebKit's decoder pipeline.
-	//
-	// If ptCodecMap is empty (shouldn't happen with codec pinning), we fall
-	// back to lazy track loading in WriteRTP.
 	preCreated := 0
 	for pt, codecInfo := range ls.ptCodecMap {
 		ls.addTrackLocked(pt, codecInfo)
@@ -80,52 +106,94 @@ func (ls *loopbackSession) initPC() {
 	}
 
 	if preCreated > 0 {
-		ls.logf("[bcr_client][loopback][%s] pre-created %d track(s) from pinned codec map", ls.bridgeID, preCreated)
+		ls.logf("[bcr_client][loopback][%s] pre-created %d track(s) from preferred codec map", ls.bridgeID, preCreated)
 		ls.renegotiateLocked()
 		ls.initialOfferSent = true
 	} else {
-		ls.logf("[bcr_client][loopback][%s] no codecs in ptCodecMap — will lazy-load tracks on first RTP", ls.bridgeID)
+		ls.logf("[bcr_client][loopback][%s] WARNING: no codecs in ptCodecMap — loopback session created with no tracks", ls.bridgeID)
 	}
 }
 
+// addTrackLocked creates a TrackLocalStaticRTP for the given codec and adds
+// it to the PeerConnection. MUST be called with ls.mu held.
+//
+// IMPORTANT: We pass the FULL RTPCodecCapability (MimeType + ClockRate +
+// Channels), not just MimeType. ClockRate is required by Pion to correctly
+// match the track against the MediaEngine's registered codecs and to generate
+// valid a=rtpmap lines in the SDP. Without ClockRate, the SDP may be
+// malformed and rejected by the browser's setRemoteDescription.
 func (ls *loopbackSession) addTrackLocked(pt uint8, codecInfo CodecInfo) {
 	mimeType := ""
 	lowerMime := strings.ToLower(codecInfo.MimeType)
 
-	// Determine the base Pion MimeType
-	if strings.Contains(lowerMime, "vp8") {
+	// Map the SFU's codec name to Pion's canonical MimeType constants.
+	// Teams may send "X-H264UC" which is a proprietary H264 variant —
+	// we map it to standard H264 since the RTP payload is compatible.
+	switch {
+	case strings.Contains(lowerMime, "vp8"):
 		mimeType = webrtc.MimeTypeVP8
-	} else if strings.Contains(lowerMime, "vp9") {
+	case strings.Contains(lowerMime, "vp9"):
 		mimeType = webrtc.MimeTypeVP9
-	} else if strings.Contains(lowerMime, "h264") {
+	case strings.Contains(lowerMime, "h264"):
 		mimeType = webrtc.MimeTypeH264
-	} else if strings.Contains(lowerMime, "opus") {
+	case strings.Contains(lowerMime, "opus"):
 		mimeType = webrtc.MimeTypeOpus
-	} else {
-		// Unsupported codec for loopback, just skip it.
-		// Pion supports G722, PCMU, PCMA, etc., but we only care about modern codecs.
+	default:
+		ls.logf("[bcr_client][loopback][%s] skipping unsupported codec PT=%d mime=%s", ls.bridgeID, pt, codecInfo.MimeType)
 		return
 	}
 
-	// Create a local track with a unique ID based on Payload Type to prevent SDP duplicate track ID crashes
+	// Determine clock rate and channels from our CodecInfo (parsed from
+	// the SDP). Fall back to standard defaults if the SDP didn't have them.
+	clockRate := codecInfo.ClockRate
+	if clockRate == 0 {
+		if strings.HasPrefix(mimeType, "video/") {
+			clockRate = 90000 // standard for all video codecs
+		} else if mimeType == webrtc.MimeTypeOpus {
+			clockRate = 48000
+		}
+	}
+	channels := codecInfo.Channels
+	if mimeType == webrtc.MimeTypeOpus && channels == 0 {
+		channels = 2 // Opus is stereo by default
+	}
+
+	// Build the full codec capability with all required fields.
+	capability := webrtc.RTPCodecCapability{
+		MimeType:  mimeType,
+		ClockRate: clockRate,
+		Channels:  channels,
+	}
+
+	// Create a local track with a unique ID based on Payload Type
 	trackID := fmt.Sprintf("track-%d-%s", pt, strings.ReplaceAll(lowerMime, "/", "-"))
 	streamID := "stream-" + ls.bridgeID
 
-	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: mimeType}, trackID, streamID)
+	track, err := webrtc.NewTrackLocalStaticRTP(capability, trackID, streamID)
 	if err != nil {
-		ls.logf("[bcr_client][loopback][%s] failed to create local track for PT=%d: %v", ls.bridgeID, pt, err)
+		ls.logf("[bcr_client][loopback][%s] failed to create local track for PT=%d mime=%s clockRate=%d: %v",
+			ls.bridgeID, pt, mimeType, clockRate, err)
 		return
 	}
 
 	if _, err := ls.pc.AddTrack(track); err != nil {
-		ls.logf("[bcr_client][loopback][%s] failed to add track to PC: %v", ls.bridgeID, err)
+		ls.logf("[bcr_client][loopback][%s] failed to add track to PC for PT=%d: %v", ls.bridgeID, pt, err)
 		return
 	}
 
 	ls.tracks[pt] = track
-	ls.logf("[bcr_client][loopback][%s] added local track PT=%d MimeType=%s", ls.bridgeID, pt, mimeType)
+	ls.logf("[bcr_client][loopback][%s] added local track PT=%d mimeType=%s clockRate=%d channels=%d trackID=%s",
+		ls.bridgeID, pt, mimeType, clockRate, channels, trackID)
 }
 
+// renegotiateLocked creates a new offer and emits it to the frontend.
+// MUST be called with ls.mu held.
+//
+// We use webrtc.GatheringCompletePromise to wait for ICE candidate gathering
+// to finish before emitting the offer SDP. This ensures the SDP contains
+// actual host candidates (e.g. the machine's real IP), preventing the
+// zero-candidate race where the frontend receives an offer with no candidates
+// and ICE connectivity checks never start.
 func (ls *loopbackSession) renegotiateLocked() {
 	if ls.pc == nil {
 		return
@@ -144,6 +212,10 @@ func (ls *loopbackSession) renegotiateLocked() {
 		return
 	}
 
+	// Register the gathering-complete promise BEFORE SetLocalDescription so
+	// we don't miss the completion signal if gathering is very fast.
+	gatherComplete := webrtc.GatheringCompletePromise(ls.pc)
+
 	if err := ls.pc.SetLocalDescription(offer); err != nil {
 		ls.logf("[bcr_client][loopback][%s] failed to set local description: %v", ls.bridgeID, err)
 		return
@@ -151,10 +223,82 @@ func (ls *loopbackSession) renegotiateLocked() {
 
 	ls.renegotiateQueued = false
 
-	ls.logf("[bcr_client][loopback][%s] generated local loopback offer, emitting to frontend", ls.bridgeID)
+	// Capture fields needed by the goroutine before releasing the mutex.
+	pc := ls.pc
+	bridgeID := ls.bridgeID
+	cb := ls.onLoopbackOffer
+	logf := ls.logf
 
-	// Emit to frontend (asynchronous to avoid blocking)
-	go ls.onLoopbackOffer(ls.bridgeID, offer.SDP)
+	ls.logf("[bcr_client][loopback][%s] waiting for ICE gathering to complete before emitting offer to frontend", ls.bridgeID)
+
+	// Wait for ICE gathering in a separate goroutine so we do not hold ls.mu.
+	go func() {
+		<-gatherComplete
+
+		ld := pc.LocalDescription()
+		if ld == nil {
+			logf("[bcr_client][loopback][%s] ERROR: LocalDescription is nil after ICE gathering complete", bridgeID)
+			return
+		}
+
+		finalSDP := ld.SDP
+		logf("[bcr_client][loopback][%s] ICE gathering complete — emitting offer sdpLen=%d to frontend", bridgeID, len(finalSDP))
+
+		// Cache the completed offer SDP for re-emission on reconnect.
+		ls.mu.Lock()
+		ls.lastOfferSDP = finalSDP
+		ls.mu.Unlock()
+
+		cb(bridgeID, finalSDP)
+	}()
+}
+
+// GetLastOffer returns the most recently gathered and cached offer SDP.
+// Returns "" if no offer has been emitted yet (e.g. initPC failed or
+// gathering has not completed). Used by ReEmitAllLoopbackOffers.
+func (ls *loopbackSession) GetLastOffer() string {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	return ls.lastOfferSDP
+}
+
+// SyncTracksFromCodecMap diffs the given codec map (already filtered to
+// preferred codecs) against the loopback session's existing tracks. For every
+// PT that is preferred but has no local track yet, a new TrackLocalStaticRTP
+// is added and a Pion renegotiation offer is fired to the frontend.
+//
+// This handles the Teams 2-phase negotiation pattern where the SFU sends an
+// initial audio-only answer (triggering SRTP ready + loopback creation) and
+// immediately follows with a renegotiation offer adding video tracks.
+func (ls *loopbackSession) SyncTracksFromCodecMap(filteredCodecMap map[uint8]CodecInfo) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+
+	if ls.pc == nil {
+		return
+	}
+
+	added := 0
+	for pt, codecInfo := range filteredCodecMap {
+		if _, exists := ls.tracks[pt]; exists {
+			continue // track already present
+		}
+		ls.logf("[bcr_client][loopback][%s] renegotiation sync: adding missing track PT=%d codec=%s clockRate=%d",
+			ls.bridgeID, pt, codecInfo.MimeType, codecInfo.ClockRate)
+		ls.addTrackLocked(pt, codecInfo)
+		if _, nowExists := ls.tracks[pt]; nowExists {
+			added++
+		}
+	}
+
+	if added > 0 {
+		ls.logf("[bcr_client][loopback][%s] renegotiation sync: added %d new track(s) — triggering new Pion offer to frontend",
+			ls.bridgeID, added)
+		ls.renegotiateLocked()
+	} else {
+		ls.logf("[bcr_client][loopback][%s] renegotiation sync: no new tracks needed (all preferred PTs already present)",
+			ls.bridgeID)
+	}
 }
 
 // WriteRTP routes incoming RTP packets to the correct local track.
@@ -172,14 +316,20 @@ func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet) {
 	if !ok {
 		if !ls.droppedPTs[pkt.Header.PayloadType] {
 			ls.droppedPTs[pkt.Header.PayloadType] = true
-			ls.logf("[bcr_client][loopback][%s] strict-drop PT=%d (no pre-created local track)",
+			ls.logf("[bcr_client][loopback][%s] strict-drop PT=%d (no pre-created local track — check codec pinning)",
 				ls.bridgeID, pkt.Header.PayloadType)
 		}
 		return
 	}
 
 	if err := track.WriteRTP(pkt); err != nil {
-		// Don't log every error as it will flood if connection is closing
+		ls.writeErrCount++
+		if ls.writeErrCount == 1 || ls.writeErrCount%500 == 0 {
+			ls.logf("[bcr_client][loopback][%s] track.WriteRTP error #%d PT=%d: %v",
+				ls.bridgeID, ls.writeErrCount, pkt.Header.PayloadType, err)
+		}
+	} else {
+		ls.writeErrCount = 0
 	}
 }
 

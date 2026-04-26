@@ -250,13 +250,26 @@ func (e *Engine) getOrCreateRawSession(bridgeID string) *rawShadowSession {
 	// Callback is set once at creation; it is safe to read ptCodecMap since
 	// that map is populated before Init() starts (in handleShadowLocal).
 	session.onRTPPacket = func(pkt *rtp.Packet) {
+		// ── Snapshot ptCodecMap under lock (Bug-4 fix) ─────────────────────
+		// mergeCodecsAndSSRCs writes this map from the WebSocket goroutine
+		// while srtpReadLoop reads it from the SRTP goroutine — a data race
+		// that can cause a concurrent-map panic under renegotiation. We take
+		// a cheap copy here (typically 2–4 entries) to give each packet its
+		// own immutable view of the codec table.
+		session.mu.Lock()
+		ptMap := make(map[uint8]CodecInfo, len(session.ptCodecMap))
+		for k, v := range session.ptCodecMap {
+			ptMap[k] = v
+		}
+		session.mu.Unlock()
+
 		// Track video SSRCs so the RTCP heartbeat loop can send PLI.
-		if codec, ok := session.ptCodecMap[pkt.Header.PayloadType]; ok {
+		if codec, ok := ptMap[pkt.Header.PayloadType]; ok {
 			if strings.Contains(strings.ToUpper(codec.MimeType), "VIDEO") {
 				session.trackVideoSSRC(pkt.SSRC)
 			}
 		}
-		e.onRawRTPPacket(bridgeID, pkt, session.ptCodecMap)
+		e.onRawRTPPacket(bridgeID, pkt, ptMap)
 	}
 	e.rawSessions[bridgeID] = session
 	return session
@@ -674,12 +687,92 @@ func (e *Engine) promoteActiveBridge(bridgeID, reason string) {
 	}
 	oldActive := e.activeBridgeID
 	e.activeBridgeID = bridgeID
+	// Grab the session reference while holding shadowMu so we can pass it
+	// to ensureLoopbackSession without a second map lookup under relayMu.
+	session := e.rawSessions[bridgeID]
 	e.shadowMu.Unlock()
 
 	e.logf("[bcr_client][bridge] active bridge switched old=%s new=%s reason=%s", oldActive, bridgeID, reason)
 
 	if oldActive != "" && oldActive != bridgeID {
 		e.closeShadowSession(oldActive)
+	}
+
+	// ── Eager loopback creation (Bug-1 fix) ──────────────────────────────
+	// At this point the remote answer SDP has already been merged into
+	// session.ptCodecMap via mergeCodecsAndSSRCs. Creating the loopback now
+	// (rather than on the first arriving RTP packet) guarantees the track
+	// pre-creation uses the correct remote payload types, and fires the Pion
+	// offer to the frontend ~200ms before media floods in.
+	if session != nil {
+		e.ensureLoopbackSession(bridgeID, session)
+	}
+}
+
+// ensureLoopbackSession creates the Pion loopback PeerConnection (and fires
+// the offer to the frontend) if one does not already exist for bridgeID.
+// It snapshots ptCodecMap under the session mutex to be race-safe.
+func (e *Engine) ensureLoopbackSession(bridgeID string, session *rawShadowSession) {
+	// Fast-path: already exists (checked without lock first for performance).
+	e.relayMu.Lock()
+	_, alreadyExists := e.loopbackSessions[bridgeID]
+	e.relayMu.Unlock()
+	if alreadyExists {
+		e.logf("[bcr_client][loopback] session already exists for bridgeId=%s — skipping eager creation", bridgeID)
+		return
+	}
+
+	// Snapshot ptCodecMap under lock (same race-safety as the onRTPPacket closure).
+	session.mu.Lock()
+	ptMap := make(map[uint8]CodecInfo, len(session.ptCodecMap))
+	for k, v := range session.ptCodecMap {
+		ptMap[k] = v
+	}
+	session.mu.Unlock()
+
+	filteredForPreCreate := FilterPTCodecMapToPreferred(ptMap, e.cfg.PreferredCodecs)
+	e.logf("[bcr_client][loopback] eagerly creating loopback session bridgeId=%s totalCodecs=%d preferredCodecs=%d",
+		bridgeID, len(ptMap), len(filteredForPreCreate))
+
+	e.relayMu.Lock()
+	// Double-check under lock to prevent TOCTOU race if two goroutines race here.
+	if _, alreadyExists = e.loopbackSessions[bridgeID]; alreadyExists {
+		e.relayMu.Unlock()
+		e.logf("[bcr_client][loopback] session created concurrently for bridgeId=%s — skipping", bridgeID)
+		return
+	}
+	ls := newLoopbackSession(bridgeID, e.logf, e.cb.OnLoopbackOffer, filteredForPreCreate)
+	e.loopbackSessions[bridgeID] = ls
+	e.relayMu.Unlock()
+
+	e.logf("[bcr_client][loopback] loopback session eagerly created bridgeId=%s", bridgeID)
+}
+
+// ReEmitAllLoopbackOffers re-fires the cached loopback offer SDP for every
+// active session. Called when the Wails frontend signals it is ready to
+// receive offers (recovering from cold-start timing races where the offer
+// fired before EventsOn("onLocalLoopbackOffer") was registered).
+func (e *Engine) ReEmitAllLoopbackOffers() {
+	e.relayMu.Lock()
+	snapshot := make(map[string]*loopbackSession, len(e.loopbackSessions))
+	for id, s := range e.loopbackSessions {
+		snapshot[id] = s
+	}
+	e.relayMu.Unlock()
+
+	for bridgeID, session := range snapshot {
+		if session == nil {
+			continue
+		}
+		offer := session.GetLastOffer()
+		if offer == "" {
+			e.logf("[bcr_client][loopback] re-emit requested for bridgeId=%s but no offer SDP cached yet", bridgeID)
+			continue
+		}
+		e.logf("[bcr_client][loopback] re-emitting loopback offer bridgeId=%s sdpLen=%d", bridgeID, len(offer))
+		if e.cb.OnLoopbackOffer != nil {
+			go e.cb.OnLoopbackOffer(bridgeID, offer)
+		}
 	}
 }
 
@@ -758,6 +851,10 @@ func (e *Engine) handleRenegotiationLocal(conn *websocket.Conn, session *rawShad
 	// Update codecs and SSRCs from the new local SDP
 	e.mergeCodecsAndSSRCs(session, bridgeID, sdpType, sdp)
 
+	// Sync loopback tracks in case the local SDP carries codec PTs not yet
+	// represented in the loopback session (mirrors the remote path).
+	e.syncLoopbackTracks(bridgeID, session)
+
 	// Fetch existing transport credentials
 	ready, err := session.GetTransportCredentials(sdpType)
 	if err != nil {
@@ -773,6 +870,36 @@ func (e *Engine) handleRenegotiationLocal(conn *websocket.Conn, session *rawShad
 	e.logf("[raw][%s] [Renegotiation Answer Sent] SHADOW_READY sent bridgeId=%s sdpType=%s", bridgeID, bridgeID, sdpType)
 }
 
+// syncLoopbackTracks snapshots the session's current codec map under the
+// session mutex, filters it to preferred codecs, and calls
+// SyncTracksFromCodecMap on the active loopback session for bridgeID.
+// It is a no-op if no loopback session exists yet for that bridgeID.
+func (e *Engine) syncLoopbackTracks(bridgeID string, session *rawShadowSession) {
+	e.relayMu.Lock()
+	ls := e.loopbackSessions[bridgeID]
+	e.relayMu.Unlock()
+
+	if ls == nil {
+		// Loopback session not yet created (SRTP not ready) — nothing to sync.
+		e.logf("[bcr_client][loopback] syncLoopbackTracks: no session yet for bridgeId=%s — skipping", bridgeID)
+		return
+	}
+
+	// Snapshot codec map under session mutex (same pattern as onRTPPacket closure).
+	session.mu.Lock()
+	ptMap := make(map[uint8]CodecInfo, len(session.ptCodecMap))
+	for k, v := range session.ptCodecMap {
+		ptMap[k] = v
+	}
+	session.mu.Unlock()
+
+	filtered := FilterPTCodecMapToPreferred(ptMap, e.cfg.PreferredCodecs)
+	e.logf("[bcr_client][loopback] syncLoopbackTracks bridgeId=%s totalCodecs=%d preferredCodecs=%d",
+		bridgeID, len(ptMap), len(filtered))
+
+	ls.SyncTracksFromCodecMap(filtered)
+}
+
 func (e *Engine) handleRenegotiationRemote(session *rawShadowSession, bridgeID string, sdpType string, sdp string) {
 	e.logf("[raw][%s] [Renegotiation Offer/Answer Received] Parsing remote %s SDP", bridgeID, sdpType)
 
@@ -783,6 +910,15 @@ func (e *Engine) handleRenegotiationRemote(session *rawShadowSession, bridgeID s
 	}
 
 	e.mergeCodecsAndSSRCs(session, bridgeID, sdpType, sdp)
+
+	// ── Sync loopback tracks with newly merged codecs ─────────────────────────
+	// Teams SFU uses a 2-phase pattern: audio-only initial answer followed
+	// immediately by a renegotiation offer adding video tracks. The loopback
+	// session is created at SRTP-ready time (after the initial answer), so
+	// it only knows about audio. This call propagates the newly merged
+	// video codec PTs (e.g. H264 PT=107) to the loopback, adding tracks
+	// and firing a new Pion offer to the frontend.
+	e.syncLoopbackTracks(bridgeID, session)
 }
 
 // ─── Utility Functions ────────────────────────────────────────────────────────

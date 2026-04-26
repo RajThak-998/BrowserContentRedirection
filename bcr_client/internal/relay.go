@@ -93,20 +93,28 @@ func (e *Engine) onRawRTPPacket(bridgeID string, pkt *rtp.Packet, ptCodecMap map
 		return
 	}
 
-	// Get or create loopback session.
+	// Get loopback session — created eagerly at SRTP-ready time by
+	// ensureLoopbackSession (called from promoteActiveBridge). If it is
+	// missing here, something went wrong in the startup sequence; drop
+	// the packet and emit a one-time warning so the log is not flooded.
 	e.relayMu.Lock()
-	session, ok := e.loopbackSessions[bridgeID]
-	if !ok {
-		// Pass a preferred-filtered codec map for track PRE-CREATION only
-		// (so the loopback creates preferred tracks upfront, not 10 tracks
-		// for every codec the SFU listed). The full ptCodecMap is passed
-		// to WriteRTP for runtime PT identification.
-		filteredForPreCreate := FilterPTCodecMapToPreferred(ptCodecMap, e.cfg.PreferredCodecs)
-		session = newLoopbackSession(bridgeID, e.logf, e.cb.OnLoopbackOffer, filteredForPreCreate)
-		e.loopbackSessions[bridgeID] = session
-	}
+	session := e.loopbackSessions[bridgeID]
 	e.relayMu.Unlock()
 
-	// Forward only strict-allowlisted RTP to loopback.
+	if session == nil {
+		e.unknownPTMu.Lock()
+		if e.unknownPTs == nil {
+			e.unknownPTs = make(map[uint8]bool)
+		}
+		if !e.unknownPTs[255] { // sentinel key for "no-session" warning
+			e.unknownPTs[255] = true
+			e.logf("[raw][%s] [WARN] no loopback session found for bridgeId=%s — RTP dropped PT=%d — eager creation may have failed",
+				bridgeID, bridgeID, pkt.Header.PayloadType)
+		}
+		e.unknownPTMu.Unlock()
+		return
+	}
+
+	// Forward the allowlisted, decrypted RTP packet to the loopback PeerConnection.
 	session.WriteRTP(pkt)
 }
