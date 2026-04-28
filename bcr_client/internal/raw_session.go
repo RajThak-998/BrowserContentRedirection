@@ -730,10 +730,10 @@ func parseDTLSRole(sdp string) string {
 		case "active":
 			return "server"
 		default:
-			return "server" // actpass or holdon → default to server
+			return "client" 
 		}
 	}
-	return "server" // no a=setup: found — Teams is almost always active
+	return "client" 
 }
 
 // verifyPeerCertByDER checks the DTLS peer cert (raw DER bytes captured via
