@@ -685,6 +685,31 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	go s.startupKeyframeLoop(loopCtx)
 	go s.mediaSummaryLoop(loopCtx)
 
+	// ── DTLS drain loop ─────────────────────────────────────────────────────
+	// CRITICAL: pion/dtls v3's internal packet-reader goroutine only runs
+	// while there is an active Read() call on the dtls.Conn. After the
+	// handshake, nobody reads application data from the DTLS connection
+	// (we use raw SRTP, not DTLS-data). Without an active Read(), the
+	// internal reader exits after its flight-timer expires (~10-15s),
+	// which stops calling splitter.ReadFrom() — the ONLY function that
+	// reads from the ICE connection and feeds srtpCh. The result is
+	// total media starvation despite a healthy ICE/SRTP session.
+	//
+	// This goroutine continuously calls dtlsConn.Read() to keep the
+	// internal reader alive for the lifetime of the session. Any DTLS
+	// application data received is discarded (none is expected in
+	// SRTP-only mode).
+	go func() {
+		buf := make([]byte, 8192)
+		for {
+			_, err := dtlsConn.Read(buf)
+			if err != nil {
+				s.logf("[raw][%s] DTLS drain loop exited: %v", s.bridgeID, err)
+				return
+			}
+		}
+	}()
+
 	return nil
 }
 
@@ -1255,10 +1280,7 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 			case delta > 0:
 				missing := s.nackSt.recordGap(header.SSRC, expected, header.SequenceNumber)
 				st.totalLost += int64(len(missing))
-				s.logf("[RTP-GAP] SSRC=%d expected=%d got=%d lost=%d",
-					header.SSRC, expected, header.SequenceNumber, len(missing))
 				if len(missing) > 0 {
-					s.logf("[NACK] mediaSSRC=%d missing=%v reason=sequence-gap", header.SSRC, missing)
 					s.rtcpMu.Lock()
 					s.rtcpNACKCount++
 					s.rtcpMu.Unlock()
@@ -1266,14 +1288,10 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 					// Only NACK primary media SSRCs, never the RTX repair stream itself.
 					if st.role != roleRTXVideo {
 						go s.sendNACK(header.SSRC, missing)
-					} else {
-						s.logf("[NACK] skipping NACK for RTX SSRC=%d (repair stream, not primary)", header.SSRC)
 					}
 				}
 			case delta < 0:
 				st.totalReorder++
-				s.logf("[RTP-REORDER] SSRC=%d expected=%d got=%d delta=%d",
-					header.SSRC, expected, header.SequenceNumber, delta)
 			}
 		}
 		if !st.seqInitiated || int16(header.SequenceNumber-st.highestSeq) > 0 {
@@ -1346,7 +1364,6 @@ func (s *rawShadowSession) processInboundSRTCP(encrypted []byte) {
 	}
 
 	now := time.Now()
-	var rxDescs []string
 	for _, pkt := range pkts {
 		switch v := pkt.(type) {
 		case *rtcp.SenderReport:
@@ -1358,41 +1375,11 @@ func (s *rawShadowSession) processInboundSRTCP(encrypted []byte) {
 			s.lastSRBySSRCMu.Unlock()
 			s.logf("[RTCP-RX] SR ssrc=%d ntp=%d rtpTime=%d pkts=%d bytes=%d",
 				v.SSRC, v.NTPTime, v.RTPTime, v.PacketCount, v.OctetCount)
-			rxDescs = append(rxDescs, fmt.Sprintf("SR(ssrc=%d)", v.SSRC))
-		case *rtcp.ReceiverReport:
-			for _, rr := range v.Reports {
-				s.logf("[RTCP-RX] RR ssrc=%d fracLost=%d cumLost=%d highSeq=%d jitter=%d lsr=%d dlsr=%d",
-					rr.SSRC, rr.FractionLost, rr.TotalLost,
-					rr.LastSequenceNumber, rr.Jitter,
-					rr.LastSenderReport, rr.Delay)
-				rxDescs = append(rxDescs, fmt.Sprintf("RR(ssrc=%d lost=%d)", rr.SSRC, rr.TotalLost))
-			}
-		case *rtcp.TransportLayerNack:
-			for _, pair := range v.Nacks {
-				s.logf("[RTCP-RX] NACK mediaSSRC=%d pid=%d blp=%016b",
-					v.MediaSSRC, pair.PacketID, pair.LostPackets)
-				// Check if RTX can satisfy this NACK.
-				if _, hasRTX := s.rtxMapping.reverse[uint8(v.MediaSSRC)]; hasRTX {
-					s.logf("[NACK-RECOVERY] mediaSSRC=%d pid=%d rtxAvailable=true",
-						v.MediaSSRC, pair.PacketID)
-				}
-			}
-			rxDescs = append(rxDescs, fmt.Sprintf("NACK(mediaSSRC=%d)", v.MediaSSRC))
-		case *rtcp.PictureLossIndication:
-			s.logf("[RTCP-RX] PLI mediaSSRC=%d senderSSRC=%d", v.MediaSSRC, v.SenderSSRC)
-			rxDescs = append(rxDescs, fmt.Sprintf("PLI(mediaSSRC=%d)", v.MediaSSRC))
-		case *rtcp.FullIntraRequest:
-			s.logf("[RTCP-RX] FIR mediaSSRC=%d", v.MediaSSRC)
-			rxDescs = append(rxDescs, fmt.Sprintf("FIR(mediaSSRC=%d)", v.MediaSSRC))
-		case *rtcp.ReceiverEstimatedMaximumBitrate:
-			s.logf("[RTCP-RX] REMB bitrate=%d ssrcs=%v", v.Bitrate, v.SSRCs)
-			rxDescs = append(rxDescs, fmt.Sprintf("REMB(bitrate=%d)", v.Bitrate))
 		default:
-			rxDescs = append(rxDescs, fmt.Sprintf("%T", pkt))
+			// RR, NACK, PLI, FIR, REMB — handled silently.
+			// Health visible via [MEDIA-SUMMARY] and [RTCP-TX] logs.
+			_ = v
 		}
-	}
-	if len(rxDescs) > 0 {
-		s.logf("[RTCP-RX] compound packets=[%s]", strings.Join(rxDescs, ", "))
 	}
 }
 
@@ -1763,7 +1750,13 @@ func (s *rawShadowSession) sendNACK(mediaSSRC uint32, missing []uint16) {
 		s.logf("[NACK-TX] write failed SSRC=%d: %v", mediaSSRC, writeErr)
 		return
 	}
-	s.logf("[NACK-TX] sent NACK senderSSRC=%d mediaSSRC=%d pairs=%d seqs=%v", senderSSRC, mediaSSRC, len(pairs), missing)
+	// Log sampled NACK-TX (every 10th to reduce noise).
+	s.rtcpMu.Lock()
+	nackTotal := s.rtcpNACKCount
+	s.rtcpMu.Unlock()
+	if nackTotal <= 3 || nackTotal%10 == 0 {
+		s.logf("[NACK-TX] sent NACK senderSSRC=%d mediaSSRC=%d pairs=%d seqs=%v", senderSSRC, mediaSSRC, len(pairs), missing)
+	}
 }
 
 // decapsulateRTX implements RFC 4588 RTX packet processing.
@@ -1777,8 +1770,7 @@ func (s *rawShadowSession) sendNACK(mediaSSRC uint32, missing []uint16) {
 // and dispatch it to onRTPPacket as if it arrived normally.
 func (s *rawShadowSession) decapsulateRTX(rtxPkt *rtp.Packet, rtxSSRC uint32, mediaPT uint8) {
 	if len(rtxPkt.Payload) < 2 {
-		s.logf("[RTX] rtxSSRC=%d rtxPT=%d apt=%d payload too short (%d bytes) — dropping",
-			rtxSSRC, rtxPkt.Header.PayloadType, mediaPT, len(rtxPkt.Payload))
+		// 0-byte RTX payloads are padding probes (bandwidth estimation). Normal and high-frequency.
 		return
 	}
 
@@ -1811,11 +1803,8 @@ func (s *rawShadowSession) decapsulateRTX(rtxPkt *rtp.Packet, rtxSSRC uint32, me
 
 	// Check if this seq was in our NACK missing set.
 	wasExpected := s.nackSt.recover(mediaSSRC, originalSeq)
-	s.logf("[RTX] rtxSSRC=%d rtxPT=%d apt=%d recoveredSeq=%d originalMediaSSRC=%d accepted=true nackRecovered=%v",
-		rtxSSRC, rtxPkt.Header.PayloadType, mediaPT, originalSeq, mediaSSRC, wasExpected)
 
 	if wasExpected {
-		s.logf("[NACK-RECOVERY] mediaSSRC=%d recoveredSeq=%d viaRTX=true", mediaSSRC, originalSeq)
 		if st, _ := s.ssrcReg.getOrCreate(rtxSSRC); st != nil {
 			st.mu.Lock()
 			st.nackRecovered++
