@@ -139,72 +139,121 @@ window.onload = function () {
     // Local WebRTC Loopback Mode
     // ==========================================
     window.runtime.EventsOn("onLocalLoopbackOffer", async (bridgeID, offerSdp) => {
-        isWebRTCLive = true;
-        logTerminal(`[Loopback] Received SDP Offer for bridgeId=${bridgeID}. Showing Window...`);
-        window.go.main.App.ShowWindow();
-
-        if (!localPCs[bridgeID]) {
-            logTerminal(`[Loopback] Creating new RTCPeerConnection for bridgeId=${bridgeID}`);
-            const pc = new RTCPeerConnection({
-                iceServers: [] // Local loopback, no ICE servers needed
-            });
-
-            pc.onsignalingstatechange = () => {
-                logTerminal(`[Loopback] Signaling state changed to: ${pc.signalingState}`);
-            };
-
-            pc.oniceconnectionstatechange = () => {
-                logTerminal(`[Loopback] ICE connection state changed to: ${pc.iceConnectionState}`);
-            };
-
-            pc.ontrack = (event) => {
-                logTerminal(`[Loopback] Stream track received! track.kind=${event.track.kind} codec-pinned=H264+Opus`);
-                if (videoElement.srcObject !== event.streams[0]) {
-                    videoElement.srcObject = event.streams[0];
-                    // Ensure playback starts immediately with the pinned codec stream
-                    videoElement.play().catch(e => {
-                        logTerminal(`[Loopback] Autoplay blocked, will retry: ${e}`);
-                    });
-                }
-            };
-
-            pc.onconnectionstatechange = () => {
-                logTerminal(`[Loopback] Connection state changed to: ${pc.connectionState}`);
-                if (isWebRTCLive && (pc.connectionState === 'disconnected' || pc.connectionState === 'failed')) {
-                    cleanupStatsForBridge(bridgeID);
-                    window.go.main.App.HideWindow();
-                    delete localPCs[bridgeID];
-                }
-
-                if (pc.connectionState === 'closed') {
-                    cleanupStatsForBridge(bridgeID);
-                }
-            };
-
-            localPCs[bridgeID] = pc;
-        }
-
-        const pc = localPCs[bridgeID];
-
+        // Top-level try/catch — any unhandled error in this handler is caught
+        // and logged via LogInfo (visible as INF | in the terminal). LogError
+        // output is silently filtered by some Wails/WebKit configurations.
         try {
+            isWebRTCLive = true;
+            logTerminal(`[Loopback] Received SDP Offer for bridgeId=${bridgeID} sdpLen=${offerSdp ? offerSdp.length : 'null'}`);
+
+            if (!offerSdp || offerSdp.length === 0) {
+                logTerminal(`[Loopback][${bridgeID}] ERROR: received empty/null offer SDP — aborting`);
+                return;
+            }
+
+            if (!localPCs[bridgeID]) {
+                logTerminal(`[Loopback][${bridgeID}] Creating new RTCPeerConnection`);
+                const pc = new RTCPeerConnection({
+                    iceServers: [] // Local loopback — both peers on same machine
+                });
+
+                pc.onsignalingstatechange = () => {
+                    logTerminal(`[Loopback][${bridgeID}] Signaling state: ${pc.signalingState}`);
+                };
+
+                pc.oniceconnectionstatechange = () => {
+                    logTerminal(`[Loopback][${bridgeID}] ICE connection state: ${pc.iceConnectionState}`);
+                };
+
+                pc.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        logTerminal(`[Loopback][${bridgeID}] Local ICE candidate: ${event.candidate.candidate.substring(0, 80)}`);
+                    } else {
+                        logTerminal(`[Loopback][${bridgeID}] ICE gathering complete`);
+                    }
+                };
+
+                pc.ontrack = (event) => {
+                    logTerminal(`[Loopback][${bridgeID}] Track received: kind=${event.track.kind} id=${event.track.id} streams=${event.streams.length}`);
+                    if (event.streams && event.streams[0]) {
+                        if (videoElement.srcObject !== event.streams[0]) {
+                            logTerminal(`[Loopback][${bridgeID}] Binding stream to video element`);
+                            videoElement.srcObject = event.streams[0];
+                        }
+                        videoElement.play().catch(e => {
+                            logTerminal(`[Loopback][${bridgeID}] play() blocked: ${e}`);
+                        });
+                    } else {
+                        logTerminal(`[Loopback][${bridgeID}] ERROR: ontrack fired but event.streams[0] is missing`);
+                    }
+                };
+
+                pc.onconnectionstatechange = () => {
+                    logTerminal(`[Loopback][${bridgeID}] Connection state: ${pc.connectionState}`);
+                    if (isWebRTCLive && (pc.connectionState === 'disconnected' || pc.connectionState === 'failed')) {
+                        logTerminal(`[Loopback][${bridgeID}] Connection lost — hiding window`);
+                        cleanupStatsForBridge(bridgeID);
+                        window.go.main.App.HideWindow();
+                        delete localPCs[bridgeID];
+                    }
+                    if (pc.connectionState === 'closed') {
+                        cleanupStatsForBridge(bridgeID);
+                        delete localPCs[bridgeID];
+                    }
+                };
+
+                localPCs[bridgeID] = pc;
+                logTerminal(`[Loopback][${bridgeID}] RTCPeerConnection created successfully`);
+            }
+
+            const pc = localPCs[bridgeID];
+
+            // Guard: skip if this exact SDP was already applied
+            if (pc.signalingState === 'stable' && pc.remoteDescription && pc.remoteDescription.sdp === offerSdp) {
+                logTerminal(`[Loopback][${bridgeID}] Duplicate offer in stable state — ignoring`);
+                return;
+            }
+
+            logTerminal(`[Loopback][${bridgeID}] Applying remote offer (signalingState=${pc.signalingState})...`);
             await pc.setRemoteDescription(new RTCSessionDescription({
                 type: 'offer',
                 sdp: offerSdp
             }));
+            logTerminal(`[Loopback][${bridgeID}] Remote offer applied successfully`);
 
+            window.go.main.App.ShowWindow();
             startStatsPolling(bridgeID, pc);
-            collectAndLogReceiverStats(bridgeID, pc);
-            
+
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
-            
-            // Send answer back to Go backend
+
+            logTerminal(`[Loopback][${bridgeID}] SDP Answer generated (len=${answer.sdp.length}), sending to Go backend...`);
             window.go.main.App.SetLoopbackAnswer(bridgeID, answer.sdp);
-            logTerminal(`[Loopback] SDP Answer generated and sent back to Go backend.`);
+            logTerminal(`[Loopback][${bridgeID}] SDP Answer sent. Waiting for media...`);
+
         } catch (error) {
-            logErrorTerm(`[Loopback] WebRTC Negotiation Failed: ${error}`);
+            // Use LogInfo so errors are VISIBLE in the terminal (LogError may be filtered)
+            logTerminal(`[Loopback][${bridgeID}] FATAL ERROR in handler: ${error}`);
+            if (error && error.stack) {
+                logTerminal(`[Loopback][${bridgeID}] Stack: ${error.stack}`);
+            }
         }
     });
+
+    // ── Cold-start recovery (Bug-2 fix) ────────────────────────────────────
+    // The Go backend may have fired the loopback offer before this EventsOn
+    // listener was registered (race between Wails startup and Go SRTP readiness).
+    // Calling RequestLoopbackOffer() tells Go to re-emit any cached offer SDPs
+    // for sessions that are already live. The call is deferred by one tick to
+    // ensure the EventsOn handler above is fully registered first.
+    setTimeout(() => {
+        if (window.go && window.go.main && window.go.main.App) {
+            logTerminal("[Loopback] Requesting any pending loopback offers from Go backend...");
+            window.go.main.App.RequestLoopbackOffer().catch(e => {
+                logErrorTerm(`[Loopback] RequestLoopbackOffer failed: ${e}`);
+            });
+        }
+    }, 0);
 
     logTerminal("WebRTC Loopback UI ready (codec-pinned: H264+Opus). Waiting for payloads...");
 };

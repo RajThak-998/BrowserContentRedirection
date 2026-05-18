@@ -19,6 +19,8 @@ var (
 	fingerprintRe   = regexp.MustCompile(`(?m)^a=fingerprint:(.+)$`)
 	candidateLineRe = regexp.MustCompile(`(?m)^(a=candidate:[^\r\n]+)`)
 	rtpMapLineRe    = regexp.MustCompile(`^a=rtpmap:(\d+)\s+([^/\s]+)/(\d+)(?:/(\d+))?`)
+	cnameRe	 		= regexp.MustCompile(`^a=ssrc:\d+\s+cname:([^\s]+)`)
+	transportCCRe   = regexp.MustCompile(`^a=extmap:(\d+).*(transport-wide-cc|transport-cc)`)
 )
 
 // sdpInternalCodecNames are codec encoding names that must NOT be exposed to
@@ -148,6 +150,54 @@ func ParsePTCodecMap(sdp string) map[uint8]CodecInfo {
 // ssrcLineRe matches "a=ssrc:<decimal> ..." lines.
 var ssrcLineRe = regexp.MustCompile(`^a=ssrc:(\d+)\s`)
 
+// ExtractAllSSRCs returns deduplicated SSRC values declared in any m=audio or
+// m=video section of the SDP via a=ssrc: lines. Unlike ExtractVideoSSRCs, this
+// includes audio SSRCs — critical for setting localSenderSSRC from audio-only
+// initial offers where no m=video section exists yet.
+func ExtractAllSSRCs(sdp string) []uint32 {
+	sep := "\r\n"
+	if !strings.Contains(sdp, "\r\n") {
+		sep = "\n"
+	}
+	lines := strings.Split(sdp, sep)
+
+	inMediaSection := false
+	seen := make(map[uint32]bool)
+	var out []uint32
+
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+
+		if strings.HasPrefix(bare, "m=audio") || strings.HasPrefix(bare, "m=video") {
+			inMediaSection = true
+			continue
+		}
+		if strings.HasPrefix(bare, "m=") {
+			inMediaSection = false
+			continue
+		}
+		if !inMediaSection {
+			continue
+		}
+
+		m := ssrcLineRe.FindStringSubmatch(bare)
+		if m == nil {
+			continue
+		}
+		ssrc64, err := strconv.ParseUint(m[1], 10, 32)
+		if err != nil {
+			continue
+		}
+		ssrc := uint32(ssrc64)
+		if !seen[ssrc] {
+			seen[ssrc] = true
+			out = append(out, ssrc)
+		}
+	}
+
+	return out
+}
+
 // ExtractVideoSSRCs returns deduplicated SSRC values declared in m=video
 // sections of the SDP via a=ssrc: lines.
 //
@@ -272,4 +322,77 @@ func FilterPTCodecMapToPreferred(ptMap map[uint8]CodecInfo, preferred PreferredC
 	}
 
 	return filtered
+}
+
+// ExtractCNAME extracts the first CNAME value from a=ssrc: lines in any
+// m=audio or m=video section of the SDP. This is the browser's CNAME that
+// must be echoed in our outbound SDES packets.
+func ExtractCNAME(sdp string) string {
+	lines := strings.Split(strings.ReplaceAll(sdp, "\r\n", "\n"), "\n")
+
+	inMediaSection := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "m=audio") || strings.HasPrefix(line, "m=video") {
+			inMediaSection = true
+			continue
+		}
+		if strings.HasPrefix(line, "m=") {
+			inMediaSection = false
+			continue
+		}
+		if !inMediaSection {
+			continue
+		}
+
+		m := cnameRe.FindStringSubmatch(line)
+		if m != nil {
+			return m[1] // No TrimSpace needed because [^\s]+ guarantees no spaces
+		}
+	}
+	return ""
+}
+
+// ExtractTransportCCExtID extracts the RTP header extension ID used for
+// transport-wide congestion control from the SDP. Returns 0 if not found.
+//
+// Example SDP line:
+//
+//	a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01
+func ExtractTransportCCExtID(sdp string) uint8 {
+	lines := strings.Split(strings.ReplaceAll(sdp, "\r\n", "\n"), "\n")
+
+	for _, line := range lines {
+		m := transportCCRe.FindStringSubmatch(line)
+		if m != nil {
+			id, err := strconv.ParseUint(m[1], 10, 8)
+			if err == nil {
+				return uint8(id)
+			}
+		}
+	}
+	return 0
+}
+
+// fidGroupRe matches "a=ssrc-group:FID <mediaSSRC> <rtxSSRC>"
+var fidGroupRe = regexp.MustCompile(`^a=ssrc-group:FID\s+(\d+)\s+(\d+)`)
+
+// ExtractFIDGroups returns a map from RTX SSRC → media SSRC, parsed from
+// "a=ssrc-group:FID <mediaSSRC> <rtxSSRC>" lines in the SDP.
+// This is used to reconstruct the original RTP SSRC during RTX decapsulation.
+func ExtractFIDGroups(sdp string) map[uint32]uint32 {
+	out := make(map[uint32]uint32)
+	for _, line := range strings.Split(strings.ReplaceAll(sdp, "\r\n", "\n"), "\n") {
+		bare := strings.TrimRight(strings.TrimSpace(line), "\r")
+		m := fidGroupRe.FindStringSubmatch(bare)
+		if m == nil {
+			continue
+		}
+		mediaSSRC, err1 := strconv.ParseUint(m[1], 10, 32)
+		rtxSSRC, err2 := strconv.ParseUint(m[2], 10, 32)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		out[uint32(rtxSSRC)] = uint32(mediaSSRC)
+	}
+	return out
 }

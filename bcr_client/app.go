@@ -38,10 +38,15 @@ func NewApp() *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 
+	// Enable WebRTC APIs (RTCPeerConnection) in the WebKit WebView.
+	// Must run after the WebView is created, so we launch in a goroutine.
+	go EnableWebRTC()
+
 	a.mediaEngine = engine.New(
 		engine.Config{ListenAddr: ":8081"},
 		engine.Callbacks{
 			OnLoopbackOffer: func(bridgeID string, sdp string) {
+				log.Printf("[bcr_client][loopback] emitting onLocalLoopbackOffer to frontend bridgeId=%s sdpLen=%d", bridgeID, len(sdp))
 				runtime.EventsEmit(a.ctx, "onLocalLoopbackOffer", bridgeID, sdp)
 			},
 			OnVideoUpdate: func(update engine.VideoUpdate) {
@@ -123,6 +128,18 @@ func (a *App) SendSdpAnswer(sdp string) {
 func (a *App) SetLoopbackAnswer(bridgeID string, sdp string) {
 	if a.mediaEngine != nil {
 		a.mediaEngine.SetLoopbackAnswer(bridgeID, sdp)
+	}
+}
+
+// RequestLoopbackOffer is called by the Wails frontend immediately after it
+// registers its EventsOn("onLocalLoopbackOffer") listener. This recovers from
+// the cold-start race where the Go backend fired the offer before the JS
+// listener was alive — the engine re-emits any cached offer SDPs for active
+// loopback sessions.
+func (a *App) RequestLoopbackOffer() {
+	log.Println("[bcr_client] RequestLoopbackOffer called by frontend — re-emitting any cached loopback offers")
+	if a.mediaEngine != nil {
+		a.mediaEngine.ReEmitAllLoopbackOffers()
 	}
 }
 
