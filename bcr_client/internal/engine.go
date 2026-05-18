@@ -465,12 +465,9 @@ func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalP
 	// this map just lets us identify the packets when they arrive.
 	session.ptCodecMap = ParsePTCodecMap(payload.SDP)
 	e.logf("[raw][%s] parsed %d codec(s) from local %s SDP", bridgeID, len(session.ptCodecMap), sdpType)
-	// ── [PTMAP] full topology dump after initial local SDP ──────────────────
-	DumpPTMap(payload.SDP, fmt.Sprintf("local-%s", sdpType), session.ptCodecMap, e.logf)
 	// Populate RTX mappings from SDP fmtp:apt= lines.
 	for rtxPT, mediaPT := range extractFmtpAPT(payload.SDP) {
 		session.rtxMapping.set(rtxPT, mediaPT)
-		e.logf("[RTX] PT=%d retransmits PT=%d (from local SDP)", rtxPT, mediaPT)
 	}
 	// Populate RTX SSRC→media SSRC mapping from a=ssrc-group:FID lines.
 	fidGroups := ExtractFIDGroups(payload.SDP)
@@ -478,45 +475,30 @@ func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalP
 		session.rtxSSRCMu.Lock()
 		for rtxSSRC, mediaSSRC := range fidGroups {
 			session.rtxSSRCtoMedia[rtxSSRC] = mediaSSRC
-			e.logf("[RTX] SSRC=%d is RTX for mediaSSRC=%d (FID from local SDP)", rtxSSRC, mediaSSRC)
 		}
 		session.rtxSSRCMu.Unlock()
 	}
 
-	// Extract ANY local SSRC (audio or video) from the local SDP to use as the
-	// SenderSSRC in RTCP heartbeats. The initial offer is often audio-only, so
-	// ExtractVideoSSRCs would find nothing — we must grab the audio SSRC too.
 	allLocalSSRCs := ExtractAllSSRCs(payload.SDP)
 	if len(allLocalSSRCs) > 0 {
 		session.mu.Lock()
 		session.localSenderSSRC = allLocalSSRCs[0]
 		session.mu.Unlock()
-		e.logf("[raw][%s] extracted local SenderSSRC %d from local %s SDP (total local SSRCs: %v)", bridgeID, allLocalSSRCs[0], sdpType, allLocalSSRCs)
-	} else {
-		e.logf("[raw][%s] WARNING: no local SSRCs found in local %s SDP — RTCP will use dummy SSRC", bridgeID, sdpType)
 	}
-	// Extract video media SSRC from FID groups for NACK SenderSSRC.
 	for rtxSSRC, mediaSSRC := range fidGroups {
 		_ = rtxSSRC
 		session.mu.Lock()
 		session.localVideoSSRC = mediaSSRC
 		session.mu.Unlock()
-		e.logf("[raw][%s] localVideoSSRC=%d (from FID in local %s SDP)", bridgeID, mediaSSRC, sdpType)
-		break // take the first video media SSRC
+		break
 	}
-
-	// Extract CNAME from the local SDP for SDES compound RTCP.
 	if cname := ExtractCNAME(payload.SDP); cname != "" {
 		session.mu.Lock()
 		session.localCNAME = cname
 		session.mu.Unlock()
-		e.logf("[raw][%s] extracted CNAME=%q from local %s SDP", bridgeID, cname, sdpType)
 	}
-
-	// Extract transport-wide-cc extension ID for TWCC feedback.
 	if extID := ExtractTransportCCExtID(payload.SDP); extID != 0 {
 		session.transportCCExtID = extID
-		e.logf("[raw][%s] extracted transport-cc ext ID=%d from local %s SDP", bridgeID, extID, sdpType)
 	}
 
 	// Mark ICE role: offerer = controlling (Dial), answerer = controlled (Accept).
@@ -862,21 +844,15 @@ func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpTyp
 	// identify incoming packets. The extension's SDP pinning constrains what
 	// the SFU sends; this map just provides the PT→codec lookup.
 	newCodecs := ParsePTCodecMap(sdp)
-	// ── [PTMAP] dump after every SDP parse (initial + renegotiation) ───
-	DumpPTMap(sdp, fmt.Sprintf("%s-%s", map[bool]string{true: "local", false: "remote"}[isLocal], sdpType), newCodecs, e.logf)
 	// Populate RTX mappings into session.
 	for rtxPT, mediaPT := range extractFmtpAPT(sdp) {
 		session.rtxMapping.set(rtxPT, mediaPT)
-		e.logf("[RTX] PT=%d retransmits PT=%d (from %s %s SDP)",
-			rtxPT, mediaPT, map[bool]string{true: "local", false: "remote"}[isLocal], sdpType)
 	}
 	// Populate RTX SSRC→media SSRC mapping from FID groups.
 	for rtxSSRC, mediaSSRC := range ExtractFIDGroups(sdp) {
 		session.rtxSSRCMu.Lock()
 		session.rtxSSRCtoMedia[rtxSSRC] = mediaSSRC
 		session.rtxSSRCMu.Unlock()
-		e.logf("[RTX] SSRC=%d is RTX for mediaSSRC=%d (FID from %s %s SDP)",
-			rtxSSRC, mediaSSRC, map[bool]string{true: "local", false: "remote"}[isLocal], sdpType)
 	}
 	session.mu.Lock()
 	added := 0
@@ -887,10 +863,6 @@ func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpTyp
 		}
 	}
 	session.mu.Unlock()
-	if added > 0 {
-		e.logf("[raw][%s] renegotiation %s: merged %d new codec(s) into ptCodecMap (total=%d)",
-			bridgeID, sdpType, added, len(session.ptCodecMap))
-	}
 
 	if isLocal {
 		allSSRCs := ExtractAllSSRCs(sdp)
@@ -898,17 +870,13 @@ func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpTyp
 			session.mu.Lock()
 			session.localSenderSSRC = allSSRCs[0]
 			session.mu.Unlock()
-			e.logf("[raw][%s] renegotiation %s: extracted local SenderSSRC %d (all: %v)", bridgeID, sdpType, allSSRCs[0], allSSRCs)
 		}
-		// Update localVideoSSRC from FID groups in local renegotiation answer.
 		for _, mediaSSRC := range ExtractFIDGroups(sdp) {
 			session.mu.Lock()
 			session.localVideoSSRC = mediaSSRC
 			session.mu.Unlock()
-			e.logf("[raw][%s] renegotiation %s: localVideoSSRC=%d (from FID)", bridgeID, sdpType, mediaSSRC)
 			break
 		}
-		// Re-extract CNAME and transport-cc ext ID (may change during renegotiation)
 		if cname := ExtractCNAME(sdp); cname != "" {
 			session.mu.Lock()
 			session.localCNAME = cname
@@ -918,33 +886,12 @@ func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpTyp
 			session.transportCCExtID = extID
 		}
 	} else {
-		// Extract video SSRCs and inject them for proactive PLI.
 		videoSSRCs := ExtractVideoSSRCs(sdp)
 		for _, ssrc := range videoSSRCs {
 			session.trackVideoSSRC(ssrc)
 		}
-		if len(videoSSRCs) > 0 {
-			e.logf("[raw][%s] extracted %d video SSRC(s) from %s SDP for proactive PLI: %v",
-				bridgeID, len(videoSSRCs), sdpType, videoSSRCs)
-		}
-
-		// ── TWCC Asymmetry Fix ─────────────────────────────────────────────
-		// The transportCCExtID is set from the LOCAL offer SDP (ext ID=3).
-		// But the SFU may REJECT transport-wide-cc in its answer and fall back
-		// to goog-remb. If we keep extID=3, the REMB branch in the heartbeat
-		// loop is permanently bypassed — the SFU gets NO bandwidth signal.
-		//
-		// Fix: re-extract from the REMOTE SDP and overwrite unconditionally.
-		// If the SFU accepted TWCC:  remoteExtID > 0 → keep TWCC path.
-		// If the SFU rejected TWCC:  remoteExtID = 0 → REMB fallback fires.
+		// TWCC Asymmetry Fix: re-extract from remote SDP.
 		remoteExtID := ExtractTransportCCExtID(sdp)
-		if remoteExtID != session.transportCCExtID {
-			e.logf("[raw][%s] transport-cc ext ID updated from remote %s SDP: %d → %d (TWCC %s)",
-				bridgeID, sdpType,
-				session.transportCCExtID, remoteExtID,
-				map[bool]string{true: "ACTIVE", false: "REJECTED → REMB fallback"}[remoteExtID != 0],
-			)
-		}
 		session.transportCCExtID = remoteExtID
 	}
 }
@@ -952,28 +899,19 @@ func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpTyp
 // ─── Renegotiation Handlers ───────────────────────────────────────────────────
 
 func (e *Engine) handleRenegotiationLocal(conn *websocket.Conn, session *rawShadowSession, bridgeID string, sdpType string, sdp string) {
-	e.logf("[raw][%s] SHADOW_LOCAL %s during active session — treating as renegotiation", bridgeID, sdpType)
-
 	// Update codecs and SSRCs from the new local SDP
 	e.mergeCodecsAndSSRCs(session, bridgeID, sdpType, sdp, true)
-
-	// Sync loopback tracks in case the local SDP carries codec PTs not yet
-	// represented in the loopback session (mirrors the remote path).
 	e.syncLoopbackTracks(bridgeID, session)
 
-	// Fetch existing transport credentials
 	ready, err := session.GetTransportCredentials(sdpType)
 	if err != nil {
-		e.logf("[raw][%s] failed to get transport credentials for renegotiation: %v", bridgeID, err)
+		e.logf("[raw][%s] renegotiation credentials failed: %v", bridgeID, err)
 		return
 	}
-
-	// Send SHADOW_READY to unblock the frontend's createAnswer/createOffer await
 	if err := writeJSONPacket(conn, "RTC_SHADOW_READY", ready); err != nil {
-		e.logf("[raw][%s] send SHADOW_READY for renegotiation failed: %v", bridgeID, err)
+		e.logf("[raw][%s] renegotiation SHADOW_READY send failed: %v", bridgeID, err)
 		return
 	}
-	e.logf("[raw][%s] [Renegotiation Answer Sent] SHADOW_READY sent bridgeId=%s sdpType=%s", bridgeID, bridgeID, sdpType)
 }
 
 // syncLoopbackTracks snapshots the session's current codec map under the
@@ -986,12 +924,9 @@ func (e *Engine) syncLoopbackTracks(bridgeID string, session *rawShadowSession) 
 	e.relayMu.Unlock()
 
 	if ls == nil {
-		// Loopback session not yet created (SRTP not ready) — nothing to sync.
-		e.logf("[bcr_client][loopback] syncLoopbackTracks: no session yet for bridgeId=%s — skipping", bridgeID)
 		return
 	}
 
-	// Snapshot codec map under session mutex (same pattern as onRTPPacket closure).
 	session.mu.Lock()
 	ptMap := make(map[uint8]CodecInfo, len(session.ptCodecMap))
 	for k, v := range session.ptCodecMap {
@@ -1000,9 +935,6 @@ func (e *Engine) syncLoopbackTracks(bridgeID string, session *rawShadowSession) 
 	session.mu.Unlock()
 
 	filtered := FilterPTCodecMapToPreferred(ptMap, e.cfg.PreferredCodecs)
-	e.logf("[bcr_client][loopback] syncLoopbackTracks bridgeId=%s totalCodecs=%d preferredCodecs=%d",
-		bridgeID, len(ptMap), len(filtered))
-
 	ls.SyncTracksFromCodecMap(filtered)
 }
 

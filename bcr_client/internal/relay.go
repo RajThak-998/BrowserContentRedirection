@@ -1,6 +1,7 @@
 package engine
 
-// relay.go — Bridges raw decrypted RTP from the shadow transport to the WebM muxer.
+// relay.go — Bridges raw decrypted RTP from the shadow transport to the
+// loopback PeerConnection which feeds the Wails WebView <video> element.
 
 import (
 	"strings"
@@ -8,6 +9,9 @@ import (
 
 	"github.com/pion/rtp"
 )
+
+// loopbackWriteCount tracks total packets written to loopback for sampled logging.
+var loopbackWriteCount uint64
 
 // Sampled RTP packet counters for diagnostic logging.
 var (
@@ -117,4 +121,11 @@ func (e *Engine) onRawRTPPacket(bridgeID string, pkt *rtp.Packet, ptCodecMap map
 
 	// Forward the allowlisted, decrypted RTP packet to the loopback PeerConnection.
 	session.WriteRTP(pkt)
+
+	// Sampled loopback confirmation — first packet + every 500th.
+	n := atomic.AddUint64(&loopbackWriteCount, 1)
+	if n == 1 || n%500 == 0 {
+		e.logf("[loopback][relay] WriteRTP #%d bridgeId=%s PT=%d SSRC=%d seq=%d",
+			n, bridgeID, pkt.Header.PayloadType, pkt.SSRC, pkt.SequenceNumber)
+	}
 }

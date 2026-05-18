@@ -533,8 +533,12 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 		iceConn *ice.Conn
 		err     error
 	)
-	if s.isOfferer {
-		s.logf("[raw][%s] ICE Dial (controlling — Go was oferer)", s.bridgeID)
+	
+	isRemoteIceLite := strings.Contains(remoteSDP, "a=ice-lite")
+	isControlling := s.isOfferer || isRemoteIceLite
+
+	if isControlling {
+		s.logf("[raw][%s] ICE Dial (controlling — Go was offerer or remote is ice-lite)", s.bridgeID)
 		iceConn, err = s.iceAgent.Dial(ctx, remoteUfrag, remotePwd)
 	} else {
 		s.logf("[raw][%s] ICE Accept (controlled — Go was answerer)", s.bridgeID)
@@ -572,12 +576,15 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	)
 	const (
 		exporterLabel = "EXTRACTOR-dtls_srtp"
-		materialLen   = 60 // 2×(16-byte key + 14-byte salt) AES_CM_HMAC_SHA1_80
 	)
 
 	dtlsCfg := &dtls.Config{
 		Certificates:           []tls.Certificate{s.cert},
-		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AES128_CM_HMAC_SHA1_80, dtls.SRTP_AEAD_AES_128_GCM},
+		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{
+			dtls.SRTP_AEAD_AES_128_GCM,
+			dtls.SRTP_AES128_CM_HMAC_SHA1_80,
+			dtls.SRTP_AES128_CM_HMAC_SHA1_32,
+		},
 		InsecureSkipVerify:     true, // skip chain verify; fingerprint verified below
 		VerifyConnection: func(st *dtls.State) error {
 			vcCalled = true
@@ -629,6 +636,23 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 		return fmt.Errorf("DTLS handshake incomplete: no SRTP profile negotiated (profile=%v ok=%v)", srtpProfile, profileOK)
 	}
 
+	var keyLen, saltLen int
+	switch srtpProfile {
+	case dtls.SRTP_AES128_CM_HMAC_SHA1_80, dtls.SRTP_AES128_CM_HMAC_SHA1_32:
+		keyLen = 16
+		saltLen = 14
+	case dtls.SRTP_AEAD_AES_128_GCM:
+		keyLen = 16
+		saltLen = 12
+	case dtls.SRTP_AEAD_AES_256_GCM:
+		keyLen = 32
+		saltLen = 12
+	default:
+		_ = dtlsConn.Close()
+		return fmt.Errorf("unsupported negotiated SRTP profile: %v", srtpProfile)
+	}
+	materialLen := (keyLen + saltLen) * 2
+
 	// Export keying material from the completed connection state.
 	st, stOK := dtlsConn.ConnectionState()
 	if !stOK {
@@ -660,7 +684,7 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 
 	// ── Step 8: SRTP key derivation ────────────────────────────────────────────
 	goIsClient := role == "client"
-	srtpCtx, srtcpCtx, err := deriveSRTPContextFromMaterial(capturedKeyMaterial, goIsClient, s.logf, s.bridgeID)
+	srtpCtx, srtcpCtx, err := deriveSRTPContextFromMaterial(capturedKeyMaterial, goIsClient, srtp.ProtectionProfile(srtpProfile), keyLen, saltLen, s.logf, s.bridgeID)
 	if err != nil {
 		return fmt.Errorf("derive SRTP context: %w", err)
 	}
@@ -888,40 +912,13 @@ func (s *rawShadowSession) rtcpHeartbeatLoop(ctx context.Context) {
 			if s.transportCCExtID == 0 {
 				pkts = append(pkts, &rtcp.ReceiverEstimatedMaximumBitrate{
 					SenderSSRC: senderSSRC,
-					Bitrate:    5_000_000, // 5 Mbps
+					Bitrate:    5_000_000,
 					SSRCs:      videoSSRCs,
 				})
-				if heartbeatCount <= 5 || heartbeatCount%30 == 0 {
-					s.logf("[REMB] bitrate=5000000 targets=%v reason=startup-default heartbeat=%d",
-						videoSSRCs, heartbeatCount)
-				}
 			}
 
-			// ── [RTCP-TX] composition log ───────────────────────────────────
-			if heartbeatCount <= 5 || heartbeatCount%10 == 0 {
-				var descs []string
-				for _, p := range pkts {
-					switch v := p.(type) {
-					case *rtcp.ReceiverReport:
-						for _, rr := range v.Reports {
-							descs = append(descs, fmt.Sprintf("RR(ssrc=%d frac=%d lost=%d seq=%d jitter=%d lsr=%d dlsr=%d)",
-								rr.SSRC, rr.FractionLost, rr.TotalLost, rr.LastSequenceNumber, rr.Jitter, rr.LastSenderReport, rr.Delay))
-						}
-						if len(v.Reports) == 0 {
-							descs = append(descs, fmt.Sprintf("RR(ssrc=%d no-reports)", v.SSRC))
-						}
-					case *rtcp.SourceDescription:
-						descs = append(descs, "SDES(cname=...)") // cname is private
-					case *rtcp.PictureLossIndication:
-						descs = append(descs, fmt.Sprintf("PLI(mediaSSRC=%d)", v.MediaSSRC))
-					case *rtcp.ReceiverEstimatedMaximumBitrate:
-						descs = append(descs, fmt.Sprintf("REMB(bitrate=%.0f ssrcs=%v)", v.Bitrate, v.SSRCs))
-					default:
-						descs = append(descs, fmt.Sprintf("%T", p))
-					}
-				}
-				s.logf("[RTCP-TX] heartbeat#%d packets=[%s]", heartbeatCount, strings.Join(descs, ", "))
-			}
+
+
 
 			// Increment RTCP counters for [MEDIA-SUMMARY].
 			s.rtcpMu.Lock()
@@ -1124,11 +1121,10 @@ func (s *rawShadowSession) sendCompoundRTCP(pkts []rtcp.Packet, label string, co
 		return
 	}
 	if s.iceConn != nil {
-		n, writeErr := s.iceConn.Write(encrypted)
+		_, writeErr := s.iceConn.Write(encrypted)
 		s.srtcpWriteMu.Unlock()
-		if count <= 5 || count%10 == 0 {
-			s.logf("[raw][%s] [RTCP] %s #%d sent: senderSSRC=%d reports=%d plis=%d bytes=%d err=%v",
-				s.bridgeID, label, count, senderSSRC, nReports, nPLIs, n, writeErr)
+		if writeErr != nil {
+			s.logf("[raw][%s] [RTCP] %s #%d write failed: %v", s.bridgeID, label, count, writeErr)
 		}
 	} else {
 		s.srtcpWriteMu.Unlock()
@@ -1228,15 +1224,7 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 	if s.seenPTs == nil {
 		s.seenPTs = make(map[uint8]int64)
 	}
-	pktCount := s.seenPTs[header.PayloadType]
-	s.seenPTs[header.PayloadType] = pktCount + 1
-	if pktCount == 0 {
-		s.logf("[raw][%s] [DIAG] first packet with PT=%d SSRC=%d",
-			s.bridgeID, header.PayloadType, header.SSRC)
-	} else if pktCount%1000 == 0 {
-		s.logf("[raw][%s] [DIAG] PT=%d SSRC=%d count=%d",
-			s.bridgeID, header.PayloadType, header.SSRC, pktCount)
-	}
+	s.seenPTs[header.PayloadType]++
 	s.seenPTsMu.Unlock()
 
 	// ── Unmarshal full RTP packet (used for H264 inspection + relay) ───
@@ -1267,9 +1255,7 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 				st.role = roleRTXVideo
 				st.codec = fmt.Sprintf("video/rtx(apt=%d)", mediaPT)
 			}
-			s.logf("[RTP-STREAM] SSRC=%d PT=%d codec=%s role=%s firstSeq=%d firstTS=%d",
-				header.SSRC, header.PayloadType, st.codec, st.role,
-				header.SequenceNumber, header.Timestamp)
+
 		}
 		// Gap / reorder detection.
 		if st.seqInitiated {
@@ -1309,18 +1295,14 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 	ci, ciOK := s.ptCodecMap[header.PayloadType]
 	s.mu.Unlock()
 	if ciOK && strings.Contains(strings.ToUpper(ci.MimeType), "H264") && len(pkt.Payload) > 0 {
-		nalType, isKF := InspectH264NAL(pkt.Payload)
+		_, isKF := InspectH264NAL(pkt.Payload)
 		if isKF {
-			s.logf("[H264] SSRC=%d nalType=%s keyframe=true seq=%d ts=%d",
-				header.SSRC, nalType, header.SequenceNumber, header.Timestamp)
 			if st, _ := s.ssrcReg.getOrCreate(header.SSRC); st != nil {
 				st.mu.Lock()
 				st.keyframeCount++
 				st.lastKeyframe = time.Now()
 				st.mu.Unlock()
 			}
-		} else if nalType == H264SPS || nalType == H264PPS {
-			s.logf("[H264] SSRC=%d received %s seq=%d", header.SSRC, nalType, header.SequenceNumber)
 		}
 	}
 
@@ -1373,8 +1355,6 @@ func (s *rawShadowSession) processInboundSRTCP(encrypted []byte) {
 				receivedAt: now,
 			}
 			s.lastSRBySSRCMu.Unlock()
-			s.logf("[RTCP-RX] SR ssrc=%d ntp=%d rtpTime=%d pkts=%d bytes=%d",
-				v.SSRC, v.NTPTime, v.RTPTime, v.PacketCount, v.OctetCount)
 		default:
 			// RR, NACK, PLI, FIR, REMB — handled silently.
 			// Health visible via [MEDIA-SUMMARY] and [RTCP-TX] logs.
@@ -1589,37 +1569,36 @@ func sha256ColonHex(data []byte) string {
 }
 
 // deriveSRTPContextFromMaterial builds SRTP/SRTCP contexts from pre-exported
-// 60-byte key material (2× 16-byte key + 14-byte salt for AES_CM_HMAC_SHA1_80).
-// This is the primary path: material is captured in the VerifyConnection callback
-// while masterSecret is live, completely avoiding ConnectionState() timing issues.
-func deriveSRTPContextFromMaterial(material []byte, goIsClient bool, logf func(string, ...any), bridgeID string) (*srtp.Context, *srtp.Context, error) {
-	const materialLen = 60
-	if len(material) != materialLen {
-		return nil, nil, fmt.Errorf("unexpected material length: got %d, want %d", len(material), materialLen)
+// key material based on the negotiated SRTP profile.
+// This is the primary path: material is exported after HandshakeContext completes.
+func deriveSRTPContextFromMaterial(material []byte, goIsClient bool, profile srtp.ProtectionProfile, keyLen, saltLen int, logf func(string, ...any), bridgeID string) (*srtp.Context, *srtp.Context, error) {
+	expectedLen := (keyLen + saltLen) * 2
+	if len(material) != expectedLen {
+		return nil, nil, fmt.Errorf("unexpected material length: got %d, want %d", len(material), expectedLen)
 	}
 
 	var inboundKey, inboundSalt []byte
 	var outboundKey, outboundSalt []byte
 	if goIsClient {
 		// RFC 5764 §4.2: client_write_key | server_write_key | client_write_salt | server_write_salt
-		outboundKey = material[0:16] // client writes (Go sends)
-		inboundKey = material[16:32] // server writes (Teams sends to Go)
-		outboundSalt = material[32:46]
-		inboundSalt = material[46:60]
+		outboundKey = material[0:keyLen]
+		inboundKey = material[keyLen : keyLen*2]
+		outboundSalt = material[keyLen*2 : keyLen*2+saltLen]
+		inboundSalt = material[keyLen*2+saltLen : expectedLen]
 	} else {
 		// Go is DTLS server (answerer)
-		inboundKey = material[0:16]   // client writes (Teams sends)
-		outboundKey = material[16:32] // server writes (Go sends)
-		inboundSalt = material[32:46]
-		outboundSalt = material[46:60]
+		inboundKey = material[0:keyLen]
+		outboundKey = material[keyLen : keyLen*2]
+		inboundSalt = material[keyLen*2 : keyLen*2+saltLen]
+		outboundSalt = material[keyLen*2+saltLen : expectedLen]
 	}
 
-	logf("[raw][%s] SRTP inbound key[0:4]=%x salt[0:4]=%x goIsClient=%v",
-		bridgeID, inboundKey[:4], inboundSalt[:4], goIsClient)
+	logf("[raw][%s] SRTP inbound key[0:4]=%x salt[0:4]=%x goIsClient=%v profile=%v",
+		bridgeID, inboundKey[:4], inboundSalt[:4], goIsClient, profile)
 
 	inboundCtx, err := srtp.CreateContext(
 		inboundKey, inboundSalt,
-		srtp.ProtectionProfileAes128CmHmacSha1_80,
+		profile,
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("srtp.CreateContext (inbound): %w", err)
@@ -1627,7 +1606,7 @@ func deriveSRTPContextFromMaterial(material []byte, goIsClient bool, logf func(s
 
 	outboundCtx, err := srtp.CreateContext(
 		outboundKey, outboundSalt,
-		srtp.ProtectionProfileAes128CmHmacSha1_80,
+		profile,
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("srtp.CreateContext (outbound): %w", err)
@@ -1750,13 +1729,7 @@ func (s *rawShadowSession) sendNACK(mediaSSRC uint32, missing []uint16) {
 		s.logf("[NACK-TX] write failed SSRC=%d: %v", mediaSSRC, writeErr)
 		return
 	}
-	// Log sampled NACK-TX (every 10th to reduce noise).
-	s.rtcpMu.Lock()
-	nackTotal := s.rtcpNACKCount
-	s.rtcpMu.Unlock()
-	if nackTotal <= 3 || nackTotal%10 == 0 {
-		s.logf("[NACK-TX] sent NACK senderSSRC=%d mediaSSRC=%d pairs=%d seqs=%v", senderSSRC, mediaSSRC, len(pairs), missing)
-	}
+
 }
 
 // decapsulateRTX implements RFC 4588 RTX packet processing.
@@ -1847,8 +1820,8 @@ func (s *rawShadowSession) getPTForSSRC(ssrc uint32) uint8 {
 	return 0
 }
 
-// mediaSummaryLoop emits a compact [MEDIA-SUMMARY] block every 5 seconds for
-// the lifetime of the SRTP session. Observability only — no media side-effects.
+// mediaSummaryLoop kept as a placeholder — logging disabled for clean output.
+// Re-enable by uncommenting the EmitMediaSummary call below.
 func (s *rawShadowSession) mediaSummaryLoop(ctx context.Context) {
 	const interval = 5 * time.Second
 	ticker := time.NewTicker(interval)
@@ -1859,29 +1832,15 @@ func (s *rawShadowSession) mediaSummaryLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.mu.Lock()
-			ptMap := make(map[uint8]CodecInfo, len(s.ptCodecMap))
-			for k, v := range s.ptCodecMap {
-				ptMap[k] = v
-			}
-			s.mu.Unlock()
-
-			s.rtcpMu.Lock()
-			rr := s.rtcpRRCount
-			remb := s.rtcpREMBCount
-			pli := s.rtcpPLICount
-			nack := s.rtcpNACKCount
-			s.rtcpMu.Unlock()
-
-			EmitMediaSummary(
-				s.bridgeID,
-				s.ssrcReg,
-				ptMap,
-				s.rtxMapping,
-				rr, remb, pli, nack,
-				interval.Seconds(),
-				s.logf,
-			)
+			// Logging disabled. Uncomment to restore 5-second health summary:
+			// s.mu.Lock()
+			// ptMap := make(map[uint8]CodecInfo, len(s.ptCodecMap))
+			// for k, v := range s.ptCodecMap { ptMap[k] = v }
+			// s.mu.Unlock()
+			// s.rtcpMu.Lock()
+			// rr, remb, pli, nack := s.rtcpRRCount, s.rtcpREMBCount, s.rtcpPLICount, s.rtcpNACKCount
+			// s.rtcpMu.Unlock()
+			// EmitMediaSummary(s.bridgeID, s.ssrcReg, ptMap, s.rtxMapping, rr, remb, pli, nack, interval.Seconds(), s.logf)
 		}
 	}
 }

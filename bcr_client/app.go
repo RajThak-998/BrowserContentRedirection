@@ -46,6 +46,7 @@ func (a *App) startup(ctx context.Context) {
 		engine.Config{ListenAddr: ":8081"},
 		engine.Callbacks{
 			OnLoopbackOffer: func(bridgeID string, sdp string) {
+				log.Printf("[bcr_client][loopback] emitting onLocalLoopbackOffer to frontend bridgeId=%s sdpLen=%d", bridgeID, len(sdp))
 				runtime.EventsEmit(a.ctx, "onLocalLoopbackOffer", bridgeID, sdp)
 			},
 			OnVideoUpdate: func(update engine.VideoUpdate) {
