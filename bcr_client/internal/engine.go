@@ -767,7 +767,30 @@ func (e *Engine) ensureLoopbackSession(bridgeID string, session *rawShadowSessio
 		e.logf("[bcr_client][loopback] session created concurrently for bridgeId=%s — skipping", bridgeID)
 		return
 	}
-	ls := newLoopbackSession(bridgeID, e.logf, e.cb.OnLoopbackOffer, filteredForPreCreate)
+	ls := newLoopbackSession(
+		bridgeID,
+		e.logf,
+		e.cb.OnLoopbackOffer,
+		filteredForPreCreate,
+		// onRequestKeyframe
+		func(bID string, ssrc uint32) {
+			e.shadowMu.Lock()
+			session := e.rawSessions[bID]
+			e.shadowMu.Unlock()
+			if session != nil {
+				session.requestKeyframe(ssrc)
+			}
+		},
+		// onNACK
+		func(bID string, ssrc uint32, missing []uint16) {
+			e.shadowMu.Lock()
+			session := e.rawSessions[bID]
+			e.shadowMu.Unlock()
+			if session != nil {
+				session.sendNACK(ssrc, missing)
+			}
+		},
+	)
 	e.loopbackSessions[bridgeID] = ls
 	e.relayMu.Unlock()
 

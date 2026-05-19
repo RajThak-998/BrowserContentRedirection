@@ -4,12 +4,13 @@ go 1.24.0
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/wailsapp/wails/v2 v2.11.0
+	github.com/wailsapp/wails/v2 v2.12.0
 )
 
 require github.com/pion/webrtc/v4 v4.2.11
 
 require (
+	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
 	github.com/pion/datachannel v1.6.0 // indirect
 	github.com/pion/interceptor v0.1.44 // indirect
 	github.com/pion/sctp v1.9.4 // indirect

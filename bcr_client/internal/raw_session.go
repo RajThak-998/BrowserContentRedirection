@@ -582,6 +582,7 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 		Certificates:           []tls.Certificate{s.cert},
 		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{
 			dtls.SRTP_AEAD_AES_128_GCM,
+			dtls.SRTP_AEAD_AES_256_GCM,
 			dtls.SRTP_AES128_CM_HMAC_SHA1_80,
 			dtls.SRTP_AES128_CM_HMAC_SHA1_32,
 		},
