@@ -216,6 +216,17 @@ BCR/
 │   └── frontend/              # Wails WebKit renderer
 └── video-telemetry-extension/ # Manifest V3 Chrome extension
 ```
+---
+
+## Dynamic Virtual Channel Plugin
+
+To compile the RDP dynamic virtual channel plugin DLL using `g++` inside MSYS2 / MinGW, run the following:
+```bash
+cd bcr_client/dvc_plugin
+g++ -shared -o bcr_dvc_plugin.dll dvc_plugin.cpp -lwtsapi32 -lws2_32 -lole32 -luuid
+```
+
+For registry loading and registration instructions, please refer to [walkthrough.md](file:///C:/Users/rajds/.gemini/antigravity-ide/brain/abd4e48b-94bb-433a-b921-0f92633efc60/walkthrough.md).
 
 ---
 

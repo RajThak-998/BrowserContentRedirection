@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -306,91 +308,116 @@ func handleMediaBinaryFrame(data []byte, registry *Registry) {
 }
 
 const (
-	bridgeControlURL     = "ws://localhost:8081?channel=control"
-	bridgeDataURL        = "ws://localhost:8081?channel=data"
 	bridgeReconnectDelay = 2 * time.Second
 	bridgeControlQueue   = 512
-	bridgeDataQueue      = 512
-
-	// Safe mode toggle:
-	// "all" (default), "video-only", "audio-only"
-	bridgeFilterMode = "all"
 )
 
 type bridgeMessage struct {
 	msgType    int
-	kind       string
 	data       []byte
 	packetType string
 	bridgeID   string
-
-	track string
-	mime  string
-	seq   int64
-	init  bool
 }
 
-type bridgeChunk struct {
-	track string
-	mime  string
-	seq   int64
-	init  bool
-	data  []byte
+type SignalingConn interface {
+	WriteMessage(msgType int, data []byte) error
+	ReadMessage() (int, []byte, error)
+	Close() error
+}
+
+type TCPSignalingConn struct {
+	net.Conn
+}
+
+func (c *TCPSignalingConn) WriteMessage(msgType int, data []byte) error {
+	length := uint32(len(data))
+	if err := binary.Write(c.Conn, binary.BigEndian, length); err != nil {
+		return err
+	}
+	_, err := c.Conn.Write(data)
+	return err
+}
+
+func (c *TCPSignalingConn) ReadMessage() (int, []byte, error) {
+	var length uint32
+	if err := binary.Read(c.Conn, binary.BigEndian, &length); err != nil {
+		return 0, nil, err
+	}
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(c.Conn, payload); err != nil {
+		return 0, nil, err
+	}
+	return 1, payload, nil // 1 = TextMessage
+}
+
+type DVCSignalingConn struct {
+	*DVCConn
+}
+
+func (d *DVCSignalingConn) WriteMessage(msgType int, data []byte) error {
+	length := uint32(len(data))
+	lengthBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lengthBuf, length)
+	if _, err := d.DVCConn.Write(lengthBuf); err != nil {
+		return err
+	}
+	_, err := d.DVCConn.Write(data)
+	return err
+}
+
+func (d *DVCSignalingConn) ReadMessage() (int, []byte, error) {
+	lengthBuf := make([]byte, 4)
+	if _, err := io.ReadFull(d.DVCConn, lengthBuf); err != nil {
+		return 0, nil, err
+	}
+	length := binary.BigEndian.Uint32(lengthBuf)
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(d.DVCConn, payload); err != nil {
+		return 0, nil, err
+	}
+	return 1, payload, nil // 1 = TextMessage
 }
 
 type bridgeForwarder struct {
 	startOnce sync.Once
-	controlCh chan bridgeMessage
-	dataCh    chan bridgeMessage
+	sendCh    chan bridgeMessage
 }
 
 var mediaBridge = newBridgeForwarder()
 
 func newBridgeForwarder() *bridgeForwarder {
 	return &bridgeForwarder{
-		controlCh: make(chan bridgeMessage, bridgeControlQueue),
-		dataCh:    make(chan bridgeMessage, bridgeDataQueue),
+		sendCh: make(chan bridgeMessage, bridgeControlQueue),
 	}
-}
-
-func (b *bridgeForwarder) writeLoop(conn *websocket.Conn, sendCh <-chan bridgeMessage, channel string) error {
-	for msg := range sendCh {
-		if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
-			log.Printf("[Bridge] ERROR send failed channel=%s type=%d kind=%s: %v", channel, msg.msgType, msg.kind, err)
-			return err
-		}
-
-		if msg.kind == "telemetry" {
-			if msg.packetType == PacketTypeRTCShadowRemote ||
-				msg.packetType == PacketTypeRTCShadowLocal ||
-				msg.packetType == PacketTypeRTCShadowClose ||
-				msg.packetType == PacketTypeRTCShadowCandidate {
-				log.Printf("[Bridge] SHADOW_UP -> client type=%s bridgeId=%s", msg.packetType, msg.bridgeID)
-			}
-			continue
-		}
-	}
-
-	return nil
 }
 
 func (b *bridgeForwarder) start() {
 	b.startOnce.Do(func() {
-		go b.runControlPath()
-		go b.runDataPath()
+		go b.runBridgeLoop()
 	})
 }
 
-func (b *bridgeForwarder) runControlPath() {
+func (b *bridgeForwarder) runBridgeLoop() {
 	for {
-		conn, _, err := websocket.DefaultDialer.Dial(bridgeControlURL, nil)
-		if err != nil {
-			log.Printf("[Bridge] control reconnecting... dial failed: %v", err)
-			time.Sleep(bridgeReconnectDelay)
-			continue
-		}
+		var conn SignalingConn
+		var err error
 
-		log.Printf("[Bridge] control connected to bcr_client")
+		log.Println("[Bridge] Attempting to open RDP Dynamic Virtual Channel 'BCR_VC'...")
+		dvcConn, err := OpenDVC("BCR_VC")
+		if err == nil {
+			log.Println("[Bridge] Successfully opened RDP Dynamic Virtual Channel 'BCR_VC'")
+			conn = &DVCSignalingConn{DVCConn: dvcConn}
+		} else {
+			log.Printf("[Bridge] DVC not available (%v). Falling back to TCP loopback to localhost:8081...", err)
+			tcpConn, tcpErr := net.Dial("tcp", "127.0.0.1:8081")
+			if tcpErr != nil {
+				log.Printf("[Bridge] TCP fallback dial failed: %v. Retrying in %v...", tcpErr, bridgeReconnectDelay)
+				time.Sleep(bridgeReconnectDelay)
+				continue
+			}
+			log.Println("[Bridge] Successfully connected to bcr_client over TCP loopback on 127.0.0.1:8081")
+			conn = &TCPSignalingConn{Conn: tcpConn}
+		}
 
 		readDone := make(chan struct{})
 		go func() {
@@ -398,10 +425,11 @@ func (b *bridgeForwarder) runControlPath() {
 			for {
 				msgType, data, err := conn.ReadMessage()
 				if err != nil {
+					log.Printf("[Bridge] connection read error: %v", err)
 					return
 				}
 
-				if msgType != websocket.TextMessage {
+				if msgType != 1 {
 					continue
 				}
 
@@ -425,94 +453,30 @@ func (b *bridgeForwarder) runControlPath() {
 			}
 		}()
 
-		err = b.writeLoop(conn, b.controlCh, "control")
-		if err != nil {
-			log.Printf("[Bridge] control disconnected: %v", err)
-		} else {
-			log.Printf("[Bridge] control disconnected")
+		// Write loop
+		for msg := range b.sendCh {
+			if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
+				log.Printf("[Bridge] connection write error: %v", err)
+				break
+			}
+
+			if msg.packetType == PacketTypeRTCShadowRemote ||
+				msg.packetType == PacketTypeRTCShadowLocal ||
+				msg.packetType == PacketTypeRTCShadowClose ||
+				msg.packetType == PacketTypeRTCShadowCandidate {
+				log.Printf("[Bridge] SHADOW_UP -> client type=%s bridgeId=%s", msg.packetType, msg.bridgeID)
+			}
 		}
 
 		_ = conn.Close()
 		<-readDone
-		log.Printf("[Bridge] control reconnecting...")
+		log.Println("[Bridge] Reconnecting bridge path...")
 		time.Sleep(bridgeReconnectDelay)
-	}
-}
-
-func (b *bridgeForwarder) runDataPath() {
-	for {
-		conn, _, err := websocket.DefaultDialer.Dial(bridgeDataURL, nil)
-		if err != nil {
-			log.Printf("[Bridge] data reconnecting... dial failed: %v", err)
-			time.Sleep(bridgeReconnectDelay)
-			continue
-		}
-
-		log.Printf("[Bridge] data connected to bcr_client")
-
-		err = b.writeLoop(conn, b.dataCh, "data")
-		if err != nil {
-			log.Printf("[Bridge] data disconnected: %v", err)
-		} else {
-			log.Printf("[Bridge] data disconnected")
-		}
-
-		_ = conn.Close()
-		log.Printf("[Bridge] data reconnecting...")
-		time.Sleep(bridgeReconnectDelay)
-	}
-}
-
-func bridgeShouldForward(track string, isInit bool) (bool, string) {
-	// Always forward init segments.
-	if isInit {
-		return true, ""
-	}
-
-	// Optional safety gate by track.
-	switch bridgeFilterMode {
-	case "all":
-		return true, ""
-	case "video-only":
-		if track == "video" {
-			return true, ""
-		}
-		return false, "filter_mode_video_only"
-	case "audio-only":
-		if track == "audio" {
-			return true, ""
-		}
-		return false, "filter_mode_audio_only"
-	default:
-		return false, "invalid_filter_mode"
 	}
 }
 
 func (b *bridgeForwarder) tryForwardBinary(track, mime string, seq int64, isInit bool, data []byte) {
-	b.start()
-	ok, reason := bridgeShouldForward(track, isInit)
-	if !ok {
-		log.Printf("[Bridge] SKIP track=%s reason=%s", track, reason)
-		return
-	}
-
-	payload := append([]byte(nil), data...)
-
-	select {
-	case b.dataCh <- bridgeMessage{
-		msgType: websocket.BinaryMessage,
-		kind:    "media",
-		data:    payload,
-		track:   track,
-		mime:    mime,
-		seq:     seq,
-		init:    isInit,
-	}:
-	default:
-		if isInit {
-			log.Printf("[Bridge] SKIP media init reason=data_queue_full track=%s", track)
-		}
-	}
+	// Binary media chunks are legacy; media flows directly to bcr_client over direct raw WebRTC.
 }
 
 func (b *bridgeForwarder) tryForwardText(data []byte) {
@@ -523,7 +487,7 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 		packetType == PacketTypeRTCShadowClose ||
 		packetType == PacketTypeRTCShadowCandidate
 
-	if len(b.controlCh) > (bridgeControlQueue*3)/4 {
+	if len(b.sendCh) > (bridgeControlQueue*3)/4 {
 		if isShadow {
 			log.Printf("[Bridge] SHADOW_UP dropped reason=bridge_busy type=%s bridgeId=%s", packetType, bridgeID)
 		}
@@ -533,9 +497,8 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 	payload := append([]byte(nil), data...)
 
 	select {
-	case b.controlCh <- bridgeMessage{
-		msgType:    websocket.TextMessage,
-		kind:       "telemetry",
+	case b.sendCh <- bridgeMessage{
+		msgType:    1,
 		data:       payload,
 		packetType: packetType,
 		bridgeID:   bridgeID,

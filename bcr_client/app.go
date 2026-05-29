@@ -5,13 +5,11 @@ import (
 	"log"
 	"math"
 	"net"
-	"net/http"
 	"sync"
 	"time"
 
 	"bcr_client/internal"
 
-	"github.com/gorilla/websocket"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -167,11 +165,6 @@ func (a *App) SetWindowSize(width int, height int) {
 	runtime.WindowSetSize(a.ctx, width, height)
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow from any origin for desktop app
-	},
-}
 
 func (a *App) applyWindowFromTelemetry(x, y, w, h float64) {
 	ix := int(math.Round(x))

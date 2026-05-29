@@ -3,31 +3,61 @@ package engine
 import (
 	"context"
 	"crypto/md5"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/pion/rtp"
 )
 
-// Engine manages the WebSocket bridge between the browser extension (via bcr_host)
+// SignalingConn defines the interface for bridge control messaging.
+type SignalingConn interface {
+	WriteMessage(msgType int, data []byte) error
+	ReadMessage() (int, []byte, error)
+	Close() error
+}
+
+// TCPSignalingConn adapts a raw net.Conn to frame and unframe messages
+// using a [4-byte Big-Endian Length][JSON payload] format.
+type TCPSignalingConn struct {
+	net.Conn
+}
+
+func (c *TCPSignalingConn) WriteMessage(msgType int, data []byte) error {
+	length := uint32(len(data))
+	if err := binary.Write(c.Conn, binary.BigEndian, length); err != nil {
+		return err
+	}
+	_, err := c.Conn.Write(data)
+	return err
+}
+
+func (c *TCPSignalingConn) ReadMessage() (int, []byte, error) {
+	var length uint32
+	if err := binary.Read(c.Conn, binary.BigEndian, &length); err != nil {
+		return 0, nil, err
+	}
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(c.Conn, payload); err != nil {
+		return 0, nil, err
+	}
+	return 1, payload, nil // 1 = TextMessage
+}
+
+// Engine manages the dynamic virtual channel (or TCP loopback bridge) between the browser extension (via bcr_host)
 // and the local raw ICE/DTLS/SRTP shadow transport + Pion relay to the Wails frontend.
 type Engine struct {
 	cfg Config
 	cb  Callbacks
 
-	upgrader websocket.Upgrader
-	server   *http.Server
-
 	bridgeMu    sync.RWMutex
-	controlConn *websocket.Conn
-	dataConn    *websocket.Conn
+	controlConn SignalingConn
 
 	shadowMu       sync.Mutex
 	rawSessions    map[string]*rawShadowSession
@@ -60,11 +90,8 @@ func New(cfg Config, cb Callbacks) *Engine {
 	}
 
 	return &Engine{
-		cfg: cfg,
-		cb:  cb,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
+		cfg:              cfg,
+		cb:               cb,
 		rawSessions:      make(map[string]*rawShadowSession),
 		loopbackSessions: make(map[string]*loopbackSession),
 		bridgeRetry:      make(map[string]bridgeRetryState),
@@ -72,126 +99,68 @@ func New(cfg Config, cb Callbacks) *Engine {
 }
 
 func (e *Engine) Run(ctx context.Context) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", e.handleWS)
-
-	e.server = &http.Server{
-		Addr:    e.cfg.ListenAddr,
-		Handler: mux,
+	listener, err := net.Listen("tcp", e.cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to start TCP listener on %s: %w", e.cfg.ListenAddr, err)
 	}
+	defer listener.Close()
 
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = e.server.Shutdown(shutdownCtx)
+		_ = listener.Close()
 	}()
 
-	e.logf("[bcr_client] websocket server listening on %s", e.cfg.ListenAddr)
-	err := e.server.ListenAndServe()
-	if err == http.ErrServerClosed {
-		return nil
+	e.logf("[bcr_client] TCP signaling server listening on %s", e.cfg.ListenAddr)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				e.logf("[bcr_client] TCP accept error: %v", err)
+				continue
+			}
+		}
+
+		go e.handleTCPConnection(conn)
 	}
-	return err
 }
 
-func (e *Engine) handleWS(w http.ResponseWriter, r *http.Request) {
-	channel := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("channel")))
-	if channel == "" {
-		channel = "control"
-	}
+func (e *Engine) handleTCPConnection(netConn net.Conn) {
+	conn := &TCPSignalingConn{Conn: netConn}
 
-	if channel != "control" && channel != "data" {
-		http.Error(w, "invalid channel", http.StatusBadRequest)
-		return
+	e.bridgeMu.Lock()
+	if e.controlConn != nil {
+		_ = e.controlConn.Close()
 	}
+	e.controlConn = conn
+	e.bridgeMu.Unlock()
 
-	conn, err := e.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		e.logf("[bcr_client] websocket upgrade failed: %v", err)
-		return
-	}
-
-	previous := e.setBridgeConn(channel, conn)
-	if previous != nil && previous != conn {
-		_ = previous.Close()
-	}
-
-	e.logf("[bcr_client] websocket bridge connected channel=%s", channel)
+	e.logf("[bcr_client] TCP signaling connection accepted from %s", netConn.RemoteAddr())
 
 	defer func() {
-		e.clearBridgeConn(channel, conn)
+		e.bridgeMu.Lock()
+		if e.controlConn == conn {
+			e.controlConn = nil
+		}
+		e.bridgeMu.Unlock()
 		_ = conn.Close()
-		e.logf("[bcr_client] websocket bridge disconnected channel=%s", channel)
+		e.logf("[bcr_client] TCP signaling connection closed")
 	}()
-
-	if channel == "data" {
-		e.readDataLoop(conn)
-		return
-	}
 
 	e.readControlLoop(conn)
 }
 
-func (e *Engine) setBridgeConn(channel string, conn *websocket.Conn) *websocket.Conn {
-	e.bridgeMu.Lock()
-	defer e.bridgeMu.Unlock()
-
-	var previous *websocket.Conn
-	if channel == "control" {
-		previous = e.controlConn
-		e.controlConn = conn
-		return previous
-	}
-
-	previous = e.dataConn
-	e.dataConn = conn
-	return previous
-}
-
-func (e *Engine) clearBridgeConn(channel string, conn *websocket.Conn) {
-	e.bridgeMu.Lock()
-	defer e.bridgeMu.Unlock()
-
-	if channel == "control" && e.controlConn == conn {
-		e.controlConn = nil
-	}
-
-	if channel == "data" && e.dataConn == conn {
-		e.dataConn = nil
-	}
-}
-
-func (e *Engine) isDataConnected() bool {
-	e.bridgeMu.RLock()
-	defer e.bridgeMu.RUnlock()
-
-	return e.dataConn != nil
-}
-
-func (e *Engine) waitForDataChannel(timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		if e.isDataConnected() {
-			return true
-		}
-
-		if time.Now().After(deadline) {
-			return false
-		}
-
-		time.Sleep(25 * time.Millisecond)
-	}
-}
-
-func (e *Engine) readControlLoop(conn *websocket.Conn) {
+func (e *Engine) readControlLoop(conn SignalingConn) {
 	for {
 		mt, message, err := conn.ReadMessage()
 		if err != nil {
 			return
 		}
 
-		if mt != websocket.TextMessage {
+		if mt != 1 { // 1 = TextMessage
 			continue
 		}
 
@@ -202,21 +171,6 @@ func (e *Engine) readControlLoop(conn *websocket.Conn) {
 		if e.handleVideoUpdate(message) {
 			continue
 		}
-	}
-}
-
-func (e *Engine) readDataLoop(conn *websocket.Conn) {
-	for {
-		mt, message, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		if mt != websocket.BinaryMessage {
-			continue
-		}
-
-		e.logf("[bcr_client] dropped legacy binary media chunk (%d bytes) - loopback active", len(message))
 	}
 }
 
@@ -324,7 +278,7 @@ const (
 
 // triggerConnect starts a Connect attempt for the given generation token.
 // It is the *only* call-site that transitions a session into stateConnecting.
-func (e *Engine) triggerConnect(conn *websocket.Conn, bridgeID string, session *rawShadowSession, remoteSDP string, sdpType string, gen uint32) {
+func (e *Engine) triggerConnect(conn SignalingConn, bridgeID string, session *rawShadowSession, remoteSDP string, sdpType string, gen uint32) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -389,7 +343,7 @@ func (e *Engine) triggerConnect(conn *websocket.Conn, bridgeID string, session *
 	}()
 }
 
-func (e *Engine) retryBridge(conn *websocket.Conn, bridgeID string, session *rawShadowSession, remoteSDP string, sdpType string, backoff time.Duration) {
+func (e *Engine) retryBridge(conn SignalingConn, bridgeID string, session *rawShadowSession, remoteSDP string, sdpType string, backoff time.Duration) {
 	e.logf("[raw][%s] delaying retry attempt by %s", bridgeID, backoff)
 	time.Sleep(backoff)
 
@@ -420,7 +374,7 @@ func (e *Engine) retryBridge(conn *websocket.Conn, bridgeID string, session *raw
 // handleShadowLocal is called when the browser fires its local SDP event
 // (setLocalDescription). This is phase 1 of the raw transport: generate a
 // self-signed cert + ICE agent, gather candidates, and return SHADOW_READY.
-func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalPayload) {
+func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPayload) {
 	if payload.BridgeID == "" || payload.SDP == "" {
 		e.sendShadowError(conn, payload.BridgeID, "validate_local", nil, false)
 		return
@@ -543,7 +497,7 @@ func (e *Engine) handleShadowLocal(conn *websocket.Conn, payload RTCShadowLocalP
 // SDP description (setRemoteDescription). For the offerer path this is the SFU's
 // answer — trigger Connect(). For the answerer path this is the SFU's offer — store
 // the remote SDP so Init(answer) can call Connect() after it finishes.
-func (e *Engine) handleShadowRemote(conn *websocket.Conn, payload RTCShadowRemotePayload) {
+func (e *Engine) handleShadowRemote(conn SignalingConn, payload RTCShadowRemotePayload) {
 	if payload.BridgeID == "" || payload.SDP == "" {
 		e.sendShadowError(conn, payload.BridgeID, "validate_remote", nil, false)
 		return
@@ -652,7 +606,7 @@ func (e *Engine) handleShadowICECandidate(payload RTCShadowCandidatePayload) {
 
 // ─── handleShadowPacket ───────────────────────────────────────────────────────
 
-func (e *Engine) handleShadowPacket(conn *websocket.Conn, message []byte) bool {
+func (e *Engine) handleShadowPacket(conn SignalingConn, message []byte) bool {
 	var pkt Packet
 	if err := json.Unmarshal(message, &pkt); err != nil {
 		return false
@@ -921,7 +875,7 @@ func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpTyp
 
 // ─── Renegotiation Handlers ───────────────────────────────────────────────────
 
-func (e *Engine) handleRenegotiationLocal(conn *websocket.Conn, session *rawShadowSession, bridgeID string, sdpType string, sdp string) {
+func (e *Engine) handleRenegotiationLocal(conn SignalingConn, session *rawShadowSession, bridgeID string, sdpType string, sdp string) {
 	// Update codecs and SSRCs from the new local SDP
 	e.mergeCodecsAndSSRCs(session, bridgeID, sdpType, sdp, true)
 	e.syncLoopbackTracks(bridgeID, session)
@@ -984,7 +938,7 @@ func (e *Engine) handleRenegotiationRemote(session *rawShadowSession, bridgeID s
 
 // ─── Utility Functions ────────────────────────────────────────────────────────
 
-func (e *Engine) sendShadowError(conn *websocket.Conn, bridgeID, stage string, err error, retryable bool) {
+func (e *Engine) sendShadowError(conn SignalingConn, bridgeID, stage string, err error, retryable bool) {
 	reason := "unknown"
 	if err != nil {
 		reason = err.Error()
@@ -998,7 +952,7 @@ func (e *Engine) sendShadowError(conn *websocket.Conn, bridgeID, stage string, e
 	})
 }
 
-func writeJSONPacket(conn *websocket.Conn, packetType string, payload any) error {
+func writeJSONPacket(conn SignalingConn, packetType string, payload any) error {
 	payloadRaw, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -1007,7 +961,7 @@ func writeJSONPacket(conn *websocket.Conn, packetType string, payload any) error
 	if err != nil {
 		return err
 	}
-	return conn.WriteMessage(websocket.TextMessage, out)
+	return conn.WriteMessage(1, out) // 1 = TextMessage
 }
 
 func detectLocalIPv4() string {
