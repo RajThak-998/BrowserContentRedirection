@@ -252,7 +252,18 @@ public:
 extern "C" __declspec(dllexport) HRESULT VCAPITYPE VirtualChannelEntry(
     PCHANNEL_ENTRY_POINTS pEntryPoints
 ) {
+    if (!pEntryPoints) return E_INVALIDARG;
+
+    // Check size of CHANNEL_ENTRY_POINTS to ensure it has EX fields
+    if (pEntryPoints->cbSize < sizeof(CHANNEL_ENTRY_POINTS_EX)) {
+        return E_FAIL;
+    }
+
     PCHANNEL_ENTRY_POINTS_EX pEntryPointsEx = (PCHANNEL_ENTRY_POINTS_EX)pEntryPoints;
+    if (!pEntryPointsEx->pVirtualChannelInitListenerEx) {
+        return E_FAIL;
+    }
+
     CDVCPlugin* pPlugin = new CDVCPlugin();
     HRESULT hr = pEntryPointsEx->pVirtualChannelInitListenerEx(pEntryPoints, pPlugin);
     pPlugin->Release();
