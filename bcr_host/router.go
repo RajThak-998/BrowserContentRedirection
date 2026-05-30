@@ -333,10 +333,10 @@ type TCPSignalingConn struct {
 
 func (c *TCPSignalingConn) WriteMessage(msgType int, data []byte) error {
 	length := uint32(len(data))
-	if err := binary.Write(c.Conn, binary.BigEndian, length); err != nil {
-		return err
-	}
-	_, err := c.Conn.Write(data)
+	buf := make([]byte, 4+length)
+	binary.BigEndian.PutUint32(buf[0:4], length)
+	copy(buf[4:], data)
+	_, err := c.Conn.Write(buf)
 	return err
 }
 

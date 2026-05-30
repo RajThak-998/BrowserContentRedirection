@@ -67,7 +67,11 @@ public:
             m_socket = INVALID_SOCKET;
         }
         if (m_socketThread.joinable()) {
-            m_socketThread.join();
+            if (m_socketThread.get_id() != std::this_thread::get_id()) {
+                m_socketThread.join();
+            } else {
+                m_socketThread.detach();
+            }
         }
     }
 
