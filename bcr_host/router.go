@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -356,26 +358,33 @@ type DVCSignalingConn struct {
 
 func (d *DVCSignalingConn) WriteMessage(msgType int, data []byte) error {
 	length := uint32(len(data))
-	lengthBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lengthBuf, length)
-	if _, err := d.DVCConn.Write(lengthBuf); err != nil {
-		return err
-	}
-	_, err := d.DVCConn.Write(data)
-	return err
+	payload := make([]byte, 4+length)
+	binary.BigEndian.PutUint32(payload[0:4], length)
+	copy(payload[4:], data)
+	return d.DVCConn.WriteMessage(payload)
 }
 
 func (d *DVCSignalingConn) ReadMessage() (int, []byte, error) {
-	lengthBuf := make([]byte, 4)
-	if _, err := io.ReadFull(d.DVCConn, lengthBuf); err != nil {
-		return 0, nil, err
+	for {
+		data, err := d.DVCConn.ReadMessage(250)
+		if err != nil {
+			// ErrTimeout means 250ms elapsed with no data — this is normal.
+			// Loop and retry rather than killing the bridge.
+			if errors.Is(err, ErrTimeout) {
+				continue
+			}
+			return 0, nil, err
+		}
+		if len(data) < 4 {
+			return 0, nil, fmt.Errorf("dvc signaling: packet too short (%d bytes)", len(data))
+		}
+		length := binary.BigEndian.Uint32(data[0:4])
+		if int(length)+4 > len(data) {
+			return 0, nil, fmt.Errorf("dvc signaling: short packet, expected %d payload bytes, got %d", length, len(data)-4)
+		}
+		payload := data[4 : 4+length]
+		return 1, payload, nil // 1 = TextMessage
 	}
-	length := binary.BigEndian.Uint32(lengthBuf)
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(d.DVCConn, payload); err != nil {
-		return 0, nil, err
-	}
-	return 1, payload, nil // 1 = TextMessage
 }
 
 type bridgeForwarder struct {
@@ -405,7 +414,7 @@ func (b *bridgeForwarder) runBridgeLoop() {
 		log.Println("[Bridge] Attempting to open RDP Dynamic Virtual Channel 'BCR_VC'...")
 		dvcConn, err := OpenDVC("BCR_VC")
 		if err == nil {
-			log.Println("[Bridge] Successfully opened RDP Dynamic Virtual Channel 'BCR_VC'")
+			log.Println("[Bridge] ✅ DVC transport active — signaling via RDP Dynamic Virtual Channel 'BCR_VC'")
 			conn = &DVCSignalingConn{DVCConn: dvcConn}
 		} else {
 			log.Printf("[Bridge] DVC not available (%v). Falling back to TCP loopback to localhost:8081...", err)
@@ -415,16 +424,44 @@ func (b *bridgeForwarder) runBridgeLoop() {
 				time.Sleep(bridgeReconnectDelay)
 				continue
 			}
-			log.Println("[Bridge] Successfully connected to bcr_client over TCP loopback on 127.0.0.1:8081")
+			log.Println("[Bridge] ✅ TCP transport active — signaling via TCP loopback 127.0.0.1:8081")
 			conn = &TCPSignalingConn{Conn: tcpConn}
 		}
 
-		readDone := make(chan struct{})
+		stopCh := make(chan struct{})
+		var stopOnce sync.Once
+		triggerStop := func(reason string) {
+			stopOnce.Do(func() {
+				log.Printf("[Bridge] Triggering bridge shutdown, reason: %s", reason)
+				close(stopCh)
+				_ = conn.Close() // Force-close underlying connection to unblock any pending read/write operations
+			})
+		}
+
+		var wg sync.WaitGroup
+
+		// Read loop
+		wg.Add(1)
 		go func() {
-			defer close(readDone)
+			defer func() {
+				triggerStop("read loop exited")
+				wg.Done()
+			}()
 			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+				}
+
 				msgType, data, err := conn.ReadMessage()
 				if err != nil {
+					// If we were stopped, ignore any errors as they are expected due to connection close
+					select {
+					case <-stopCh:
+						return
+					default:
+					}
 					log.Printf("[Bridge] connection read error: %v", err)
 					return
 				}
@@ -454,22 +491,48 @@ func (b *bridgeForwarder) runBridgeLoop() {
 		}()
 
 		// Write loop
-		for msg := range b.sendCh {
-			if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
-				log.Printf("[Bridge] connection write error: %v", err)
-				break
-			}
+		wg.Add(1)
+		go func() {
+			defer func() {
+				triggerStop("write loop exited")
+				wg.Done()
+			}()
+			for {
+				select {
+				case msg := <-b.sendCh:
+					select {
+					case <-stopCh:
+						return
+					default:
+					}
 
-			if msg.packetType == PacketTypeRTCShadowRemote ||
-				msg.packetType == PacketTypeRTCShadowLocal ||
-				msg.packetType == PacketTypeRTCShadowClose ||
-				msg.packetType == PacketTypeRTCShadowCandidate {
-				log.Printf("[Bridge] SHADOW_UP -> client type=%s bridgeId=%s", msg.packetType, msg.bridgeID)
-			}
-		}
+					if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
+						select {
+						case <-stopCh:
+							return
+						default:
+						}
+						log.Printf("[Bridge] connection write error: %v", err)
+						return
+					}
 
-		_ = conn.Close()
-		<-readDone
+					if msg.packetType == PacketTypeRTCShadowRemote ||
+						msg.packetType == PacketTypeRTCShadowLocal ||
+						msg.packetType == PacketTypeRTCShadowClose ||
+						msg.packetType == PacketTypeRTCShadowCandidate {
+						log.Printf("[Bridge] SHADOW_UP -> client type=%s bridgeId=%s", msg.packetType, msg.bridgeID)
+					}
+
+				case <-stopCh:
+					return
+				}
+			}
+		}()
+
+		// Wait for both read and write loops to fully exit
+		<-stopCh
+		wg.Wait()
+
 		log.Println("[Bridge] Reconnecting bridge path...")
 		time.Sleep(bridgeReconnectDelay)
 	}

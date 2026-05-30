@@ -39,16 +39,19 @@ typedef struct tagCHANNEL_ENTRY_POINTS_EX {
 #define CHANNEL_NAME "BCR_VC"
 #define LOCAL_PORT 8081
 
+#include <atomic>
+
 class CDVCChannelCallback : public IWTSVirtualChannelCallback {
 private:
     ULONG m_cRef;
     IWTSVirtualChannel* m_pChannel;
     SOCKET m_socket;
     std::thread m_socketThread;
-    bool m_bClosed;
+    std::atomic<bool> m_bClosed;
 
 public:
-    CDVCChannelCallback(IWTSVirtualChannel* pChannel) : m_cRef(1), m_pChannel(pChannel), m_socket(INVALID_SOCKET), m_bClosed(false) {
+    CDVCChannelCallback(IWTSVirtualChannel* pChannel) 
+        : m_cRef(1), m_pChannel(pChannel), m_socket(INVALID_SOCKET), m_bClosed(false) {
         m_pChannel->AddRef();
     }
 
@@ -68,44 +71,70 @@ public:
         }
     }
 
-    void StartSocketReader() {
+    void StartTCPBridgeThread() {
         m_socketThread = std::thread([this]() {
+            WSADATA wsaData;
+            if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
+                OutputDebugStringA("BCR DLL: WSAStartup failed in bridge thread.");
+                m_pChannel->Close();
+                return;
+            }
+
+            sockaddr_in addr = {0};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(LOCAL_PORT);
+            inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+            while (!m_bClosed) {
+                m_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (m_socket == INVALID_SOCKET) {
+                    OutputDebugStringA("BCR DLL: Socket creation failed in bridge thread.");
+                    break;
+                }
+
+                OutputDebugStringA("BCR DLL: Connecting to 127.0.0.1:8081...");
+                if (connect(m_socket, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
+                    OutputDebugStringA("BCR DLL: Bidirectional TCP connection established with local player!");
+                    break;
+                }
+
+                // Close socket for retry
+                closesocket(m_socket);
+                m_socket = INVALID_SOCKET;
+
+                // Cooldown retry delay (1 second) checking m_bClosed
+                for (int i = 0; i < 10 && !m_bClosed; i++) {
+                    Sleep(100);
+                }
+            }
+
+            if (m_bClosed || m_socket == INVALID_SOCKET) {
+                if (m_socket != INVALID_SOCKET) {
+                    closesocket(m_socket);
+                    m_socket = INVALID_SOCKET;
+                }
+                m_pChannel->Close();
+                return;
+            }
+
+            // TCP connected. Forward TCP to DVC.
             std::vector<char> buffer(65536);
             while (!m_bClosed) {
                 int bytesRead = recv(m_socket, buffer.data(), (int)buffer.size(), 0);
                 if (bytesRead <= 0) {
+                    OutputDebugStringA("BCR DLL: TCP connection lost/closed.");
                     break;
                 }
                 m_pChannel->Write((ULONG)bytesRead, (BYTE*)buffer.data(), NULL);
             }
+
+            CloseConnections();
             m_pChannel->Close();
         });
     }
 
-    HRESULT InitializeTCP() {
-        WSADATA wsaData;
-        if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) return E_FAIL;
-
-        m_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (m_socket == INVALID_SOCKET) return E_FAIL;
-
-        sockaddr_in addr = {0};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(LOCAL_PORT);
-        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-        if (connect(m_socket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-            closesocket(m_socket);
-            m_socket = INVALID_SOCKET;
-            return E_FAIL;
-        }
-
-        StartSocketReader();
-        return S_OK;
-    }
-
     // IUnknown
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) {
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
         if (!ppvObject) return E_POINTER;
         if (riid == IID_IUnknown || riid == __uuidof(IWTSVirtualChannelCallback)) {
             *ppvObject = this;
@@ -116,18 +145,18 @@ public:
         return E_NOINTERFACE;
     }
 
-    ULONG STDMETHODCALLTYPE AddRef() {
+    ULONG STDMETHODCALLTYPE AddRef() override {
         return InterlockedIncrement(&m_cRef);
     }
 
-    ULONG STDMETHODCALLTYPE Release() {
+    ULONG STDMETHODCALLTYPE Release() override {
         ULONG res = InterlockedDecrement(&m_cRef);
         if (res == 0) delete this;
         return res;
     }
 
     // IWTSVirtualChannelCallback
-    HRESULT STDMETHODCALLTYPE OnDataReceived(ULONG cbSize, BYTE* pBuffer) {
+    HRESULT STDMETHODCALLTYPE OnDataReceived(ULONG cbSize, BYTE* pBuffer) override {
         if (m_socket != INVALID_SOCKET) {
             int sent = send(m_socket, (const char*)pBuffer, (int)cbSize, 0);
             if (sent == SOCKET_ERROR) {
@@ -138,7 +167,7 @@ public:
         return S_OK;
     }
 
-    HRESULT STDMETHODCALLTYPE OnClose() {
+    HRESULT STDMETHODCALLTYPE OnClose() override {
         CloseConnections();
         return S_OK;
     }
@@ -152,7 +181,7 @@ public:
     CDVCListenerCallback() : m_cRef(1) {}
 
     // IUnknown
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) {
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
         if (!ppvObject) return E_POINTER;
         if (riid == IID_IUnknown || riid == __uuidof(IWTSListenerCallback)) {
             *ppvObject = this;
@@ -163,11 +192,11 @@ public:
         return E_NOINTERFACE;
     }
 
-    ULONG STDMETHODCALLTYPE AddRef() {
+    ULONG STDMETHODCALLTYPE AddRef() override {
         return InterlockedIncrement(&m_cRef);
     }
 
-    ULONG STDMETHODCALLTYPE Release() {
+    ULONG STDMETHODCALLTYPE Release() override {
         ULONG res = InterlockedDecrement(&m_cRef);
         if (res == 0) delete this;
         return res;
@@ -179,16 +208,19 @@ public:
         BSTR pData,
         BOOL* pbAccept,
         IWTSVirtualChannelCallback** ppCallback
-    ) {
+    ) override {
+        OutputDebugStringA("BCR DLL: OnNewChannelConnection triggered!");
         *pbAccept = FALSE;
         *ppCallback = NULL;
 
         CDVCChannelCallback* pChanCallback = new CDVCChannelCallback(pChannel);
-        if (pChanCallback->InitializeTCP() == S_OK) {
-            *pbAccept = TRUE;
-            *ppCallback = pChanCallback;
-            pChanCallback->AddRef();
-        }
+        pChanCallback->StartTCPBridgeThread();
+
+        OutputDebugStringA("BCR DLL: Accepting channel and starting background TCP retry bridge.");
+        *pbAccept = TRUE;
+        *ppCallback = pChanCallback;
+        pChanCallback->AddRef();
+
         pChanCallback->Release();
         return S_OK;
     }
@@ -248,24 +280,37 @@ public:
     }
 };
 
-// Exported initialization function
-extern "C" __declspec(dllexport) HRESULT VCAPITYPE VirtualChannelEntry(
-    PCHANNEL_ENTRY_POINTS pEntryPoints
+// Exported entrypoint used by RDP DVC client LoadLibrary activation: VirtualChannelGetInstance
+extern "C" __declspec(dllexport) HRESULT __stdcall VirtualChannelGetInstance(
+    REFIID requestedIid,
+    ULONG* pNumObjs,
+    VOID** ppObjArray
 ) {
-    if (!pEntryPoints) return E_INVALIDARG;
+    OutputDebugStringA("BCR DLL: VirtualChannelGetInstance called!");
+    if (!pNumObjs) return E_POINTER;
 
-    // Check size of CHANNEL_ENTRY_POINTS to ensure it has EX fields
-    if (pEntryPoints->cbSize < sizeof(CHANNEL_ENTRY_POINTS_EX)) {
-        return E_FAIL;
+    // We expose exactly one object: IWTSPlugin
+    if (!ppObjArray) {
+        *pNumObjs = 1;
+        return S_OK;
     }
 
-    PCHANNEL_ENTRY_POINTS_EX pEntryPointsEx = (PCHANNEL_ENTRY_POINTS_EX)pEntryPoints;
-    if (!pEntryPointsEx->pVirtualChannelInitListenerEx) {
-        return E_FAIL;
-    }
+    if (*pNumObjs < 1) return E_INVALIDARG;
 
+    OutputDebugStringA("BCR DLL: Instantiating CDVCPlugin...");
     CDVCPlugin* pPlugin = new CDVCPlugin();
-    HRESULT hr = pEntryPointsEx->pVirtualChannelInitListenerEx(pEntryPoints, pPlugin);
-    pPlugin->Release();
+    
+    void* out = nullptr;
+    HRESULT hr = pPlugin->QueryInterface(requestedIid, &out);
+    pPlugin->Release(); // balance local ref
+
+    if (SUCCEEDED(hr)) {
+        OutputDebugStringA("BCR DLL: IWTSPlugin instance created and returned successfully!");
+        ppObjArray[0] = out;
+    } else {
+        char szBuf[128];
+        wsprintfA(szBuf, "BCR DLL: QueryInterface failed with hr=0x%08X", (unsigned int)hr);
+        OutputDebugStringA(szBuf);
+    }
     return hr;
 }
