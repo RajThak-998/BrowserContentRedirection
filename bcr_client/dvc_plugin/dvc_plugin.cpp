@@ -41,6 +41,30 @@ typedef struct tagCHANNEL_ENTRY_POINTS_EX {
 
 #include <atomic>
 
+// ── TCP I/O helpers ──────────────────────────────────────────────────────────
+// TCP is a byte stream; recv()/send() may return fewer bytes than requested.
+// These helpers loop until exactly n bytes have been transferred.
+
+static bool RecvExact(SOCKET sock, char* buf, int n) {
+    int total = 0;
+    while (total < n) {
+        int r = recv(sock, buf + total, n - total, 0);
+        if (r <= 0) return false;  // connection closed or error
+        total += r;
+    }
+    return true;
+}
+
+static bool SendAll(SOCKET sock, const char* buf, int n) {
+    int total = 0;
+    while (total < n) {
+        int s = send(sock, buf + total, n - total, 0);
+        if (s == SOCKET_ERROR) return false;
+        total += s;
+    }
+    return true;
+}
+
 class CDVCChannelCallback : public IWTSVirtualChannelCallback {
 private:
     ULONG m_cRef;
@@ -121,15 +145,41 @@ public:
                 return;
             }
 
-            // TCP connected. Forward TCP to DVC.
-            std::vector<char> buffer(65536);
+            // TCP connected. Forward complete length-prefixed frames to DVC.
+            // Protocol: [4-byte Big-Endian length][payload]
+            // Each complete frame is written as a single DVC message so that
+            // WTSVirtualChannelRead on the host receives one discrete PDU
+            // per IWTSVirtualChannel::Write (per MS DVC specification).
             while (!m_bClosed) {
-                int bytesRead = recv(m_socket, buffer.data(), (int)buffer.size(), 0);
-                if (bytesRead <= 0) {
-                    OutputDebugStringA("BCR DLL: TCP connection lost/closed.");
+                // 1. Read the 4-byte Big-Endian length prefix
+                char lenBuf[4];
+                if (!RecvExact(m_socket, lenBuf, 4)) {
+                    OutputDebugStringA("BCR DLL: TCP connection lost reading frame header.");
                     break;
                 }
-                m_pChannel->Write((ULONG)bytesRead, (BYTE*)buffer.data(), NULL);
+
+                ULONG payloadLen = ((ULONG)(unsigned char)lenBuf[0] << 24) |
+                                   ((ULONG)(unsigned char)lenBuf[1] << 16) |
+                                   ((ULONG)(unsigned char)lenBuf[2] << 8)  |
+                                   ((ULONG)(unsigned char)lenBuf[3]);
+
+                if (payloadLen > 10 * 1024 * 1024) { // 10 MB safety cap
+                    OutputDebugStringA("BCR DLL: Frame exceeds 10 MB safety cap, dropping connection.");
+                    break;
+                }
+
+                // 2. Allocate buffer for complete frame (prefix + payload)
+                std::vector<char> frame(4 + payloadLen);
+                memcpy(frame.data(), lenBuf, 4);
+
+                // 3. Read exactly payloadLen bytes of payload
+                if (payloadLen > 0 && !RecvExact(m_socket, frame.data() + 4, (int)payloadLen)) {
+                    OutputDebugStringA("BCR DLL: TCP connection lost reading frame payload.");
+                    break;
+                }
+
+                // 4. Write the complete frame as a single DVC message
+                m_pChannel->Write((ULONG)frame.size(), (BYTE*)frame.data(), NULL);
             }
 
             CloseConnections();
@@ -162,8 +212,7 @@ public:
     // IWTSVirtualChannelCallback
     HRESULT STDMETHODCALLTYPE OnDataReceived(ULONG cbSize, BYTE* pBuffer) override {
         if (m_socket != INVALID_SOCKET) {
-            int sent = send(m_socket, (const char*)pBuffer, (int)cbSize, 0);
-            if (sent == SOCKET_ERROR) {
+            if (!SendAll(m_socket, (const char*)pBuffer, (int)cbSize)) {
                 CloseConnections();
                 return E_FAIL;
             }

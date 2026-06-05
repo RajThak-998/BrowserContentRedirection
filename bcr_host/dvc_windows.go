@@ -3,7 +3,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -33,12 +32,6 @@ const (
 	WTS_CHANNEL_OPTION_DYNAMIC = 0x00000001
 )
 
-const (
-	channelFlagFirst = 0x00000001
-	channelFlagLast  = 0x00000002
-	pduHeaderSize    = 8
-)
-
 // Windows error codes relevant to DVC operations
 const (
 	ERROR_IO_INCOMPLETE  = 996
@@ -57,16 +50,6 @@ type DVCConn struct {
 	mu     sync.Mutex
 	handle syscall.Handle
 	closed bool
-
-	// internal stream buffer for PDU parsing
-	inbuf []byte
-
-	// reassembly buffer for logical messages
-	assembling bool
-	msgbuf     []byte
-
-	// hard cap to prevent OOM on corrupt header
-	maxMessage int
 }
 
 // GetCurrentSessionID returns the Terminal Services session ID for the
@@ -147,10 +130,7 @@ func OpenDVC(channelName string) (*DVCConn, error) {
 	log.Printf("[DVC] ✅ Channel %q opened successfully (handle=0x%X)", channelName, h)
 
 	return &DVCConn{
-		handle:     h,
-		inbuf:      make([]byte, 0, 128*1024),
-		msgbuf:     make([]byte, 0, 128*1024),
-		maxMessage: 64 * 1024 * 1024,
+		handle: h,
 	}, nil
 }
 
@@ -214,139 +194,80 @@ func (d *DVCConn) WriteMessage(payload []byte) error {
 	return fmt.Errorf("WTSVirtualChannelWrite failed: ERROR_INVALID_HANDLE (6) after 10 attempts")
 }
 
-// ReadMessage reads and reassembles FIRST..LAST PDUs into one logical message.
-// It tolerates partial reads and multiple PDUs in one buffer.
+// ReadMessage reads a single complete logical packet from the Dynamic Virtual Channel.
+// Dynamic Virtual Channels automatically handle fragmentation and reassembly under the hood,
+// so WTSVirtualChannelRead returns exactly the complete raw payload written by the client.
 // A timeout return from WTSVirtualChannelRead is NOT treated as a fatal error —
 // it returns ErrTimeout so callers can retry.
 func (d *DVCConn) ReadMessage(timeoutMs uint32) ([]byte, error) {
 	tmp := make([]byte, 64*1024)
 
-	for {
-		// Parse any complete PDUs already in buffer
-		if msg, ok, err := d.tryParseFromBuffer(); err != nil {
-			return nil, err
-		} else if ok {
-			return msg, nil
-		}
+	var n uint32
+	var r1 uintptr
+	var callErr error
 
-		// Need more bytes -> do a WTS read
-		var n uint32
-		var r1 uintptr
-		var callErr error
-
-		for attempt := 1; attempt <= 10; attempt++ {
-			d.mu.Lock()
-			if d.closed || d.handle == 0 {
-				d.mu.Unlock()
-				return nil, ErrClosed
-			}
-			h := d.handle
+	for attempt := 1; attempt <= 10; attempt++ {
+		d.mu.Lock()
+		if d.closed || d.handle == 0 {
 			d.mu.Unlock()
+			return nil, ErrClosed
+		}
+		h := d.handle
+		d.mu.Unlock()
 
-			r1, _, callErr = wtsVirtualChannelRead.Call(
-				uintptr(h),
-				uintptr(timeoutMs),
-				uintptr(unsafe.Pointer(&tmp[0])),
-				uintptr(len(tmp)),
-				uintptr(unsafe.Pointer(&n)),
-			)
-			if r1 != 0 {
-				break
-			}
-
-			errno, isErrno := callErr.(syscall.Errno)
-			if isErrno {
-				errCode := uint32(errno)
-				if errCode == ERROR_INVALID_HANDLE {
-					log.Printf("[DVC] Read got ERROR_INVALID_HANDLE (attempt %d/10), channel might not be fully established yet. Retrying in 100ms...", attempt)
-					time.Sleep(100 * time.Millisecond)
-					continue
-				}
-			}
+		r1, _, callErr = wtsVirtualChannelRead.Call(
+			uintptr(h),
+			uintptr(timeoutMs),
+			uintptr(unsafe.Pointer(&tmp[0])),
+			uintptr(len(tmp)),
+			uintptr(unsafe.Pointer(&n)),
+		)
+		if r1 != 0 {
 			break
 		}
 
-		if r1 == 0 {
-			d.mu.Lock()
-			closed := d.closed
-			d.mu.Unlock()
-			if closed {
-				return nil, ErrClosed
+		errno, isErrno := callErr.(syscall.Errno)
+		if isErrno {
+			errCode := uint32(errno)
+			if errCode == ERROR_INVALID_HANDLE {
+				log.Printf("[DVC] Read got ERROR_INVALID_HANDLE (attempt %d/10), channel might not be fully established yet. Retrying in 100ms...", attempt)
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
-
-			// Check if this is a timeout/no-data condition (non-fatal)
-			errno, isErrno := callErr.(syscall.Errno)
-			if isErrno {
-				errCode := uint32(errno)
-				switch errCode {
-				case ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, WAIT_TIMEOUT, ERROR_NO_DATA:
-					// Timeout or no data available — this is expected and NOT an error.
-					// Return ErrTimeout so the caller can decide to retry.
-					return nil, ErrTimeout
-				}
-			}
-
-			// Genuine error
-			return nil, fmt.Errorf("WTSVirtualChannelRead failed: %v (win32=%d/0x%X)",
-				callErr, uint32(errno), uint32(errno))
 		}
-		if n == 0 {
-			// treat as "no data" not EOF; loop again
-			continue
+		break
+	}
+
+	if r1 == 0 {
+		d.mu.Lock()
+		closed := d.closed
+		d.mu.Unlock()
+		if closed {
+			return nil, ErrClosed
 		}
 
-		d.inbuf = append(d.inbuf, tmp[:n]...)
-	}
-}
+		// Check if this is a timeout/no-data condition (non-fatal)
+		errno, isErrno := callErr.(syscall.Errno)
+		if isErrno {
+			errCode := uint32(errno)
+			switch errCode {
+			case ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, WAIT_TIMEOUT, ERROR_NO_DATA:
+				// Timeout or no data available — this is expected and NOT an error.
+				// Return ErrTimeout so the caller can decide to retry.
+				return nil, ErrTimeout
+			}
+		}
 
-func (d *DVCConn) tryParseFromBuffer() ([]byte, bool, error) {
-	// Need at least a header
-	if len(d.inbuf) < pduHeaderSize {
-		return nil, false, nil
-	}
-
-	// Peek header
-	pduLen := binary.LittleEndian.Uint32(d.inbuf[0:4])
-	flags := binary.LittleEndian.Uint32(d.inbuf[4:8])
-
-	if int(pduLen) > d.maxMessage {
-		// Corrupt; reset all state
-		d.inbuf = d.inbuf[:0]
-		d.msgbuf = d.msgbuf[:0]
-		d.assembling = false
-		return nil, false, fmt.Errorf("dvc: pdu length too large: %d", pduLen)
+		// Genuine error
+		return nil, fmt.Errorf("WTSVirtualChannelRead failed: %v (win32=%d/0x%X)",
+			callErr, uint32(errno), uint32(errno))
 	}
 
-	total := pduHeaderSize + int(pduLen)
-	if len(d.inbuf) < total {
-		// Not enough yet
-		return nil, false, nil
+	if n == 0 {
+		return nil, ErrTimeout
 	}
 
-	// Consume exactly one PDU from buffer
-	payload := d.inbuf[pduHeaderSize:total]
-	d.inbuf = d.inbuf[total:]
-
-	// Reassembly rules
-	if flags&channelFlagFirst != 0 {
-		d.msgbuf = d.msgbuf[:0]
-		d.assembling = true
-	}
-	if !d.assembling {
-		// middle/last without FIRST => protocol violation; reset
-		d.msgbuf = d.msgbuf[:0]
-		return nil, false, errors.New("dvc: got non-FIRST chunk without an active message")
-	}
-
-	d.msgbuf = append(d.msgbuf, payload...)
-
-	if flags&channelFlagLast != 0 {
-		out := make([]byte, len(d.msgbuf))
-		copy(out, d.msgbuf)
-		d.msgbuf = d.msgbuf[:0]
-		d.assembling = false
-		return out, true, nil
-	}
-
-	return nil, false, nil
+	out := make([]byte, n)
+	copy(out, tmp[:n])
+	return out, nil
 }

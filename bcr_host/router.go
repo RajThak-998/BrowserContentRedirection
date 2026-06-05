@@ -341,10 +341,19 @@ func (c *TCPSignalingConn) WriteMessage(msgType int, data []byte) error {
 }
 
 func (c *TCPSignalingConn) ReadMessage() (int, []byte, error) {
-	var length uint32
-	if err := binary.Read(c.Conn, binary.BigEndian, &length); err != nil {
+	lenBuf := make([]byte, 4)
+	if _, err := io.ReadFull(c.Conn, lenBuf); err != nil {
 		return 0, nil, err
 	}
+
+	length := binary.BigEndian.Uint32(lenBuf)
+	if length > 10*1024*1024 { // 10MB safety cap
+		leLength := binary.LittleEndian.Uint32(lenBuf)
+		if leLength <= 10*1024*1024 {
+			length = leLength
+		}
+	}
+
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(c.Conn, payload); err != nil {
 		return 0, nil, err
@@ -378,10 +387,17 @@ func (d *DVCSignalingConn) ReadMessage() (int, []byte, error) {
 		if len(data) < 4 {
 			return 0, nil, fmt.Errorf("dvc signaling: packet too short (%d bytes)", len(data))
 		}
+
 		length := binary.BigEndian.Uint32(data[0:4])
-		if int(length)+4 > len(data) {
-			return 0, nil, fmt.Errorf("dvc signaling: short packet, expected %d payload bytes, got %d", length, len(data)-4)
+		if int(length)+4 != len(data) {
+			leLength := binary.LittleEndian.Uint32(data[0:4])
+			if int(leLength)+4 == len(data) {
+				length = leLength
+			} else {
+				return 0, nil, fmt.Errorf("dvc signaling: short packet, expected BE %d or LE %d payload bytes, got %d", length, leLength, len(data)-4)
+			}
 		}
+
 		payload := data[4 : 4+length]
 		return 1, payload, nil // 1 = TextMessage
 	}
