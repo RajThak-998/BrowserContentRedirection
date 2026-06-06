@@ -370,6 +370,8 @@ func (d *DVCSignalingConn) WriteMessage(msgType int, data []byte) error {
 	payload := make([]byte, 4+length)
 	binary.BigEndian.PutUint32(payload[0:4], length)
 	copy(payload[4:], data)
+	log.Printf("[DVC DIAG] WriteMessage: %d bytes total, prefix=[%02X %02X %02X %02X]",
+		len(payload), payload[0], payload[1], payload[2], payload[3])
 	return d.DVCConn.WriteMessage(payload)
 }
 

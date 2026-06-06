@@ -205,6 +205,7 @@
     // Restore to 5 000 ms (or a tighter value like 8 000 ms) once the hang is fixed.
     const RTC_WAIT_TIMEOUT_MS = 60_000; // TODO: revert to 5_000 after Go-side hang is resolved
     const rtcStateByPeer = new WeakMap();
+    const rtcPcByBridgeId = new Map(); // bridgeId → PC (for late candidate trickle)
     const rtcReadyByBridgeId = new Map();
     const rtcWaitersByBridgeId = new Map();
     const rtcLastErrorByBridgeId = new Map();
@@ -247,6 +248,8 @@
             // Best-effort debug hint only.
             pc._bcr_id = bridgeId;
         }
+
+        rtcPcByBridgeId.set(bridgeId, pc);
 
         return entry;
     }
@@ -825,6 +828,21 @@
             if (typeof bridgeId === 'string' && bridgeId.length > 0) {
                 BCR_LOG('[BCR] Received SHADOW_ERROR bridgeId=', bridgeId, 'stage=', payload?.stage, 'reason=', payload?.reason);
                 rejectShadowReady(bridgeId, payload?.reason ?? 'shadow_error');
+            }
+        }
+
+        if (data.type === 'BCR_RTC_SHADOW_ICE_CANDIDATE') {
+            const payload = data.payload;
+            const bridgeId = payload?.bridgeId;
+            const candidateStr = payload?.candidate;
+            if (typeof bridgeId === 'string' && typeof candidateStr === 'string' && candidateStr.length > 0) {
+                const pc = rtcPcByBridgeId.get(bridgeId);
+                if (pc) {
+                    BCR_LOG('[BCR] Late ICE candidate received, trickle bridgeId=', bridgeId);
+                    dispatchShadowTrickleCandidates(pc, [candidateStr]);
+                } else {
+                    BCR_LOG('[BCR] Late ICE candidate dropped — no PC for bridgeId=', bridgeId);
+                }
             }
         }
     });

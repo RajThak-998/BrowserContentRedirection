@@ -38,8 +38,20 @@ typedef struct tagCHANNEL_ENTRY_POINTS_EX {
 
 #define CHANNEL_NAME "BCR_VC"
 #define LOCAL_PORT 8081
+#define BCR_DVC_VERSION "2.1-diag"
 
 #include <atomic>
+#include <cstdio>
+
+// Formatted debug output helper (visible in DebugView)
+static void DebugLog(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    OutputDebugStringA(buf);
+}
 
 // ── TCP I/O helpers ──────────────────────────────────────────────────────────
 // TCP is a byte stream; recv()/send() may return fewer bytes than requested.
@@ -150,6 +162,7 @@ public:
             // Each complete frame is written as a single DVC message so that
             // WTSVirtualChannelRead on the host receives one discrete PDU
             // per IWTSVirtualChannel::Write (per MS DVC specification).
+            DebugLog("BCR DLL [v%s]: Starting framed TCP->DVC bridge loop", BCR_DVC_VERSION);
             while (!m_bClosed) {
                 // 1. Read the 4-byte Big-Endian length prefix
                 char lenBuf[4];
@@ -163,8 +176,12 @@ public:
                                    ((ULONG)(unsigned char)lenBuf[2] << 8)  |
                                    ((ULONG)(unsigned char)lenBuf[3]);
 
+                DebugLog("BCR DLL: TCP frame header=[%02X %02X %02X %02X] payloadLen=%lu",
+                    (unsigned char)lenBuf[0], (unsigned char)lenBuf[1],
+                    (unsigned char)lenBuf[2], (unsigned char)lenBuf[3], payloadLen);
+
                 if (payloadLen > 10 * 1024 * 1024) { // 10 MB safety cap
-                    OutputDebugStringA("BCR DLL: Frame exceeds 10 MB safety cap, dropping connection.");
+                    DebugLog("BCR DLL: Frame exceeds 10 MB safety cap (%lu bytes), dropping.", payloadLen);
                     break;
                 }
 
@@ -178,8 +195,15 @@ public:
                     break;
                 }
 
+                DebugLog("BCR DLL: TCP->DVC writing %lu bytes (4 prefix + %lu payload)",
+                    (ULONG)frame.size(), payloadLen);
+
                 // 4. Write the complete frame as a single DVC message
-                m_pChannel->Write((ULONG)frame.size(), (BYTE*)frame.data(), NULL);
+                HRESULT hr = m_pChannel->Write((ULONG)frame.size(), (BYTE*)frame.data(), NULL);
+                if (FAILED(hr)) {
+                    DebugLog("BCR DLL: DVC Write FAILED hr=0x%08X", (unsigned int)hr);
+                    break;
+                }
             }
 
             CloseConnections();
@@ -211,8 +235,13 @@ public:
 
     // IWTSVirtualChannelCallback
     HRESULT STDMETHODCALLTYPE OnDataReceived(ULONG cbSize, BYTE* pBuffer) override {
+        DebugLog("BCR DLL: DVC->TCP OnDataReceived %lu bytes, first4=[%02X %02X %02X %02X]",
+            cbSize,
+            cbSize >= 1 ? pBuffer[0] : 0, cbSize >= 2 ? pBuffer[1] : 0,
+            cbSize >= 3 ? pBuffer[2] : 0, cbSize >= 4 ? pBuffer[3] : 0);
         if (m_socket != INVALID_SOCKET) {
             if (!SendAll(m_socket, (const char*)pBuffer, (int)cbSize)) {
+                OutputDebugStringA("BCR DLL: DVC->TCP SendAll failed");
                 CloseConnections();
                 return E_FAIL;
             }
@@ -262,7 +291,7 @@ public:
         BOOL* pbAccept,
         IWTSVirtualChannelCallback** ppCallback
     ) override {
-        OutputDebugStringA("BCR DLL: OnNewChannelConnection triggered!");
+        DebugLog("BCR DLL [v%s]: OnNewChannelConnection triggered!", BCR_DVC_VERSION);
         *pbAccept = FALSE;
         *ppCallback = NULL;
 

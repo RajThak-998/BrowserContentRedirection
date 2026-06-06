@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -195,8 +196,9 @@ func (d *DVCConn) WriteMessage(payload []byte) error {
 }
 
 // ReadMessage reads a single complete logical packet from the Dynamic Virtual Channel.
-// Dynamic Virtual Channels automatically handle fragmentation and reassembly under the hood,
-// so WTSVirtualChannelRead returns exactly the complete raw payload written by the client.
+// On some Windows builds, WTSVirtualChannelRead returns an 8-byte CHANNEL_PDU_HEADER
+// (per MS-RDPBCGR §2.2.6.1) before the application payload. This function detects and
+// strips that header so callers always receive raw application data.
 // A timeout return from WTSVirtualChannelRead is NOT treated as a fatal error —
 // it returns ErrTimeout so callers can retry.
 func (d *DVCConn) ReadMessage(timeoutMs uint32) ([]byte, error) {
@@ -269,5 +271,55 @@ func (d *DVCConn) ReadMessage(timeoutMs uint32) ([]byte, error) {
 
 	out := make([]byte, n)
 	copy(out, tmp[:n])
+
+	// ── DVC read diagnostic ──────────────────────────────────────────────
+	hexPreview := ""
+	previewLen := int(n)
+	if previewLen > 16 {
+		previewLen = 16
+	}
+	for i := 0; i < previewLen; i++ {
+		hexPreview += fmt.Sprintf("%02X ", out[i])
+	}
+	log.Printf("[DVC DIAG] ReadMessage raw: %d bytes, first %d hex: %s", n, previewLen, hexPreview)
+	// ─────────────────────────────────────────────────────────────────────
+
+	// Strip CHANNEL_PDU_HEADER if present (see stripChannelPDUHeader doc).
+	out = stripChannelPDUHeader(out)
+
 	return out, nil
+}
+
+// CHANNEL_PDU_HEADER flags from MS-RDPBCGR §2.2.6.1.
+const (
+	channelFlagFirst = 0x00000001
+	channelFlagLast  = 0x00000002
+)
+
+// stripChannelPDUHeader removes the 8-byte virtual channel PDU header that
+// WTSVirtualChannelRead includes on some Windows builds when reading from a
+// Dynamic Virtual Channel opened with WTS_CHANNEL_OPTION_DYNAMIC.
+//
+// The header format (all Little-Endian) is:
+//
+//	Offset 0: uint32  length  — byte count of application data (= total - 8)
+//	Offset 4: uint32  flags   — CHANNEL_FLAG_FIRST (0x01) | CHANNEL_FLAG_LAST (0x02)
+//
+// Detection: if LE(data[0:4]) == len(data)-8 AND flags has at least FIRST or
+// LAST set, we treat the first 8 bytes as the header and return data[8:].
+// If the pattern doesn't match, data is returned unchanged.
+func stripChannelPDUHeader(data []byte) []byte {
+	if len(data) <= 8 {
+		return data
+	}
+
+	pduLength := binary.LittleEndian.Uint32(data[0:4])
+	flags := binary.LittleEndian.Uint32(data[4:8])
+
+	if pduLength == uint32(len(data)-8) && (flags&(channelFlagFirst|channelFlagLast)) != 0 {
+		log.Printf("[DVC DIAG] Stripped 8-byte CHANNEL_PDU_HEADER (length=%d, flags=0x%X)", pduLength, flags)
+		return data[8:]
+	}
+
+	return data
 }

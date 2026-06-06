@@ -131,6 +131,14 @@
                     type: "BCR_RTC_SHADOW_ERROR",
                     payload: message.payload ?? {},
                 }, "*");
+                return;
+            }
+
+            if (message.type === "RTC_SHADOW_ICE_CANDIDATE") {
+                window.postMessage({
+                    type: "BCR_RTC_SHADOW_ICE_CANDIDATE",
+                    payload: message.payload ?? {},
+                }, "*");
             }
         };
 

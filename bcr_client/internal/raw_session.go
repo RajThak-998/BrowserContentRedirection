@@ -289,6 +289,12 @@ type rawShadowSession struct {
 	// Set by the engine after session creation.
 	onRTPPacket func(pkt *rtp.Packet)
 
+	// onLateCandidate is called for ICE candidates that arrive after SHADOW_READY
+	// has been sent (e.g. srflx/relay candidates on slow networks). Set by the
+	// engine before Init() is called so no candidates are missed.
+	onLateCandidate func(candidate string)
+	readySentCount  int // number of candidates included in SHADOW_READY
+
 	// localCredentials stores the generated ICE/DTLS transport credentials.
 	// Used to respond to renegotiation SHADOW_LOCAL events.
 	localCredentials *RTCShadowReadyPayload
@@ -413,9 +419,20 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 		}
 		line := "a=candidate:" + c.Marshal()
 		candidateMu.Lock()
+		idx := len(candidates)
 		candidates = append(candidates, line)
 		candidateMu.Unlock()
 		s.logf("[raw][%s] gathered: %s", s.bridgeID, line)
+
+		// Trickle late candidates — those arriving after SHADOW_READY was sent.
+		s.mu.Lock()
+		cb := s.onLateCandidate
+		readySent := s.state >= stateReady && s.readySentCount > 0
+		s.mu.Unlock()
+		if readySent && idx >= s.readySentCount && cb != nil {
+			s.logf("[raw][%s] late candidate (post-READY) trickle: %s", s.bridgeID, line)
+			cb(line)
+		}
 	}); err != nil {
 		return nil, fmt.Errorf("OnCandidate: %w", err)
 	}
@@ -434,8 +451,12 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	}
 	s.logf("[raw][%s] local ufrag=%s sdpType=%s", s.bridgeID, ufrag, sdpType)
 
-	// ── Step 8: Wait for gathering (3 s max) ─────────────────────────────────
-	gatherCtx, gatherCancel := context.WithTimeout(ctx, 3*time.Second)
+	// ── Step 8: Wait for gathering (7 s max) ─────────────────────────────────
+	// STUN reflexive (srflx) candidates typically arrive in 4-6 seconds when
+	// reaching external STUN servers from a corporate/VDI network. Without
+	// srflx candidates, only private-IP host candidates are sent to the SFU,
+	// making ICE connectivity impossible in split-network (VDI + local) setups.
+	gatherCtx, gatherCancel := context.WithTimeout(ctx, 7*time.Second)
 	defer gatherCancel()
 	select {
 	case <-gatherDone:
@@ -451,6 +472,7 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 
 	s.mu.Lock()
 	s.state = stateReady
+	s.readySentCount = len(candsCopy) // candidates after this index are "late"
 	s.mu.Unlock()
 
 	ready := &RTCShadowReadyPayload{

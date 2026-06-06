@@ -350,6 +350,20 @@ func (e *Engine) retryBridge(conn SignalingConn, bridgeID string, session *rawSh
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Set up late candidate trickle BEFORE Init.
+	session.mu.Lock()
+	session.onLateCandidate = func(candidate string) {
+		payload := RTCShadowCandidatePayload{
+			BridgeID:  bridgeID,
+			Candidate: candidate,
+			Timestamp: time.Now().UnixMilli(),
+		}
+		if err := writeJSONPacket(conn, "RTC_SHADOW_ICE_CANDIDATE", payload); err != nil {
+			e.logf("[raw][%s] late ICE candidate trickle failed: %v", bridgeID, err)
+		}
+	}
+	session.mu.Unlock()
+
 	ready, err := session.Init(ctx, sdpType)
 	if err != nil {
 		e.logf("[raw][%s] retry Init failed: %v", bridgeID, err)
@@ -461,6 +475,20 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+
+		// Set up late candidate trickle BEFORE Init so no candidates are missed.
+		session.mu.Lock()
+		session.onLateCandidate = func(candidate string) {
+			payload := RTCShadowCandidatePayload{
+				BridgeID:  bridgeID,
+				Candidate: candidate,
+				Timestamp: time.Now().UnixMilli(),
+			}
+			if err := writeJSONPacket(conn, "RTC_SHADOW_ICE_CANDIDATE", payload); err != nil {
+				e.logf("[raw][%s] late ICE candidate trickle failed: %v", bridgeID, err)
+			}
+		}
+		session.mu.Unlock()
 
 		ready, err := session.Init(ctx, sdpType)
 		if err != nil {

@@ -36,9 +36,7 @@ func NewApp() *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 
-	// Enable WebRTC APIs (RTCPeerConnection) in the WebKit WebView.
-	// Must run after the WebView is created, so we launch in a goroutine.
-	go EnableWebRTC()
+	
 
 	a.mediaEngine = engine.New(
 		engine.Config{ListenAddr: ":8081"},

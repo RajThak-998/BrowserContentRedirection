@@ -24,6 +24,7 @@ const RTC_UPSTREAM_TYPES = new Set([
 const RTC_DOWNSTREAM_TYPES = new Set([
     "RTC_SHADOW_READY",
     "RTC_SHADOW_ERROR",
+    "RTC_SHADOW_ICE_CANDIDATE",
 ]);
 
 // ─── Media Counters ─────────────────────────────────────────────────────────
