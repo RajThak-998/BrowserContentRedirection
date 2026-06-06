@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -363,6 +362,7 @@ func (c *TCPSignalingConn) ReadMessage() (int, []byte, error) {
 
 type DVCSignalingConn struct {
 	*DVCConn
+	buf []byte
 }
 
 func (d *DVCSignalingConn) WriteMessage(msgType int, data []byte) error {
@@ -375,33 +375,62 @@ func (d *DVCSignalingConn) WriteMessage(msgType int, data []byte) error {
 	return d.DVCConn.WriteMessage(payload)
 }
 
+func isAllZeros(data []byte) bool {
+	if len(data) == 0 {
+		return true
+	}
+	for _, b := range data {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (d *DVCSignalingConn) ReadMessage() (int, []byte, error) {
 	for {
-		data, err := d.DVCConn.ReadMessage(250)
+		if len(d.buf) >= 4 {
+			length := binary.BigEndian.Uint32(d.buf[0:4])
+			if length == 0 {
+				// Skip/discard leading zero byte (likely RDP channel padding/init)
+				d.buf = d.buf[1:]
+				continue
+			}
+			if length > 10*1024*1024 { // 10MB safety cap
+				leLength := binary.LittleEndian.Uint32(d.buf[0:4])
+				if leLength <= 10*1024*1024 {
+					length = leLength
+				} else {
+					log.Printf("[DVC DIAG] Huge packet length BE=%d LE=%d. Clearing buffer to realign.", length, leLength)
+					d.buf = nil
+					continue
+				}
+			}
+
+			if len(d.buf) >= 4+int(length) {
+				payload := make([]byte, length)
+				copy(payload, d.buf[4:4+length])
+				d.buf = d.buf[4+length:]
+				return 1, payload, nil // 1 = TextMessage
+			}
+		}
+
+		data, err := d.DVCConn.ReadMessage(20)
 		if err != nil {
-			// ErrTimeout means 250ms elapsed with no data — this is normal.
+			// ErrTimeout means 20ms elapsed with no data — this is normal.
 			// Loop and retry rather than killing the bridge.
 			if errors.Is(err, ErrTimeout) {
 				continue
 			}
 			return 0, nil, err
 		}
-		if len(data) < 4 {
-			return 0, nil, fmt.Errorf("dvc signaling: packet too short (%d bytes)", len(data))
+
+		if isAllZeros(data) {
+			log.Printf("[DVC DIAG] Discarding %d bytes of pure zero padding/keep-alive packet", len(data))
+			continue
 		}
 
-		length := binary.BigEndian.Uint32(data[0:4])
-		if int(length)+4 != len(data) {
-			leLength := binary.LittleEndian.Uint32(data[0:4])
-			if int(leLength)+4 == len(data) {
-				length = leLength
-			} else {
-				return 0, nil, fmt.Errorf("dvc signaling: short packet, expected BE %d or LE %d payload bytes, got %d", length, leLength, len(data)-4)
-			}
-		}
-
-		payload := data[4 : 4+length]
-		return 1, payload, nil // 1 = TextMessage
+		d.buf = append(d.buf, data...)
 	}
 }
 

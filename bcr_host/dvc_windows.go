@@ -165,7 +165,6 @@ func (d *DVCConn) WriteMessage(payload []byte) error {
 			return ErrClosed
 		}
 		h := d.handle
-		d.mu.Unlock()
 
 		var written uint32
 		r1, _, callErr := wtsVirtualChannelWrite.Call(
@@ -174,6 +173,7 @@ func (d *DVCConn) WriteMessage(payload []byte) error {
 			uintptr(len(payload)),
 			uintptr(unsafe.Pointer(&written)),
 		)
+		d.mu.Unlock()
 		if r1 != 0 {
 			if int(written) != len(payload) {
 				return fmt.Errorf("short write: wrote=%d expected=%d", written, len(payload))
@@ -215,7 +215,6 @@ func (d *DVCConn) ReadMessage(timeoutMs uint32) ([]byte, error) {
 			return nil, ErrClosed
 		}
 		h := d.handle
-		d.mu.Unlock()
 
 		r1, _, callErr = wtsVirtualChannelRead.Call(
 			uintptr(h),
@@ -224,6 +223,7 @@ func (d *DVCConn) ReadMessage(timeoutMs uint32) ([]byte, error) {
 			uintptr(len(tmp)),
 			uintptr(unsafe.Pointer(&n)),
 		)
+		d.mu.Unlock()
 		if r1 != 0 {
 			break
 		}
@@ -305,8 +305,9 @@ const (
 //	Offset 0: uint32  length  — byte count of application data (= total - 8)
 //	Offset 4: uint32  flags   — CHANNEL_FLAG_FIRST (0x01) | CHANNEL_FLAG_LAST (0x02)
 //
-// Detection: if LE(data[0:4]) == len(data)-8 AND flags has at least FIRST or
-// LAST set, we treat the first 8 bytes as the header and return data[8:].
+// Detection: if LE(data[0:4]) == len(data)-8 AND flags is a valid DVC flags
+// value (<= 3, covering first, middle, last, and single chunks), we treat the
+// first 8 bytes as the header and return data[8:].
 // If the pattern doesn't match, data is returned unchanged.
 func stripChannelPDUHeader(data []byte) []byte {
 	if len(data) <= 8 {
@@ -316,7 +317,7 @@ func stripChannelPDUHeader(data []byte) []byte {
 	pduLength := binary.LittleEndian.Uint32(data[0:4])
 	flags := binary.LittleEndian.Uint32(data[4:8])
 
-	if pduLength == uint32(len(data)-8) && (flags&(channelFlagFirst|channelFlagLast)) != 0 {
+	if pduLength == uint32(len(data)-8) && flags <= 3 {
 		log.Printf("[DVC DIAG] Stripped 8-byte CHANNEL_PDU_HEADER (length=%d, flags=0x%X)", pduLength, flags)
 		return data[8:]
 	}
