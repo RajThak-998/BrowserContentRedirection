@@ -399,7 +399,10 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 
 	agent, err := ice.NewAgent(&ice.AgentConfig{
 		Urls:         stunURIs,
-		NetworkTypes: []ice.NetworkType{ice.NetworkTypeUDP4},
+		NetworkTypes: []ice.NetworkType{
+			ice.NetworkTypeUDP4,
+			ice.NetworkTypeTCP4,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new ice agent: %w", err)
@@ -1655,6 +1658,9 @@ func iceServersToStunURIs(servers []IceServer, logf func(string, ...any), bridge
 			if srv.Credential != "" {
 				uri.Password = srv.Credential
 			}
+			hasCreds := srv.Username != "" || srv.Credential != ""
+			logf("[raw][%s] parsed ICE server: %s (scheme: %s, host: %s, port: %d, credentials: %t)",
+				bridgeID, rawURL, uri.Scheme, uri.Host, uri.Port, hasCreds)
 			out = append(out, uri)
 		}
 	}
