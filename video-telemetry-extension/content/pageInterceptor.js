@@ -60,6 +60,7 @@
     const origSetRemoteDescription = rtcProto?.setRemoteDescription;
     const origCreateOffer = rtcProto?.createOffer;
     const origCreateAnswer = rtcProto?.createAnswer;
+    const origSetConfiguration = rtcProto?.setConfiguration;
     const origRTCPeerConnection = window.RTCPeerConnection;
 
     // Property descriptors (needed to bypass our own patches internally)
@@ -932,6 +933,28 @@
                 configurable: true,
                 enumerable: true,
             });
+        }
+
+        if (typeof origSetConfiguration === 'function') {
+            BCR_LOG('[BCR] Hooking setConfiguration...');
+            rtcProto.setConfiguration = function patchedSetConfiguration(config, ...args) {
+                if (config && Array.isArray(config.iceServers) && config.iceServers.length > 0) {
+                    const entry = ensureRtcState(this);
+                    entry.iceServers = config.iceServers.map(s => ({
+                        urls: Array.isArray(s.urls) ? s.urls : (s.url ? [s.url] : []),
+                        username: s.username ?? '',
+                        credential: s.credential ?? '',
+                    }));
+                    BCR_LOG('[BCR] Captured dynamic setConfiguration', entry.iceServers.length, 'ICE server(s) for bridgeId=', entry.bridgeId);
+                    
+                    emitShadowEvent('BCR_RTC_SHADOW_ICE_SERVERS', {
+                        bridgeId: entry.bridgeId,
+                        iceServers: entry.iceServers,
+                        timestamp: Date.now(),
+                    });
+                }
+                return origSetConfiguration.apply(this, [config, ...args]);
+            };
         }
 
         rtcProto.setLocalDescription = async function patchedSetLocalDescription(...args) {

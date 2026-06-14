@@ -139,6 +139,20 @@ class Emitter {
         );
     }
 
+    emitRtcShadowIceServers(payload) {
+        this._sendWithRetry(
+            {
+                type: "RTC_SHADOW_ICE_SERVERS",
+                payload: {
+                    bridgeId: payload.bridgeId,
+                    iceServers: payload.iceServers ?? [],
+                    timestamp: payload.timestamp ?? Date.now(),
+                },
+            },
+            this._MAX_RETRIES
+        );
+    }
+
     emitRtcShadowClose(payload) {
         this._sendWithRetry(
             {

@@ -50,6 +50,11 @@
                 return;
             }
 
+            if (data.type === "BCR_RTC_SHADOW_ICE_SERVERS") {
+                Emitter.getInstance().emitRtcShadowIceServers(data.payload ?? {});
+                return;
+            }
+
             if (data.type === "BCR_RTC_SHADOW_ICE_CANDIDATE") {
                 Emitter.getInstance().emitRtcShadowIceCandidate(data.payload ?? {});
                 return;

@@ -316,6 +316,8 @@ func (e *Engine) triggerConnect(conn SignalingConn, bridgeID string, session *ra
 			session.mu.Lock()
 			iceServers := session.iceServers
 			ptCodecMap := session.ptCodecMap
+			cert := session.cert
+			localCreds := session.localCredentials
 			session.mu.Unlock()
 
 			e.closeShadowSession(bridgeID)
@@ -324,6 +326,8 @@ func (e *Engine) triggerConnect(conn SignalingConn, bridgeID string, session *ra
 			newSession.mu.Lock()
 			newSession.iceServers = iceServers
 			newSession.ptCodecMap = ptCodecMap
+			newSession.cert = cert
+			newSession.localCredentials = localCreds
 			newSession.isOfferer = (sdpType == "offer")
 			newSession.mu.Unlock()
 
@@ -617,6 +621,21 @@ func (e *Engine) handleShadowRemote(conn SignalingConn, payload RTCShadowRemoteP
 	}
 }
 
+// ─── handleShadowIceServers ───────────────────────────────────────────────────
+
+func (e *Engine) handleShadowIceServers(payload RTCShadowIceServersPayload) {
+	e.shadowMu.Lock()
+	session, ok := e.rawSessions[payload.BridgeID]
+	e.shadowMu.Unlock()
+
+	if !ok {
+		e.logf("[raw][%s] ICE servers for unknown session — ignored", payload.BridgeID)
+		return
+	}
+
+	session.UpdateIceServers(payload.IceServers)
+}
+
 // ─── handleShadowICECandidate ─────────────────────────────────────────────────
 
 func (e *Engine) handleShadowICECandidate(payload RTCShadowCandidatePayload) {
@@ -678,6 +697,15 @@ func (e *Engine) handleShadowPacket(conn SignalingConn, message []byte) bool {
 			return true
 		}
 		e.handleShadowICECandidate(payload)
+		return true
+
+	case "RTC_SHADOW_ICE_SERVERS":
+		var payload RTCShadowIceServersPayload
+		if err := json.Unmarshal(pkt.Payload, &payload); err != nil {
+			e.logf("[bcr_client] RTC_SHADOW_ICE_SERVERS decode failed: %v", err)
+			return true
+		}
+		e.handleShadowIceServers(payload)
 		return true
 
 	default:

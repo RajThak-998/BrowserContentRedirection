@@ -9,6 +9,7 @@ const (
 	PacketTypeRTCShadowReady     = "RTC_SHADOW_READY"
 	PacketTypeRTCShadowError     = "RTC_SHADOW_ERROR"
 	PacketTypeRTCShadowCandidate = "RTC_SHADOW_ICE_CANDIDATE"
+	PacketTypeRTCShadowIceServers = "RTC_SHADOW_ICE_SERVERS"
 )
 
 type Packet struct {
@@ -85,4 +86,16 @@ type RTCShadowErrorPayload struct {
 	Reason    string `json:"reason"`
 	Retryable bool   `json:"retryable"`
 	Timestamp int64  `json:"timestamp"`
+}
+
+type RTCShadowIceServersPayload struct {
+	BridgeID   string        `json:"bridgeId"`
+	IceServers []HostIceServer `json:"iceServers"`
+	Timestamp  int64         `json:"timestamp"`
+}
+
+type HostIceServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
 }

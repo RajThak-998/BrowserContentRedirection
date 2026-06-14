@@ -196,7 +196,7 @@ func isRTCShadowUpstreamPacket(data []byte) bool {
 	}
 
 	switch pkt.Type {
-	case PacketTypeRTCShadowRemote, PacketTypeRTCShadowLocal, PacketTypeRTCShadowClose, PacketTypeRTCShadowCandidate:
+	case PacketTypeRTCShadowRemote, PacketTypeRTCShadowLocal, PacketTypeRTCShadowClose, PacketTypeRTCShadowCandidate, PacketTypeRTCShadowIceServers:
 		return true
 	default:
 		return false
@@ -566,7 +566,8 @@ func (b *bridgeForwarder) runBridgeLoop() {
 					if msg.packetType == PacketTypeRTCShadowRemote ||
 						msg.packetType == PacketTypeRTCShadowLocal ||
 						msg.packetType == PacketTypeRTCShadowClose ||
-						msg.packetType == PacketTypeRTCShadowCandidate {
+						msg.packetType == PacketTypeRTCShadowCandidate ||
+						msg.packetType == PacketTypeRTCShadowIceServers {
 						log.Printf("[Bridge] SHADOW_UP -> client type=%s bridgeId=%s", msg.packetType, msg.bridgeID)
 					}
 
@@ -595,7 +596,8 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 	isShadow := packetType == PacketTypeRTCShadowRemote ||
 		packetType == PacketTypeRTCShadowLocal ||
 		packetType == PacketTypeRTCShadowClose ||
-		packetType == PacketTypeRTCShadowCandidate
+		packetType == PacketTypeRTCShadowCandidate ||
+		packetType == PacketTypeRTCShadowIceServers
 
 	if len(b.sendCh) > (bridgeControlQueue*3)/4 {
 		if isShadow {

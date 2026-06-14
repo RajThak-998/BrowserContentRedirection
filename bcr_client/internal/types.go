@@ -95,6 +95,12 @@ type RTCShadowErrorPayload struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+type RTCShadowIceServersPayload struct {
+	BridgeID   string      `json:"bridgeId"`
+	IceServers []IceServer `json:"iceServers"`
+	Timestamp  int64       `json:"timestamp"`
+}
+
 // CodecInfo is a minimal PT → codec descriptor used by the raw transport layer.
 // It avoids importing pion/webrtc in sdp.go while carrying the information the
 // relay needs to create TrackLocalStaticRTP with the correct MIME and clock rate.

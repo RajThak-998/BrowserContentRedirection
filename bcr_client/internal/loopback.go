@@ -30,6 +30,9 @@ type loopbackSession struct {
 	// Map of VDI PayloadType to Pion's dynamically assigned loopback PayloadType
 	boundPTs map[uint8]webrtc.PayloadType
 
+	// Map of VDI PayloadType to Pion's dynamically assigned loopback SSRC
+	boundSSRCs map[uint8]uint32
+
 	// One-time logging guard for dropped RTP PTs with no local track.
 	droppedPTs map[uint8]bool
 
@@ -67,10 +70,11 @@ func newLoopbackSession(
 		onRequestKeyframe: onRequestKeyframe,
 		onNACK:            onNACK,
 		tracks:            make(map[uint8]*webrtc.TrackLocalStaticRTP),
-		senders:         make(map[uint8]*webrtc.RTPSender),
-		boundPTs:        make(map[uint8]webrtc.PayloadType),
-		droppedPTs:      make(map[uint8]bool),
-		ptCodecMap:      ptCodecMap,
+		senders:           make(map[uint8]*webrtc.RTPSender),
+		boundPTs:          make(map[uint8]webrtc.PayloadType),
+		boundSSRCs:        make(map[uint8]uint32),
+		droppedPTs:        make(map[uint8]bool),
+		ptCodecMap:        ptCodecMap,
 	}
 
 	ls.initPC()
@@ -243,13 +247,7 @@ func (ls *loopbackSession) renegotiateLocked() {
 
 	// Now that local description is set, Pion has bound the payload types.
 	// We extract them from the senders to rewrite RTP packet headers later.
-	for pt, sender := range ls.senders {
-		params := sender.GetParameters()
-		if len(params.Codecs) > 0 {
-			ls.boundPTs[pt] = params.Codecs[0].PayloadType
-			ls.logf("[bcr_client][loopback][%s] mapped VDI PT=%d to loopback PT=%d", ls.bridgeID, pt, params.Codecs[0].PayloadType)
-		}
-	}
+	ls.updateBindingsLocked()
 
 	ls.renegotiateQueued = false
 
@@ -352,8 +350,10 @@ func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet) {
 		return
 	}
 
+	vdiPT := pkt.Header.PayloadType
+
 	// Rewrite PayloadType to match the loopback SDP, otherwise WebKit drops it.
-	if boundPT, ok := ls.boundPTs[pkt.Header.PayloadType]; ok {
+	if boundPT, ok := ls.boundPTs[vdiPT]; ok {
 		pkt.Header.PayloadType = uint8(boundPT)
 	}
 
@@ -363,6 +363,11 @@ func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet) {
 	pkt.Header.ExtensionProfile = 0
 	pkt.Header.Extensions = nil
 
+	// Rewrite SSRC to match the loopback track's negotiated SSRC, otherwise WebKit discards it.
+	if boundSSRC, ok := ls.boundSSRCs[vdiPT]; ok && boundSSRC != 0 {
+		pkt.Header.SSRC = boundSSRC
+	}
+
 	if err := track.WriteRTP(pkt); err != nil {
 		ls.writeErrCount++
 		if ls.writeErrCount == 1 || ls.writeErrCount%500 == 0 {
@@ -371,6 +376,22 @@ func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet) {
 		}
 	} else {
 		ls.writeErrCount = 0
+	}
+}
+
+// updateBindingsLocked extracts mapped Payload Types and SSRCs from RTPSenders.
+// MUST be called with ls.mu held.
+func (ls *loopbackSession) updateBindingsLocked() {
+	for pt, sender := range ls.senders {
+		params := sender.GetParameters()
+		if len(params.Codecs) > 0 {
+			ls.boundPTs[pt] = params.Codecs[0].PayloadType
+			ls.logf("[bcr_client][loopback][%s] mapped VDI PT=%d to loopback PT=%d", ls.bridgeID, pt, params.Codecs[0].PayloadType)
+		}
+		if len(params.Encodings) > 0 && params.Encodings[0].SSRC != 0 {
+			ls.boundSSRCs[pt] = uint32(params.Encodings[0].SSRC)
+			ls.logf("[bcr_client][loopback][%s] mapped VDI PT=%d to loopback SSRC=%d", ls.bridgeID, pt, params.Encodings[0].SSRC)
+		}
 	}
 }
 
@@ -394,6 +415,9 @@ func (ls *loopbackSession) SetRemoteDescription(sdp string) {
 	}
 
 	ls.logf("[bcr_client][loopback][%s] applied remote description from frontend successfully", ls.bridgeID)
+
+	// Update bound payload types and SSRCs from senders post-remote answer.
+	ls.updateBindingsLocked()
 
 	if ls.renegotiateQueued {
 		ls.logf("[bcr_client][loopback][%s] processing queued renegotiation after remote answer", ls.bridgeID)

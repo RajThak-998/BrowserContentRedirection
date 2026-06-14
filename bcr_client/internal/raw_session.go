@@ -19,11 +19,15 @@ package engine
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -32,6 +36,7 @@ import (
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/ice/v4"
+	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/srtp/v3"
@@ -369,15 +374,31 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	s.state = stateInit
 	s.mu.Unlock()
 
-	// ── Step 1: Self-signed DTLS certificate ────────────────────────────────
-	// selfsign.GenerateSelfSigned uses ECDSA P-256 internally.
-	// The certificate is single-use; we compute its SHA-256 fingerprint to
-	// send to the JS, which munges it into the browser's SDP a=fingerprint line.
-	cert, err := selfsign.GenerateSelfSigned()
-	if err != nil {
-		return nil, fmt.Errorf("generate cert: %w", err)
+	// ── Step 1: DTLS certificate generation or reuse ────────────────────────
+	s.mu.Lock()
+	cert := s.cert
+	var reuseCreds bool
+	var reuseUfrag, reusePwd string
+	if len(cert.Certificate) > 0 {
+		s.logf("[raw][%s] reusing existing DTLS certificate", s.bridgeID)
+		if s.localCredentials != nil {
+			reuseCreds = true
+			reuseUfrag = s.localCredentials.ICEUfrag
+			reusePwd = s.localCredentials.ICEPwd
+		}
 	}
-	s.cert = cert
+	s.mu.Unlock()
+
+	if !reuseCreds {
+		var err error
+		cert, err = selfsign.GenerateSelfSigned()
+		if err != nil {
+			return nil, fmt.Errorf("generate cert: %w", err)
+		}
+		s.mu.Lock()
+		s.cert = cert
+		s.mu.Unlock()
+	}
 
 	// ── Step 2: SHA-256 fingerprint for the JS munge ─────────────────────────
 	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
@@ -387,7 +408,20 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	fingerprint := sha256ColonHex(x509Cert.Raw) // "AB:CD:EF:..." form
 
 	// ── Step 3: Convert IceServers → []*stun.URI ─────────────────────────────
-	stunURIs := iceServersToStunURIs(s.iceServers, s.logf, s.bridgeID)
+	var stunURIs []*stun.URI
+	if len(s.iceServers) > 0 {
+		stunURIs = iceServersToStunURIs(s.iceServers, s.logf, s.bridgeID)
+	} else {
+		s.logf("[raw][%s] No ICE servers provided by browser, using default fallback STUN servers", s.bridgeID)
+		defaultServers := []IceServer{
+			{URLs: []string{
+				"stun:stun.l.google.com:19302",
+				"stun:stun1.l.google.com:19302",
+				"stun:stun2.l.google.com:19302",
+			}},
+		}
+		stunURIs = iceServersToStunURIs(defaultServers, s.logf, s.bridgeID)
+	}
 	s.logf("[raw][%s] using %d ICE server(s)", s.bridgeID, len(stunURIs))
 
 	// ── Step 4: Create ICE agent ──────────────────────────────────────────────
@@ -397,17 +431,28 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 		candidates  []string
 	)
 
-	agent, err := ice.NewAgent(&ice.AgentConfig{
+	agentConfig := &ice.AgentConfig{
 		Urls:         stunURIs,
 		NetworkTypes: []ice.NetworkType{
 			ice.NetworkTypeUDP4,
 			ice.NetworkTypeTCP4,
 		},
-	})
+	}
+	if reuseCreds {
+		agentConfig.LocalUfrag = reuseUfrag
+		agentConfig.LocalPwd = reusePwd
+		s.logf("[raw][%s] reusing existing ICE credentials: ufrag=%s", s.bridgeID, reuseUfrag)
+	}
+
+	agent, err := ice.NewAgent(agentConfig)
 	if err != nil {
 		return nil, fmt.Errorf("new ice agent: %w", err)
 	}
 	s.iceAgent = agent
+
+	agent.OnConnectionStateChange(func(state ice.ConnectionState) {
+		s.logf("[raw][%s] ICE connection state changed: %s", s.bridgeID, state.String())
+	})
 
 	// ── Step 5: OnCandidate handler ───────────────────────────────────────────
 	// A nil Candidate argument signals end-of-gathering per the pion/ice API.
@@ -587,6 +632,31 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	role := parseDTLSRole(remoteSDP)
 	s.logf("[raw][%s] DTLS role: %s (from a=setup: in remote SDP)", s.bridgeID, role)
 
+	// ── DIAG: Dump exact a=setup and a=fingerprint lines from remote SDP ──
+	for _, line := range strings.Split(remoteSDP, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "a=setup:") || strings.HasPrefix(trimmed, "a=fingerprint:") {
+			s.logf("[raw][%s] [DIAG] remote SDP line: %s", s.bridgeID, trimmed)
+		}
+	}
+
+	// ── DIAG: Log our own certificate key type ──
+	if len(s.cert.Certificate) > 0 {
+		if localCert, parseErr := x509.ParseCertificate(s.cert.Certificate[0]); parseErr == nil {
+			switch localCert.PublicKey.(type) {
+			case *ecdsa.PublicKey:
+				s.logf("[raw][%s] [DIAG] local cert key type: ECDSA, algo: %s", s.bridgeID, localCert.PublicKeyAlgorithm)
+			case *rsa.PublicKey:
+				s.logf("[raw][%s] [DIAG] local cert key type: RSA, algo: %s", s.bridgeID, localCert.PublicKeyAlgorithm)
+			case ed25519.PublicKey:
+				s.logf("[raw][%s] [DIAG] local cert key type: Ed25519", s.bridgeID)
+			default:
+				s.logf("[raw][%s] [DIAG] local cert key type: unknown (%T)", s.bridgeID, localCert.PublicKey)
+			}
+			s.logf("[raw][%s] [DIAG] local cert fingerprint: sha-256 %s", s.bridgeID, sha256ColonHex(localCert.Raw))
+		}
+	}
+
 	// Key material capture strategy:
 	//
 	// VerifyConnection is called DURING the handshake (before master secret
@@ -603,6 +673,11 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 		exporterLabel = "EXTRACTOR-dtls_srtp"
 	)
 
+	// ── DIAG: pion/dtls internal logger to trace handshake flights ──
+	pionLogFactory := logging.NewDefaultLoggerFactory()
+	pionLogFactory.DefaultLogLevel = logging.LogLevelDebug
+	pionLogFactory.Writer = log.Writer()
+
 	dtlsCfg := &dtls.Config{
 		Certificates:           []tls.Certificate{s.cert},
 		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{
@@ -612,14 +687,23 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 			dtls.SRTP_AES128_CM_HMAC_SHA1_32,
 		},
 		InsecureSkipVerify:     true, // skip chain verify; fingerprint verified below
+		LoggerFactory:          pionLogFactory,
 		VerifyConnection: func(st *dtls.State) error {
 			vcCalled = true
-			s.logf("[raw][%s] [DIAG] VerifyConnection entered: peerCerts=%d",
-				s.bridgeID, len(st.PeerCertificates))
+			s.logf("[raw][%s] [DIAG] VerifyConnection entered: peerCerts=%d cipherSuiteID=0x%04x",
+				s.bridgeID, len(st.PeerCertificates), st.CipherSuiteID)
 
 			if len(st.PeerCertificates) > 0 {
 				capturedPeerCert = make([]byte, len(st.PeerCertificates[0]))
 				copy(capturedPeerCert, st.PeerCertificates[0])
+
+				// DIAG: Log remote peer cert key type
+				if peerCert, pErr := x509.ParseCertificate(st.PeerCertificates[0]); pErr == nil {
+					s.logf("[raw][%s] [DIAG] remote peer cert key type: %T algo: %s",
+						s.bridgeID, peerCert.PublicKey, peerCert.PublicKeyAlgorithm)
+					s.logf("[raw][%s] [DIAG] remote peer cert fingerprint: sha-256 %s",
+						s.bridgeID, sha256ColonHex(peerCert.Raw))
+				}
 			}
 			return nil
 		},
@@ -644,6 +728,7 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	// the first Read(), Write(), or explicit HandshakeContext() call.
 	s.logf("[raw][%s] [DIAG] starting explicit DTLS HandshakeContext", s.bridgeID)
 	if err = dtlsConn.HandshakeContext(ctx); err != nil {
+		s.logf("[raw][%s] [DIAG] DTLS HandshakeContext FAILED: vcCalled=%v err=%v", s.bridgeID, vcCalled, err)
 		_ = dtlsConn.Close()
 		return fmt.Errorf("DTLS handshake (%s): %w", role, err)
 	}
@@ -781,6 +866,14 @@ func (s *rawShadowSession) AddRemoteIceCandidate(raw string) {
 		return
 	}
 	s.logf("[raw][%s] remote ICE candidate added: %s", s.bridgeID, raw[:min(len(raw), 60)])
+}
+
+func (s *rawShadowSession) UpdateIceServers(servers []IceServer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.iceServers = servers
+	s.logf("[raw][%s] received dynamic ICE servers update: %d server(s)", s.bridgeID, len(servers))
 }
 
 // checkGen returns an error if the session's generation has advanced past gen.
