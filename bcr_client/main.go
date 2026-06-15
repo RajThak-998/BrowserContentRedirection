@@ -4,6 +4,7 @@ import (
 	"embed"
 	"flag"
 	"log"
+	"os"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -15,6 +16,9 @@ import (
 var assets embed.FS
 
 func main() {
+	// Bypass WebView2 autoplay restrictions to allow unmuted autoplay
+	os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--autoplay-policy=no-user-gesture-required")
+
 	// Parse command-line arguments for window size
 	width := flag.Int("w", 1280, "Window width")
 	height := flag.Int("h", 720, "Window height")

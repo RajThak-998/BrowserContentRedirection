@@ -4,11 +4,79 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
+
+// ── RTP Packet Cache (ring buffer) for instant local NACK retransmission ────
+//
+// WebKit's jitter buffer generates NACKs for packets that arrive slightly
+// out-of-order or with short delays over the local loopback PeerConnection.
+// Forwarding these NACKs to the remote SFU is too slow (hundreds of ms RTT)
+// and the SFU's RTX retransmits arrive too late to be useful.
+//
+// Instead, we cache the last N RTP packets per loopback SSRC in a ring buffer
+// and retransmit them instantly when WebKit NACKs them. This provides
+// microsecond-level retransmission latency.
+
+const (
+	// rtpCacheSize is the number of RTP packets to cache per SSRC.
+	// 512 packets at 30fps ≈ 17 seconds of video, more than enough for jitter.
+	rtpCacheSize = 512
+
+	// nackLogInterval controls how often NACK activity is logged.
+	// Log a summary every N NACKs instead of spamming per-packet.
+	nackLogInterval = 50
+
+	// nackCooldownMs is the minimum interval (in ms) between forwarding
+	// NACKs to the remote VDI for the same SSRC. Prevents flooding.
+	nackCooldownMs = 200
+)
+
+// rtpRingBuffer is a lock-free (single-writer) ring buffer for caching RTP packets.
+type rtpRingBuffer struct {
+	buf  [rtpCacheSize]cachedRTPPacket
+	mask uint16 // rtpCacheSize - 1, for fast modulo
+}
+
+type cachedRTPPacket struct {
+	seq     uint16
+	valid   bool
+	payload []byte     // serialized RTP packet (header + payload)
+}
+
+func newRTPRingBuffer() *rtpRingBuffer {
+	return &rtpRingBuffer{
+		mask: rtpCacheSize - 1,
+	}
+}
+
+// store caches a serialized RTP packet by its sequence number.
+func (rb *rtpRingBuffer) store(seq uint16, raw []byte) {
+	idx := seq & rb.mask
+	// Copy the raw bytes so we don't hold references to the original buffer.
+	dup := make([]byte, len(raw))
+	copy(dup, raw)
+	rb.buf[idx] = cachedRTPPacket{
+		seq:     seq,
+		valid:   true,
+		payload: dup,
+	}
+}
+
+// retrieve looks up a cached packet by sequence number.
+// Returns the serialized packet bytes and true if found, nil and false otherwise.
+func (rb *rtpRingBuffer) retrieve(seq uint16) ([]byte, bool) {
+	idx := seq & rb.mask
+	entry := &rb.buf[idx]
+	if entry.valid && entry.seq == seq {
+		return entry.payload, true
+	}
+	return nil, false
+}
 
 type loopbackSession struct {
 	bridgeID        string
@@ -32,6 +100,22 @@ type loopbackSession struct {
 
 	// Map of VDI PayloadType to Pion's dynamically assigned loopback SSRC
 	boundSSRCs map[uint8]uint32
+
+	// Map of loopback SSRC to original VDI SSRC
+	loopbackToVdiSSRC map[uint32]uint32
+
+	// Local RTP packet cache per loopback SSRC for instant NACK retransmission.
+	// Key: loopback SSRC, Value: ring buffer of recent packets.
+	rtpCache map[uint32]*rtpRingBuffer
+
+	// NACK statistics for sampled logging (avoids per-packet log spam).
+	nackLocalHit   uint64 // NACKs satisfied from local cache
+	nackLocalMiss  uint64 // NACKs that had to be forwarded to VDI
+	nackTotal      uint64 // total NACK requests received
+	nackLastLog    uint64 // nackTotal value at last log
+
+	// Per-SSRC cooldown for forwarding NACKs to VDI.
+	nackLastForward map[uint32]time.Time
 
 	// One-time logging guard for dropped RTP PTs with no local track.
 	droppedPTs map[uint8]bool
@@ -73,6 +157,9 @@ func newLoopbackSession(
 		senders:           make(map[uint8]*webrtc.RTPSender),
 		boundPTs:          make(map[uint8]webrtc.PayloadType),
 		boundSSRCs:        make(map[uint8]uint32),
+		loopbackToVdiSSRC: make(map[uint32]uint32),
+		rtpCache:          make(map[uint32]*rtpRingBuffer),
+		nackLastForward:   make(map[uint32]time.Time),
 		droppedPTs:        make(map[uint8]bool),
 		ptCodecMap:        ptCodecMap,
 	}
@@ -351,6 +438,7 @@ func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet) {
 	}
 
 	vdiPT := pkt.Header.PayloadType
+	originalVdiSSRC := pkt.Header.SSRC
 
 	// Rewrite PayloadType to match the loopback SDP, otherwise WebKit drops it.
 	if boundPT, ok := ls.boundPTs[vdiPT]; ok {
@@ -366,6 +454,18 @@ func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet) {
 	// Rewrite SSRC to match the loopback track's negotiated SSRC, otherwise WebKit discards it.
 	if boundSSRC, ok := ls.boundSSRCs[vdiPT]; ok && boundSSRC != 0 {
 		pkt.Header.SSRC = boundSSRC
+		ls.loopbackToVdiSSRC[boundSSRC] = originalVdiSSRC
+	}
+
+	// Cache the serialized packet BEFORE writing it to the track, so that
+	// if WebKit immediately NACKs it (due to reorder), we can retransmit
+	// from cache in microseconds rather than waiting for a VDI round-trip.
+	loopSSRC := pkt.Header.SSRC
+	if _, hasBuf := ls.rtpCache[loopSSRC]; !hasBuf {
+		ls.rtpCache[loopSSRC] = newRTPRingBuffer()
+	}
+	if raw, marshalErr := pkt.Marshal(); marshalErr == nil {
+		ls.rtpCache[loopSSRC].store(pkt.Header.SequenceNumber, raw)
 	}
 
 	if err := track.WriteRTP(pkt); err != nil {
@@ -437,8 +537,15 @@ func (ls *loopbackSession) Close() error {
 	return nil
 }
 
-// readRTCP reads RTCP packets generated by the local Wails WebKit engine
-// and forwards NACKs and PLIs to the VDI to recover from packet loss.
+// readRTCP reads RTCP packets generated by the local Wails WebKit engine.
+//
+// For NACKs, we first attempt to retransmit the requested packets from
+// our local RTP cache (microsecond latency). Only if the cache doesn't
+// have the packet do we forward the NACK to the remote VDI SFU (which
+// has hundreds of ms RTT and may retransmit via RTX).
+//
+// For PLIs (keyframe requests), we always forward to the VDI since we
+// cannot generate keyframes locally.
 func (ls *loopbackSession) readRTCP(sender *webrtc.RTPSender) {
 	buf := make([]byte, 1500)
 	for {
@@ -455,20 +562,122 @@ func (ls *loopbackSession) readRTCP(sender *webrtc.RTPSender) {
 		for _, pkt := range pkts {
 			switch p := pkt.(type) {
 			case *rtcp.PictureLossIndication:
-				ls.logf("[bcr_client][loopback][%s] received PLI from Wails for SSRC=%d, forwarding to VDI", ls.bridgeID, p.MediaSSRC)
-				if ls.onRequestKeyframe != nil {
-					ls.onRequestKeyframe(ls.bridgeID, p.MediaSSRC)
+				ls.mu.Lock()
+				vdiSSRC, hasMapping := ls.loopbackToVdiSSRC[p.MediaSSRC]
+				ls.mu.Unlock()
+
+				targetSSRC := p.MediaSSRC
+				if hasMapping {
+					targetSSRC = vdiSSRC
 				}
+				ls.logf("[bcr_client][loopback][%s] PLI from Wails SSRC=%d → VDI SSRC=%d", ls.bridgeID, p.MediaSSRC, targetSSRC)
+
+				if ls.onRequestKeyframe != nil {
+					ls.onRequestKeyframe(ls.bridgeID, targetSSRC)
+				}
+
 			case *rtcp.TransportLayerNack:
-				ls.logf("[bcr_client][loopback][%s] received NACK from Wails for SSRC=%d, forwarding to VDI", ls.bridgeID, p.MediaSSRC)
-				if ls.onNACK != nil {
-					for _, pair := range p.Nacks {
-						// Extract the missing sequence numbers from the packet list
-						missing := pair.PacketList()
-						ls.onNACK(ls.bridgeID, p.MediaSSRC, missing)
+				ls.handleNACK(p, sender)
+			}
+		}
+	}
+}
+
+// handleNACK processes a single NACK packet from WebKit. It attempts to
+// retransmit the requested packets from the local RTP cache first.
+// Only cache misses are forwarded to the remote VDI as a fallback.
+func (ls *loopbackSession) handleNACK(p *rtcp.TransportLayerNack, sender *webrtc.RTPSender) {
+	ls.mu.Lock()
+	vdiSSRC, hasMapping := ls.loopbackToVdiSSRC[p.MediaSSRC]
+	cache := ls.rtpCache[p.MediaSSRC]
+
+	// Get the track for this SSRC so we can retransmit directly.
+	var retransmitTrack *webrtc.TrackLocalStaticRTP
+	for _, track := range ls.tracks {
+		// Any track on this sender will do — we write raw packets.
+		retransmitTrack = track
+		break
+	}
+	// Find the specific track by checking which bound SSRC matches.
+	for pt, ssrc := range ls.boundSSRCs {
+		if ssrc == p.MediaSSRC {
+			if t, ok := ls.tracks[pt]; ok {
+				retransmitTrack = t
+			}
+			break
+		}
+	}
+	ls.mu.Unlock()
+
+	targetSSRC := p.MediaSSRC
+	if hasMapping {
+		targetSSRC = vdiSSRC
+	}
+
+	// Collect all missing sequence numbers from the NACK packet.
+	var allMissing []uint16
+	for _, pair := range p.Nacks {
+		allMissing = append(allMissing, pair.PacketList()...)
+	}
+
+	// Attempt local retransmission from cache.
+	var localRetransmitted int
+	var cacheMisses []uint16
+
+	if cache != nil && retransmitTrack != nil {
+		for _, seq := range allMissing {
+			if raw, found := cache.retrieve(seq); found {
+				// Parse the cached packet and write it to the track.
+				var cachedPkt rtp.Packet
+				if unmarshalErr := cachedPkt.Unmarshal(raw); unmarshalErr == nil {
+					if writeErr := retransmitTrack.WriteRTP(&cachedPkt); writeErr == nil {
+						localRetransmitted++
 					}
 				}
+			} else {
+				cacheMisses = append(cacheMisses, seq)
 			}
+		}
+	} else {
+		// No cache available — all are misses.
+		cacheMisses = allMissing
+	}
+
+	// Update statistics.
+	totalNACKed := uint64(len(allMissing))
+	ls.mu.Lock()
+	ls.nackTotal += totalNACKed
+	ls.nackLocalHit += uint64(localRetransmitted)
+	ls.nackLocalMiss += uint64(len(cacheMisses))
+	currentTotal := ls.nackTotal
+	lastLog := ls.nackLastLog
+	hitTotal := ls.nackLocalHit
+	missTotal := ls.nackLocalMiss
+	ls.mu.Unlock()
+
+	// Sampled logging: log every nackLogInterval NACKs.
+	if currentTotal-lastLog >= nackLogInterval {
+		ls.mu.Lock()
+		ls.nackLastLog = currentTotal
+		ls.mu.Unlock()
+		ls.logf("[bcr_client][loopback][%s] NACK summary: total=%d localHit=%d localMiss=%d hitRate=%.1f%% (SSRC %d→%d)",
+			ls.bridgeID, currentTotal, hitTotal, missTotal,
+			float64(hitTotal)/float64(max(currentTotal, 1))*100.0,
+			p.MediaSSRC, targetSSRC)
+	}
+
+	// Forward cache misses to the remote VDI as a fallback, with rate-limiting.
+	if len(cacheMisses) > 0 && ls.onNACK != nil {
+		now := time.Now()
+		ls.mu.Lock()
+		lastFwd := ls.nackLastForward[p.MediaSSRC]
+		ls.mu.Unlock()
+
+		if now.Sub(lastFwd).Milliseconds() >= nackCooldownMs {
+			ls.mu.Lock()
+			ls.nackLastForward[p.MediaSSRC] = now
+			ls.mu.Unlock()
+			ls.onNACK(ls.bridgeID, targetSSRC, cacheMisses)
 		}
 	}
 }

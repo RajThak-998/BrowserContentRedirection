@@ -55,7 +55,7 @@ const (
 )
 
 // DisableTransportStateReuse is a diagnostic flag to disable DTLS certificate and ICE credential reuse across connections/reconnects.
-var DisableTransportStateReuse = true
+var DisableTransportStateReuse = false
 
 // ─── RTCP Tracking Types ─────────────────────────────────────────────────────
 
@@ -739,6 +739,10 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	}
 	s.logf("[raw][%s] [DIAG] DTLS HandshakeContext completed successfully", s.bridgeID)
 	s.dtlsConn = dtlsConn
+
+	// Disable deadlines on the splitter/connection post-handshake to prevent
+	// subsequent read timeouts from freezing the media flow.
+	splitter.SetIgnoreDeadlines(true)
 
 	// ── Post-handshake: extract SRTP profile and keying material ─────────
 	srtpProfile, profileOK := dtlsConn.SelectedSRTPProtectionProfile()
