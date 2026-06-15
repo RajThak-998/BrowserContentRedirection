@@ -60,6 +60,9 @@ func (s *iceConnSplitter) ReadFrom(p []byte) (int, net.Addr, error) {
 		}
 
 		first := p[0]
+		if first < 128 {
+			s.logf("[raw][%s] [VDI-DEBUG] splitter ReadFrom: read %d bytes, first_byte=0x%02x, remote=%v", s.bridgeID, n, first, s.conn.RemoteAddr())
+		}
 		switch {
 		case first >= 20 && first <= 63: // DTLS record
 			// Return to pion/dtls
@@ -86,6 +89,9 @@ func (s *iceConnSplitter) ReadFrom(p []byte) (int, net.Addr, error) {
 
 // WriteTo delegates directly to the underlying ice.Conn.
 func (s *iceConnSplitter) WriteTo(p []byte, _ net.Addr) (int, error) {
+	if len(p) > 0 {
+		s.logf("[raw][%s] [VDI-DEBUG] splitter WriteTo: writing %d bytes, first_byte=0x%02x", s.bridgeID, len(p), p[0])
+	}
 	// addr is ignored — the ICE transport already knows the remote address.
 	return s.conn.Write(p)
 }

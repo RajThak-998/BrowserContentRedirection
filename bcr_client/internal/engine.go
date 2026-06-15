@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -316,8 +317,15 @@ func (e *Engine) triggerConnect(conn SignalingConn, bridgeID string, session *ra
 			session.mu.Lock()
 			iceServers := session.iceServers
 			ptCodecMap := session.ptCodecMap
-			cert := session.cert
-			localCreds := session.localCredentials
+			
+			var cert tls.Certificate
+			var localCreds *RTCShadowReadyPayload
+			if !DisableTransportStateReuse {
+				cert = session.cert
+				localCreds = session.localCredentials
+			} else {
+				e.logf("[raw][%s] [VDI-DEBUG] retry: bypassing caching of cert and local credentials due to DisableTransportStateReuse", bridgeID)
+			}
 			session.mu.Unlock()
 
 			e.closeShadowSession(bridgeID)
@@ -326,8 +334,10 @@ func (e *Engine) triggerConnect(conn SignalingConn, bridgeID string, session *ra
 			newSession.mu.Lock()
 			newSession.iceServers = iceServers
 			newSession.ptCodecMap = ptCodecMap
-			newSession.cert = cert
-			newSession.localCredentials = localCreds
+			if !DisableTransportStateReuse {
+				newSession.cert = cert
+				newSession.localCredentials = localCreds
+			}
 			newSession.isOfferer = (sdpType == "offer")
 			newSession.mu.Unlock()
 

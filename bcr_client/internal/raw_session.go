@@ -54,6 +54,9 @@ const (
 	stateClosed
 )
 
+// DisableTransportStateReuse is a diagnostic flag to disable DTLS certificate and ICE credential reuse across connections/reconnects.
+var DisableTransportStateReuse = true
+
 // ─── RTCP Tracking Types ─────────────────────────────────────────────────────
 
 // srRecord stores the last Sender Report received from a given SSRC.
@@ -379,7 +382,9 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	cert := s.cert
 	var reuseCreds bool
 	var reuseUfrag, reusePwd string
-	if len(cert.Certificate) > 0 {
+	if DisableTransportStateReuse {
+		s.logf("[raw][%s] [VDI-DEBUG] Transport state reuse is disabled, forcing fresh DTLS cert and ICE credentials", s.bridgeID)
+	} else if len(cert.Certificate) > 0 {
 		s.logf("[raw][%s] reusing existing DTLS certificate", s.bridgeID)
 		if s.localCredentials != nil {
 			reuseCreds = true
@@ -1636,10 +1641,12 @@ func parseDTLSRole(sdp string) string {
 		case "active":
 			return "server"
 		default:
-			return "client" 
+			log.Printf("[VDI-DEBUG] parseDTLSRole: found setup=%q, defaulting to 'server'", val)
+			return "server" 
 		}
 	}
-	return "client" 
+	log.Printf("[VDI-DEBUG] parseDTLSRole: no a=setup line found, defaulting to 'server'")
+	return "server" 
 }
 
 // verifyPeerCertByDER checks the DTLS peer cert (raw DER bytes captured via
