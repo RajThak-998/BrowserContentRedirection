@@ -558,9 +558,9 @@
             candidateLines.length, 'IPv4 candidates (dropped',
             (candidates.length - candidateLines.length), 'IPv6)');
 
-        // Stagger dispatching synthetic candidates slightly avoiding queue flood
-        candidateLines.forEach((line, index) => {
-            setTimeout(() => {
+        // Dispatch synthetic candidates using queueMicrotask to avoid background tab setTimeout throttling (Efficiency Mode)
+        candidateLines.forEach((line) => {
+            queueMicrotask(() => {
                 try {
                     let candidateStr = line.trim();
                     if (candidateStr.startsWith('a=')) {
@@ -591,11 +591,11 @@
                 } catch (e) {
                     BCR_LOG('[BCR] Failed to synthetically dispatch ice candidate:', e);
                 }
-            }, index * 20 + 50); // slight offset start + stagger
+            });
         });
 
         // Finally dispatch end-of-candidates
-        setTimeout(() => {
+        queueMicrotask(() => {
             try {
                 let nullEvent;
                 if (typeof window.RTCPeerConnectionIceEvent === 'function') {
@@ -609,7 +609,7 @@
             } catch (e) {
                 BCR_LOG('[BCR] Synthetic ICE Trickle end dispatch failed:', e);
             }
-        }, candidateLines.length * 20 + 80);
+        });
     }
 
     // ── SDP Codec Pinning ──────────────────────────────────────────────────────

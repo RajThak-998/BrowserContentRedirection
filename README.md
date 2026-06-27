@@ -231,6 +231,23 @@ g++ -shared -static -o bcr_dvc_plugin.dll dvc_plugin.cpp -lwtsapi32 -lws2_32 -lo
 1. call for the browser native pc.configuration() to get the ice servers at the construcutor
 2. use of pre signed dtls certificate to speed up the sdp munging
 
+## options 
+Option 5: Instant Credentials + Trickle ICE (The Best Strategy)
+How it works: Go does not wait for ICE candidate gathering to finish before sending BCR_RTC_SHADOW_READY.
+Go generates its DTLS fingerprint and ICE ufrag/pwd instantly (0ms, no network I/O needed).
+Go immediately sends BCR_RTC_SHADOW_READY to the browser containing the fingerprint and ufrag/pwd (with an empty candidates array).
+The browser munges these credentials into the SDP instantly. The wait inside setLocalDescription is now under 50ms.
+Teams POSTs the offer to the SFU immediately.
+Go gathers ICE candidates in the background and trickles them to the browser via BCR_RTC_SHADOW_ICE_CANDIDATE over the next 1–2 seconds, which trickles them to the SFU.
+Critique: This is the gold standard for WebRTC call offloading. It completely eliminates the ~29-second delay, meaning there is zero risk of TCP connection resets or timeouts. Teams gets its SDP immediately, and connectivity checks happen asynchronously via standard WebRTC trickle.
+Verdict: The absolute best option.
+My Recommendation for Your Scenario
+The best approach is to combine Option 5 (Instant Credentials + Go Trickle ICE) with Option 3 (Dynamic Getter):
+
+Modify the Go Client (Option 5): Configure Go to send the BCR_RTC_SHADOW_READY event containing the DTLS fingerprint, IP, and ICE credentials immediately upon receiving BCR_RTC_SHADOW_LOCAL. Do not wait for Go's ICE gathering to complete before sending the credentials. Trickle Go's candidates as they become available.
+Implement the Dynamic Getter in JS (Option 3): Keep the Javascript interceptor extremely robust by implementing the prototype-based dynamic getter. This protects against any scenario where Teams JS reads the SDP synchronously or Chrome throws errors, and acts as a bulletproof safety layer.
+Would you like to implement the dynamic JS getter first to secure the browser-side of this pipeline?
+
 
 ---
 

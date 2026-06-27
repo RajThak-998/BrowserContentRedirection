@@ -57,6 +57,24 @@ const (
 // DisableTransportStateReuse is a diagnostic flag to disable DTLS certificate and ICE credential reuse across connections/reconnects.
 var DisableTransportStateReuse = false
 
+var (
+	globalCert            tls.Certificate
+	globalCertFingerprint string
+	globalCertErr         error
+)
+
+func init() {
+	globalCert, globalCertErr = selfsign.GenerateSelfSigned()
+	if globalCertErr == nil && len(globalCert.Certificate) > 0 {
+		x509Cert, err := x509.ParseCertificate(globalCert.Certificate[0])
+		if err == nil {
+			globalCertFingerprint = sha256ColonHex(x509Cert.Raw)
+		} else {
+			globalCertErr = err
+		}
+	}
+}
+
 // ─── RTCP Tracking Types ─────────────────────────────────────────────────────
 
 // srRecord stores the last Sender Report received from a given SSRC.
@@ -395,22 +413,26 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	s.mu.Unlock()
 
 	if !reuseCreds {
-		var err error
-		cert, err = selfsign.GenerateSelfSigned()
-		if err != nil {
-			return nil, fmt.Errorf("generate cert: %w", err)
+		if globalCertErr != nil {
+			return nil, fmt.Errorf("pre-generated global cert failed: %w", globalCertErr)
 		}
+		cert = globalCert
 		s.mu.Lock()
 		s.cert = cert
 		s.mu.Unlock()
 	}
 
 	// ── Step 2: SHA-256 fingerprint for the JS munge ─────────────────────────
-	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
-	if err != nil {
-		return nil, fmt.Errorf("parse self-signed cert: %w", err)
+	var fingerprint string
+	if len(cert.Certificate) > 0 && len(globalCert.Certificate) > 0 && cert.PrivateKey == globalCert.PrivateKey {
+		fingerprint = globalCertFingerprint
+	} else {
+		x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return nil, fmt.Errorf("parse self-signed cert: %w", err)
+		}
+		fingerprint = sha256ColonHex(x509Cert.Raw)
 	}
-	fingerprint := sha256ColonHex(x509Cert.Raw) // "AB:CD:EF:..." form
 
 	// ── Step 3: Convert IceServers → []*stun.URI ─────────────────────────────
 	var stunURIs []*stun.URI
@@ -504,21 +526,7 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	}
 	s.logf("[raw][%s] local ufrag=%s sdpType=%s", s.bridgeID, ufrag, sdpType)
 
-	// ── Step 8: Wait for gathering (7 s max) ─────────────────────────────────
-	// STUN reflexive (srflx) candidates typically arrive in 4-6 seconds when
-	// reaching external STUN servers from a corporate/VDI network. Without
-	// srflx candidates, only private-IP host candidates are sent to the SFU,
-	// making ICE connectivity impossible in split-network (VDI + local) setups.
-	gatherCtx, gatherCancel := context.WithTimeout(ctx, 7*time.Second)
-	defer gatherCancel()
-	select {
-	case <-gatherDone:
-		s.logf("[raw][%s] ICE gathering complete", s.bridgeID)
-	case <-gatherCtx.Done():
-		s.logf("[raw][%s] ICE gather timeout — continuing with %d partial candidates",
-			s.bridgeID, len(candidates))
-	}
-
+	// ── Step 8: Return immediately without waiting for ICE gathering (Option 5) ──
 	candidateMu.Lock()
 	candsCopy := append([]string(nil), candidates...)
 	candidateMu.Unlock()
