@@ -15,6 +15,14 @@
  *     keep receiving chunks through our forwarding path.
  *   - Primary video = highest-area visible <video>.  Re-elected on each new
  *     video node.  Only one video is suppressed at a time.
+ *
+ * Changelog:
+ * 2026-06-26: Implementing fixes for unreliable calls and connection resets:
+ *   - Fix 1: Restructured shadow-wait to run in background, unblocking createOffer/createAnswer.
+ *   - Fix 2: Added HEAD-request TCP keepalive to SFU signaling endpoint during Go shadow-ready wait.
+ *   - Fix 3: Added ICE candidate starvation detection, IPv6 filtering fallback, and detailed candidate logging.
+ *   - Fix 4: Enabled structured fallback logging for setRemoteDescription failures to aid diagnostics.
+ *   - Fix 5: Cleared stale session state and credentials on close to prevent leaking between successive calls.
  */
 
 
@@ -30,6 +38,47 @@
         window.BCR_LOG = BCR_LOG;
     } catch (_) {
         // Ignore failures in locked-down contexts.
+    }
+
+    // ─── SFU Keepalive State and Functions ────────────────────────────────────
+    let _sfuSignalingBaseUrl = null;
+
+    function captureSfuUrl(url) {
+        if (_sfuSignalingBaseUrl) return;
+        try {
+            const urlObj = new URL(url);
+            const host = urlObj.hostname;
+            const pathname = urlObj.pathname;
+            const isTeamsSfu = /^[^/]+\.teams\.microsoft\.com$/i.test(host) && pathname.includes('/sdp');
+            const isGenericSfu = (host.endsWith('.teams.microsoft.com') || host.endsWith('.skype.com')) &&
+                                 (pathname.includes('/calling/') || pathname.includes('/sdp'));
+            if (isTeamsSfu || isGenericSfu) {
+                _sfuSignalingBaseUrl = urlObj.origin;
+                BCR_LOG('[BCR] Captured SFU signaling origin for keepalive:', _sfuSignalingBaseUrl);
+            }
+        } catch (_) {}
+    }
+
+    // Intercept fetch at module level to capture the SFU URL passively
+    const origFetch = window.fetch;
+    window.fetch = function patchedFetch(input, init) {
+        try {
+            const url = typeof input === 'string' ? input
+                : (input && typeof input === 'object' && 'url' in input) ? input.url : String(input);
+            captureSfuUrl(url);
+        } catch (_) {}
+        return origFetch.apply(this, arguments);
+    };
+
+    function keepSfuConnectionAlive(signal) {
+        const id = setInterval(() => {
+            if (signal.aborted) { clearInterval(id); return; }
+            if (!_sfuSignalingBaseUrl) return;
+            fetch(_sfuSignalingBaseUrl, {
+                method: 'HEAD', keepalive: true, mode: 'no-cors'
+            }).catch(() => {});
+        }, 4000);
+        signal.addEventListener('abort', () => clearInterval(id), { once: true });
     }
 
     // ─── Shared State ─────────────────────────────────────────────────────────
@@ -202,7 +251,8 @@
     // This prevents the browser from racing ahead and sending its native offer to
     // Azure before Go has finished, which caused the DTLS fingerprint mismatch.
     //
-    // Consumers: patchedSetLocalDescription (line ~756) and patchedCreateAction (~884).
+    // Consumers: patchedSetLocalDescription (now only applied in setLocalDescription,
+    // as createOffer and createAnswer no longer wait).
     // Restore to 5 000 ms (or a tighter value like 8 000 ms) once the hang is fixed.
     const RTC_WAIT_TIMEOUT_MS = 60_000; // TODO: revert to 5_000 after Go-side hang is resolved
     const rtcStateByPeer = new WeakMap();
@@ -223,6 +273,25 @@
             BCR_LOG('[BCR] Dispatching to Host via bridgeId:', payload?.bridgeId, 'event=', type);
         }
         window.postMessage({ type, payload }, '*');
+    }
+
+    function captureIceServersFromConnection(pc) {
+        const entry = ensureRtcState(pc);
+        try {
+            if (typeof pc.getConfiguration === 'function') {
+                const config = pc.getConfiguration();
+                if (config && Array.isArray(config.iceServers) && config.iceServers.length > 0) {
+                    entry.iceServers = config.iceServers.map(s => ({
+                        urls: Array.isArray(s.urls) ? s.urls : (s.url ? [s.url] : []),
+                        username: s.username ?? '',
+                        credential: s.credential ?? '',
+                    }));
+                    BCR_LOG('[BCR] Captured configuration ICE server(s) dynamically via getConfiguration() for bridgeId=', entry.bridgeId, 'count=', entry.iceServers.length);
+                }
+            }
+        } catch (e) {
+            BCR_LOG('[BCR] Failed to get RTCPeerConnection configuration:', e);
+        }
     }
 
     function ensureRtcState(pc) {
@@ -439,6 +508,17 @@
         return out.join(nl);
     }
 
+    function isIPv6Candidate(line) {
+        const parts = line.trim().split(/\s+/);
+        // candidate format: candidate:<foundation> <component> <protocol>
+        //                   <priority> <address> <port> typ <type> ...
+        // address is at index 4
+        if (parts.length < 6) return false;
+        const addr = parts[4];
+        // IPv6 addresses contain colons; IPv4 do not
+        return addr.includes(':');
+    }
+
     function dispatchShadowTrickleCandidates(pc, candidates) {
         let candidateLines = [];
         if (Array.isArray(candidates)) {
@@ -450,17 +530,33 @@
                 // Filter out IPv6 candidates to prevent Teams proprietary parser crashes.
                 // Mobile hotspots generate IPv6 candidates, which severely break Teams'
                 // JS simulcast logic when trickled.
-                const parts = trimmed.split(' ');
-                if (parts.length > 4 && parts[4].includes(':')) {
-                    BCR_LOG('[BCR] Dropping IPv6 candidate to avoid Teams crash:', parts[4]);
+                if (isIPv6Candidate(trimmed)) {
+                    BCR_LOG('[BCR] Dropping IPv6 candidate to avoid Teams crash:', trimmed);
                     return false;
                 }
                 return true;
             });
         }
 
+        if (candidateLines.length === 0 && Array.isArray(candidates) && candidates.length > 0) {
+            BCR_LOG('[BCR] WARNING: ALL', candidates.length,
+                'shadow candidates were dropped by the IPv6 filter.',
+                'Teams will have no ICE candidates. Check shadow PC network config.',
+                'Raw dropped candidates:', candidates);
+            // Emit a diagnostic event so the content script / Go side can log it
+            emitShadowEvent('BCR_SHADOW_DIAGNOSTIC', {
+                type: 'ALL_CANDIDATES_FILTERED',
+                droppedCount: candidates.length,
+                droppedSample: candidates.slice(0, 3),
+                timestamp: Date.now(),
+            });
+            return; // nothing to trickle
+        }
+
         let mid = '0';
-        BCR_LOG('[BCR] Preparing to synthetically trickle', candidateLines.length, 'candidates...');
+        BCR_LOG('[BCR] Synthetic ICE Trickle queued',
+            candidateLines.length, 'IPv4 candidates (dropped',
+            (candidates.length - candidateLines.length), 'IPv6)');
 
         // Stagger dispatching synthetic candidates slightly avoiding queue flood
         candidateLines.forEach((line, index) => {
@@ -535,7 +631,7 @@
      *   4. Rewrite the m= line's format list to only include kept PTs.
      *
      * @param {string} sdp — The SDP to filter.
-    * @param {string} preferVideo — Preferred video codec name (case-insensitive), e.g. 'H264'.
+     * @param {string} preferVideo — Preferred video codec name (case-insensitive), e.g. 'H264'.
      * @param {string} preferAudio — Preferred audio codec name (case-insensitive), e.g. 'opus'.
      * @returns {string} — The filtered SDP.
      */
@@ -746,6 +842,12 @@
         rtcReadyByBridgeId.delete(entry.bridgeId);
         rejectShadowReady(entry.bridgeId);
 
+        entry.shadowCredentials = null;
+        entry.lastOriginalLocalSdp = null;
+        entry.lastCreateActionType = null;
+        entry.lastDispatchedTrickleId = null;
+        entry.lastRemoteOfferSdp = null;
+
         emitShadowEvent('BCR_RTC_SHADOW_CLOSE', {
             bridgeId: entry.bridgeId,
             reason,
@@ -818,6 +920,16 @@
             const payload = data.payload;
             const bridgeId = payload?.bridgeId;
             if (typeof bridgeId === 'string' && bridgeId.length > 0) {
+                const pc = rtcPcByBridgeId.get(bridgeId);
+                if (!pc) {
+                    BCR_LOG('[BCR] SHADOW_READY arrived for unknown/closed bridgeId=', bridgeId, '— ignored');
+                    return;
+                }
+                const existingEntry = rtcStateByPeer.get(pc);
+                if (!existingEntry || existingEntry.closedEmitted) {
+                    BCR_LOG('[BCR] SHADOW_READY arrived for closed PC bridgeId=', bridgeId, '— ignored');
+                    return;
+                }
                 BCR_LOG('[BCR] Received SHADOW_READY bridgeId=', bridgeId);
                 resolveShadowReady(bridgeId, payload);
             }
@@ -966,42 +1078,42 @@
             const entry = ensureRtcState(this);
             entry.lastSeen = performance.now();
 
-            let origSdpString = description.sdp;
-            let isRedundant = false;
+            const sdpType = (description.type ?? '').toLowerCase();
+            const origSdpString = entry.lastOriginalLocalSdp || description.sdp;
 
-            if (entry.lastOriginalLocalSdp && entry.shadowCredentials) {
-                // Determine if this setLocalDescription is just the subsequent application
-                // of the offer/answer we just generated upstream in createOffer/createAnswer.
-                const typeMatches = (description.type ?? '').toLowerCase() === (entry.lastCreateActionType ?? '').toLowerCase();
+            // Check if credentials are already set and sdpType matches entry.lastCreateActionType
+            const hasCachedCreds = entry.shadowCredentials &&
+                sdpType === (entry.lastCreateActionType ?? '').toLowerCase();
 
-                if (typeMatches) {
-                    isRedundant = true;
-                    // Because the VDI app could have mutated the SDP structurally by stripping codecs
-                    // before giving it back to us, we just safely pass the last raw original local SDP
-                    // back into Chrome to prevent DOMExceptions out of ICE mismatches.
-                    origSdpString = entry.lastOriginalLocalSdp;
-                }
-            }
+            if (!hasCachedCreds) {
+                // If we didn't go through createOffer/createAnswer first (or if type doesn't match),
+                // we should emit the event and delete the cached ready entry if it is an offer.
+                if (!entry.lastCreateActionType || sdpType !== (entry.lastCreateActionType ?? '').toLowerCase()) {
+                    entry.lastCreateActionType = description.type;
+                    entry.lastOriginalLocalSdp = description.sdp;
+                    const pinnedSdp = filterSdpToPreferredCodecs(description.sdp);
 
-            if (!isRedundant) {
-                // Apply codec pinning before sending to Go
-                const pinnedSdp = filterSdpToPreferredCodecs(description.sdp);
+                    captureIceServersFromConnection(this);
 
-                emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
-                    bridgeId: entry.bridgeId,
-                    sdpType: description.type ?? 'unknown',
-                    sdp: pinnedSdp,
-                    iceServers: entry.iceServers ?? [],
-                    timestamp: Date.now(),
-                });
+                    emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
+                        bridgeId: entry.bridgeId,
+                        sdpType: description.type ?? 'unknown',
+                        sdp: pinnedSdp,
+                        iceServers: entry.iceServers ?? [],
+                        timestamp: Date.now(),
+                    });
 
-                BCR_LOG('[BCR] Captured SDP type:', description.type ?? 'unknown', 'direction=local bridgeId=', entry.bridgeId);
+                    BCR_LOG('[BCR] Captured SDP type:', description.type ?? 'unknown', 'direction=local bridgeId=', entry.bridgeId);
 
-                if ((description.type ?? '').toLowerCase() === 'offer') {
-                    rtcReadyByBridgeId.delete(entry.bridgeId);
+                    if (sdpType === 'offer') {
+                        rtcReadyByBridgeId.delete(entry.bridgeId);
+                    }
                 }
 
-                const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS, (description.type ?? '').toLowerCase());
+                const abortCtrl = new AbortController();
+                keepSfuConnectionAlive(abortCtrl.signal);
+                const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS, sdpType);
+                abortCtrl.abort();
 
                 const currentEntry = ensureRtcState(this);
                 if (currentEntry.bridgeId !== entry.bridgeId) {
@@ -1018,7 +1130,7 @@
                     BCR_LOG('[BCR] Shadow credentials stored bridgeId=', entry.bridgeId);
                 }
             } else {
-                BCR_LOG('[BCR] Skipping redundant SHADOW_LOCAL for pre-munged SDP bridgeId=', entry.bridgeId);
+                BCR_LOG('[BCR] Skipping redundant SHADOW_LOCAL wait, using cached credentials bridgeId=', entry.bridgeId);
             }
 
             // CRITICAL: Pass the ORIGINAL SDP to Chrome's native method.
@@ -1105,6 +1217,8 @@
                     }
                 }
 
+                captureIceServersFromConnection(this);
+
                 emitShadowEvent('BCR_RTC_SHADOW_REMOTE', {
                     bridgeId: entry.bridgeId,
                     sdpType: description.type,
@@ -1118,9 +1232,23 @@
             const entry2 = rtcStateByPeer.get(this);
             if (entry2 && entry2.shadowCredentials) {
                 return srdPromise.catch((err) => {
-                    BCR_LOG('[BCR] setRemoteDescription failed (expected for managed connection) bridgeId=',
-                        entry2.bridgeId, 'err=', err?.message || err);
-                    // Swallow — the shadow PC handles the real connection to Teams.
+                    const errMsg = err?.message || String(err);
+                    const errName = err?.name || 'UnknownError';
+                    BCR_LOG('[BCR] setRemoteDescription FAILED bridgeId=', entry2.bridgeId,
+                        'name=', errName, 'message=', errMsg);
+
+                    // Emit diagnostic so Go side / content script can correlate failures
+                    emitShadowEvent('BCR_SHADOW_DIAGNOSTIC', {
+                        type: 'SET_REMOTE_DESC_FAILED',
+                        bridgeId: entry2.bridgeId,
+                        errorName: errName,
+                        errorMessage: errMsg,
+                        sdpType: entry2?.lastCreateActionType ?? 'unknown',
+                        timestamp: Date.now(),
+                    });
+
+                    // Still swallow to prevent unhandled rejection crashing Teams UI,
+                    // but NOW we have a record of it.
                 });
             }
             return srdPromise;
@@ -1136,6 +1264,7 @@
             const entry = ensureRtcState(this);
             entry.lastSeen = performance.now();
             entry.lastCreateActionType = actionType;
+            entry.lastOriginalLocalSdp = origDescription.sdp;
 
             // ── SDP Codec Pinning ─────────────────────────────────────────────
             // Filter the SDP to only advertise the preferred codecs BEFORE
@@ -1143,6 +1272,8 @@
             // only H264 + Opus, preventing mid-session codec switches that would
             // trigger renegotiation cascades in the loopback player.
             const pinnedSdp = filterSdpToPreferredCodecs(origDescription.sdp);
+
+            captureIceServersFromConnection(this);
 
             emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
                 bridgeId: entry.bridgeId,
@@ -1154,33 +1285,8 @@
 
             BCR_LOG('[BCR] Captured SDP type:', origDescription.type ?? actionType, 'direction=local build from', actionType, 'bridgeId=', entry.bridgeId);
 
-            // Wait for the freshly built shadow PC's credentials
-            const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS, actionType);
-
-            const currentEntry = ensureRtcState(this);
-            if (currentEntry.bridgeId !== entry.bridgeId) {
-                BCR_LOG('[BCR] BridgeId changed during', actionType, 'fail-open with original SDP');
-                return origDescription;
-            }
-
-            if (shadowReady) {
-                entry.shadowCredentials = shadowReady;
-                // Store the original (unfiltered) SDP so Chrome's setLocalDescription
-                // sees what it generated internally. The codec-pinned SDP is only for
-                // the SFU signaling path.
-                entry.lastOriginalLocalSdp = origDescription.sdp;
-
-                // Munge transport creds on top of the codec-pinned SDP.
-                // This is the SDP that reaches the SFU: pinned codecs + shadow ICE/DTLS.
-                const mungedSdp = mungeSdpTransport(pinnedSdp, entry.shadowCredentials);
-                BCR_LOG('[BCR]', actionType, 'resolved, codec-pinned, and munged bridgeId=', entry.bridgeId);
-
-                // Must return an object that circumvents strict instanceof RTCSessionDescription checks inside RxJS / React data pipelines
-                return buildDescriptionLike(origDescription, mungedSdp);
-            }
-
-            BCR_LOG('[BCR] SHADOW_READY timeout or error during', actionType, 'fail-open via original result bridgeId=', entry.bridgeId);
-            return origDescription;
+            // Must return an object that circumvents strict instanceof RTCSessionDescription checks inside RxJS / React data pipelines
+            return buildDescriptionLike(origDescription, pinnedSdp);
         }
 
         rtcProto.createOffer = function patchedCreateOffer(...args) {
@@ -1462,9 +1568,6 @@
         };
     }
 
-    patchAddSourceBuffer('MediaSource');
-    patchAddSourceBuffer('ManagedMediaSource');
-
     // ─── changeType Patch (preserve existing behaviour) ──────────────────────
     if (typeof origChangeType === 'function') {
         SourceBuffer.prototype.changeType = function patchedChangeType(mimeType) {
@@ -1546,6 +1649,9 @@
 
         return origAppendBuffer.call(this, data);
     };
+
+    patchAddSourceBuffer('MediaSource');
+    patchAddSourceBuffer('ManagedMediaSource');
 
     // ─── MutationObserver — Dynamic <video> Detection ─────────────────────────
     const domObserver = new MutationObserver((mutations) => {

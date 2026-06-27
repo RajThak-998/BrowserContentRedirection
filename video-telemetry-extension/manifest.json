@@ -6,11 +6,15 @@
 
   "permissions": [
     "activeTab",
-    "scripting"
+    "scripting",
+    "storage",
+    "tabs"
   ],
 
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "https://*.teams.microsoft.com/*",
+    "https://*.teams.live.com/*"
   ],
 
   "background": {

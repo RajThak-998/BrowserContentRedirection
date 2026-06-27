@@ -226,25 +226,11 @@ cd bcr_client/dvc_plugin
 g++ -shared -static -o bcr_dvc_plugin.dll dvc_plugin.cpp -lwtsapi32 -lws2_32 -lole32 -luuid
 ```
 
-"
-#for the optimisation we need to do these things
+
+## for the optimisation we need to do these things
 1. call for the browser native pc.configuration() to get the ice servers at the construcutor
 2. use of pre signed dtls certificate to speed up the sdp munging
-"
 
-"
-The real fix: pc.getConfiguration()
-Instead of guessing with timer delays, I replaced the approach with a deterministic one:
-
-New captureIceServersFromPC(pc, entry) helper (
-
-pageInterceptor.js:258-289
-):
-
-Calls the browser's native pc.getConfiguration() API which returns the current config (including any iceServers already set via the constructor or setConfiguration())
-If servers are found, stores them on entry.iceServers AND emits BCR_RTC_SHADOW_ICE_SERVERS so the Go side receives them immediately
-Called from both patchedSetLocalDescription and patchedCreateAction before emitting SHADOW_LOCAL
-"
 
 ---
 
