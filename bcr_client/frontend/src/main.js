@@ -150,8 +150,10 @@ window.onload = function () {
     // ==========================================
 
     let mediaSource = null;
-    let sourceBuffers = {};        // keyed by sourceBufferId
-    let chunkQueues = {};          // queued chunks waiting while SourceBuffer is updating
+    let sourceBuffers = {};        // keyed by trackType ('video' or 'audio')
+    let chunkQueues = {};          // queued chunks waiting while SourceBuffer is updating, keyed by trackType
+    let configuredMimeTypes = {};  // keyed by trackType, tracks the full MIME type configured for the SourceBuffer
+    let pendingSourceBuffers = {}; // keyed by trackType, stores fullMime for SourceBuffers to create on sourceopen
     let mseReady = false;
     let mseInitCount = 0;          // how many init segments received — used for first-chunk logging
 
@@ -176,9 +178,9 @@ window.onload = function () {
         logTerminal("[MSE] Tearing down MSE pipeline");
 
         try {
-            Object.keys(sourceBuffers).forEach((id) => {
+            Object.keys(sourceBuffers).forEach((type) => {
                 try {
-                    const sb = sourceBuffers[id];
+                    const sb = sourceBuffers[type];
                     if (!sb.updating) {
                         mediaSource.removeSourceBuffer(sb);
                     }
@@ -191,6 +193,8 @@ window.onload = function () {
 
         sourceBuffers = {};
         chunkQueues = {};
+        configuredMimeTypes = {};
+        pendingSourceBuffers = {};
         mediaSource = null;
         mseReady = false;
         mseInitCount = 0;
@@ -229,15 +233,49 @@ window.onload = function () {
         mediaSource.addEventListener('sourceopen', () => {
             logTerminal("[MSE] MediaSource sourceopen — pipeline ready");
             mseReady = true;
+
+            // Create any SourceBuffers that received init segments before sourceopen
+            Object.keys(pendingSourceBuffers).forEach((trackType) => {
+                const fullMime = pendingSourceBuffers[trackType];
+                if (!sourceBuffers[trackType]) {
+                    try {
+                        const newSb = mediaSource.addSourceBuffer(fullMime);
+                        newSb.mode = 'segments';
+                        sourceBuffers[trackType] = newSb;
+                        if (!chunkQueues[trackType]) chunkQueues[trackType] = []; // preserve any queued init segment
+                        configuredMimeTypes[trackType] = fullMime;
+
+                        newSb.addEventListener('updateend', () => {
+                            drainQueue(trackType);
+                        });
+                        newSb.addEventListener('error', (e) => {
+                            logErrorTerm(`[MSE][${trackType}] SourceBuffer error: ${e}`);
+                        });
+
+                        logTerminal(`[MSE][${trackType}] SourceBuffer created (deferred) for ${fullMime}`);
+                    } catch (e) {
+                        logErrorTerm(`[MSE][${trackType}] Failed to create deferred SourceBuffer for ${fullMime}: ${e}`);
+                    }
+                }
+            });
+            pendingSourceBuffers = {};
+
             // Flush any queued chunks that arrived before sourceopen
-            Object.keys(chunkQueues).forEach((id) => {
-                drainQueue(id);
+            Object.keys(chunkQueues).forEach((type) => {
+                drainQueue(type);
             });
         });
 
         mediaSource.addEventListener('sourceclose', () => {
-            logTerminal("[MSE] MediaSource sourceclose");
+            logTerminal("[MSE] MediaSource sourceclose — resetting for fresh session");
             mseReady = false;
+            // Null out mediaSource so the next arriving chunk triggers setupMSE() for a fresh session.
+            // Without this, the dead MediaSource stays referenced and new chunks are silently dropped.
+            mediaSource = null;
+            sourceBuffers = {};
+            chunkQueues = {};
+            configuredMimeTypes = {};
+            pendingSourceBuffers = {};
         });
 
         mediaSource.addEventListener('sourceended', () => {
@@ -252,12 +290,12 @@ window.onload = function () {
     }
 
     /**
-     * Drain the pending chunk queue for a given SourceBuffer ID.
+     * Drain the pending chunk queue for a given trackType.
      * Respects the SourceBuffer.updating flag to avoid InvalidStateError.
      */
-    function drainQueue(sbID) {
-        const sb = sourceBuffers[sbID];
-        const queue = chunkQueues[sbID];
+    function drainQueue(trackType) {
+        const sb = sourceBuffers[trackType];
+        const queue = chunkQueues[trackType];
 
         if (!sb || !queue || queue.length === 0) return;
         if (sb.updating) return; // will be called again from updateend
@@ -266,7 +304,7 @@ window.onload = function () {
         try {
             sb.appendBuffer(chunk);
         } catch (e) {
-            logErrorTerm(`[MSE][${sbID}] appendBuffer error: ${e}`);
+            logErrorTerm(`[MSE][${trackType}] appendBuffer error: ${e}`);
             // On quota exceeded, clear old buffered range
             if (e.name === 'QuotaExceededError' && sb.buffered.length > 0) {
                 const removeEnd = sb.buffered.end(0) - 30; // keep last 30s
@@ -289,51 +327,69 @@ window.onload = function () {
         }
 
         const data = base64ToUint8Array(chunkB64);
+        const fullMime = mimeType.includes('codecs') ? mimeType : (codec ? `${mimeType}; codecs="${codec}"` : mimeType);
 
         if (isInitSegment) {
             mseInitCount++;
-            logTerminal(`[MSE][${sourceBufferID}] Init segment #${mseInitCount} mimeType=${mimeType} codec=${codec} size=${data.length}`);
+            logTerminal(`[MSE][${trackType}][${sourceBufferID}] Init segment #${mseInitCount} mimeType=${mimeType} codec=${codec} size=${data.length}`);
 
-            // Create SourceBuffer if this is the first init for this track
-            if (!sourceBuffers[sourceBufferID] && mseReady) {
-                const fullMime = codec ? `${mimeType}; codecs="${codec}"` : mimeType;
-                try {
-                    const sb = mediaSource.addSourceBuffer(fullMime);
-                    sb.mode = 'segments';
-                    sourceBuffers[sourceBufferID] = sb;
-                    chunkQueues[sourceBufferID] = [];
+            if (mseReady) {
+                const sb = sourceBuffers[trackType];
+                if (!sb) {
+                    // Create SourceBuffer if this is the first init for this trackType
+                    try {
+                        const newSb = mediaSource.addSourceBuffer(fullMime);
+                        newSb.mode = 'segments';
+                        sourceBuffers[trackType] = newSb;
+                        chunkQueues[trackType] = [];
+                        configuredMimeTypes[trackType] = fullMime;
 
-                    sb.addEventListener('updateend', () => {
-                        drainQueue(sourceBufferID);
-                    });
-                    sb.addEventListener('error', (e) => {
-                        logErrorTerm(`[MSE][${sourceBufferID}] SourceBuffer error: ${e}`);
-                    });
+                        newSb.addEventListener('updateend', () => {
+                            drainQueue(trackType);
+                        });
+                        newSb.addEventListener('error', (e) => {
+                            logErrorTerm(`[MSE][${trackType}] SourceBuffer error: ${e}`);
+                        });
 
-                    logTerminal(`[MSE][${sourceBufferID}] SourceBuffer created for ${fullMime}`);
-                } catch (e) {
-                    logErrorTerm(`[MSE][${sourceBufferID}] Failed to add SourceBuffer for ${fullMime}: ${e}`);
-                    return;
+                        logTerminal(`[MSE][${trackType}] SourceBuffer created for ${fullMime}`);
+                    } catch (e) {
+                        logErrorTerm(`[MSE][${trackType}] Failed to add SourceBuffer for ${fullMime}: ${e}`);
+                        return;
+                    }
+                } else if (configuredMimeTypes[trackType] !== fullMime) {
+                    // Codec change / resolution switch — call changeType dynamically
+                    logTerminal(`[MSE][${trackType}] Changing codec configuration: ${configuredMimeTypes[trackType]} → ${fullMime}`);
+                    try {
+                        if (typeof sb.changeType === 'function') {
+                            sb.changeType(fullMime);
+                            configuredMimeTypes[trackType] = fullMime;
+                        } else {
+                            logErrorTerm(`[MSE][${trackType}] changeType not supported by browser`);
+                        }
+                    } catch (e) {
+                        logErrorTerm(`[MSE][${trackType}] changeType failed: ${e}`);
+                    }
                 }
-            } else if (!mseReady) {
-                // sourceopen not yet fired — queue it
-                if (!chunkQueues[sourceBufferID]) {
-                    chunkQueues[sourceBufferID] = [];
+            } else {
+                // sourceopen not yet fired — save config and queue it
+                pendingSourceBuffers[trackType] = fullMime;
+                if (!chunkQueues[trackType]) {
+                    chunkQueues[trackType] = [];
                 }
-                chunkQueues[sourceBufferID].unshift(data); // prepend init
+                chunkQueues[trackType].push(data);
                 return;
             }
         }
 
         // Queue the chunk
-        if (!chunkQueues[sourceBufferID]) {
-            chunkQueues[sourceBufferID] = [];
+        if (!chunkQueues[trackType]) {
+            chunkQueues[trackType] = [];
         }
-        chunkQueues[sourceBufferID].push(data);
+        chunkQueues[trackType].push(data);
 
         // Start draining if MSE is ready and SourceBuffer exists
-        if (mseReady && sourceBuffers[sourceBufferID]) {
-            drainQueue(sourceBufferID);
+        if (mseReady && sourceBuffers[trackType]) {
+            drainQueue(trackType);
         }
 
         // Attempt autoplay on first media chunk

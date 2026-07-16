@@ -6,6 +6,10 @@ export function HideWindow() {
   return window['go']['main']['App']['HideWindow']();
 }
 
+export function NotifyMSEActive(arg1) {
+  return window['go']['main']['App']['NotifyMSEActive'](arg1);
+}
+
 export function RequestLoopbackOffer() {
   return window['go']['main']['App']['RequestLoopbackOffer']();
 }

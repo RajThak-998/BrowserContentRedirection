@@ -3,6 +3,8 @@
 
 export function HideWindow():Promise<void>;
 
+export function NotifyMSEActive(arg1:boolean):Promise<void>;
+
 export function RequestLoopbackOffer():Promise<void>;
 
 export function SendSdpAnswer(arg1:string):Promise<void>;

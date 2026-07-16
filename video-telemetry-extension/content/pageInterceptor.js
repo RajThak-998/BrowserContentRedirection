@@ -97,6 +97,33 @@
     const origAppendBuffer = SourceBuffer.prototype.appendBuffer;
     const origChangeType = SourceBuffer.prototype.changeType; // may be undefined
     const origAddSourceBuffer = MediaSource.prototype?.addSourceBuffer;
+    const origCanPlayType = HTMLMediaElement.prototype.canPlayType;
+    const origIsTypeSupported = typeof MediaSource !== 'undefined' ? MediaSource.isTypeSupported : null;
+
+    // Block AV1 codec support to force fallback to VP9/H.264
+    function shouldBlockCodec(type) {
+        if (typeof type !== 'string') return false;
+        const lower = type.toLowerCase();
+        return lower.includes('av01') || lower.includes('av1');
+    }
+
+    if (origIsTypeSupported) {
+        MediaSource.isTypeSupported = function patchedIsTypeSupported(type) {
+            if (shouldBlockCodec(type)) {
+                BCR_LOG('[CodecBlocker] Blocking AV1 type check in isTypeSupported:', type);
+                return false;
+            }
+            return origIsTypeSupported.call(MediaSource, type);
+        };
+    }
+
+    HTMLMediaElement.prototype.canPlayType = function patchedCanPlayType(type) {
+        if (shouldBlockCodec(type)) {
+            BCR_LOG('[CodecBlocker] Blocking AV1 type check in canPlayType:', type);
+            return "";
+        }
+        return origCanPlayType.call(this, type);
+    };
 
     // Save RTCPeerConnection method originals for shadow signaling hooks.
     const rtcProto = window.RTCPeerConnection?.prototype;
