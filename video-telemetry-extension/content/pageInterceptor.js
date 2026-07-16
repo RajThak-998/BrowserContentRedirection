@@ -40,45 +40,40 @@
         // Ignore failures in locked-down contexts.
     }
 
-    // ─── SFU Keepalive State and Functions ────────────────────────────────────
-    let _sfuSignalingBaseUrl = null;
+    // ─── Silent Audio Keepalive (Anti-Throttle) ────────────────────────────────
+    // Chrome aggressively throttles background tabs (setTimeout → 60s, CPU starved).
+    // Playing a silent audio tone prevents Chrome from applying "intensive wake up
+    // throttling" to this tab, keeping our WebRTC signaling responsive even when
+    // Teams is in a background tab or Windows Efficiency Mode is active.
+    let _silentAudioCtx = null;
+    let _silentAudioStarted = false;
 
-    function captureSfuUrl(url) {
-        if (_sfuSignalingBaseUrl) return;
+    function startSilentAudioKeepalive() {
+        if (_silentAudioStarted) return;
         try {
-            const urlObj = new URL(url);
-            const host = urlObj.hostname;
-            const pathname = urlObj.pathname;
-            const isTeamsSfu = /^[^/]+\.teams\.microsoft\.com$/i.test(host) && pathname.includes('/sdp');
-            const isGenericSfu = (host.endsWith('.teams.microsoft.com') || host.endsWith('.skype.com')) &&
-                                 (pathname.includes('/calling/') || pathname.includes('/sdp'));
-            if (isTeamsSfu || isGenericSfu) {
-                _sfuSignalingBaseUrl = urlObj.origin;
-                BCR_LOG('[BCR] Captured SFU signaling origin for keepalive:', _sfuSignalingBaseUrl);
-            }
-        } catch (_) {}
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return;
+            _silentAudioCtx = new AudioCtx();
+            const gain = _silentAudioCtx.createGain();
+            gain.gain.value = 0; // completely silent
+            const osc = _silentAudioCtx.createOscillator();
+            osc.frequency.value = 440;
+            osc.connect(gain);
+            gain.connect(_silentAudioCtx.destination);
+            osc.start();
+            _silentAudioStarted = true;
+            BCR_LOG('[BCR] Silent audio keepalive started — tab will resist background throttling');
+        } catch (e) {
+            BCR_LOG('[BCR] Silent audio keepalive failed:', e);
+        }
     }
 
-    // Intercept fetch at module level to capture the SFU URL passively
-    const origFetch = window.fetch;
-    window.fetch = function patchedFetch(input, init) {
-        try {
-            const url = typeof input === 'string' ? input
-                : (input && typeof input === 'object' && 'url' in input) ? input.url : String(input);
-            captureSfuUrl(url);
-        } catch (_) {}
-        return origFetch.apply(this, arguments);
-    };
-
-    function keepSfuConnectionAlive(signal) {
-        const id = setInterval(() => {
-            if (signal.aborted) { clearInterval(id); return; }
-            if (!_sfuSignalingBaseUrl) return;
-            fetch(_sfuSignalingBaseUrl, {
-                method: 'HEAD', keepalive: true, mode: 'no-cors'
-            }).catch(() => {});
-        }, 4000);
-        signal.addEventListener('abort', () => clearInterval(id), { once: true });
+    function stopSilentAudioKeepalive() {
+        if (_silentAudioCtx) {
+            try { _silentAudioCtx.close(); } catch (_) {}
+            _silentAudioCtx = null;
+            _silentAudioStarted = false;
+        }
     }
 
     // ─── Shared State ─────────────────────────────────────────────────────────
@@ -251,15 +246,9 @@
     // This prevents the browser from racing ahead and sending its native offer to
     // Azure before Go has finished, which caused the DTLS fingerprint mismatch.
     //
-    // Consumers: patchedSetLocalDescription (now only applied in setLocalDescription,
-    // as createOffer and createAnswer no longer wait).
-    // Restore to 5 000 ms (or a tighter value like 8 000 ms) once the hang is fixed.
-    const RTC_WAIT_TIMEOUT_MS = 60_000; // TODO: revert to 5_000 after Go-side hang is resolved
+    // Per-PC state stored in a WeakMap (GC-safe) and a bridgeId→PC lookup Map.
     const rtcStateByPeer = new WeakMap();
     const rtcPcByBridgeId = new Map(); // bridgeId → PC (for late candidate trickle)
-    const rtcReadyByBridgeId = new Map();
-    const rtcWaitersByBridgeId = new Map();
-    const rtcLastErrorByBridgeId = new Map();
 
     function generateBridgeId() {
         if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -324,92 +313,20 @@
         return entry;
     }
 
-    function resolveShadowReady(bridgeId, payload) {
-        if (!bridgeId) return;
-        rtcReadyByBridgeId.set(bridgeId, payload);
-        rtcLastErrorByBridgeId.delete(bridgeId);
-
-        const waiters = rtcWaitersByBridgeId.get(bridgeId);
-        if (!waiters || waiters.length === 0) return;
-
-        // Only resolve waiters whose expectedSdpType matches the READY's sdpType.
-        // Waiters with no type preference (null/undefined) match everything.
-        // Non-matching waiters stay in the queue for their correct SHADOW_READY.
-        const incomingType = (payload?.sdpType ?? '').toLowerCase();
-        const matched = [];
-        const remaining = [];
-
-        for (const waiter of waiters) {
-            const expected = (waiter.expectedSdpType ?? '').toLowerCase();
-            if (!expected || !incomingType || expected === incomingType) {
-                matched.push(waiter);
-            } else {
-                remaining.push(waiter);
+    // ─── Async Credential Application ────────────────────────────────────────
+    // Called when SHADOW_READY arrives (asynchronously after setLocalDescription
+    // has already returned). Applies trickle ICE candidates to the PC so the
+    // SFU can connect to the shadow transport.
+    function _applyCredentialsAndTrickle(pc, entry) {
+        if (!entry || !entry.shadowCredentials) return;
+        // Trickle candidates (deduplicated by generationId)
+        if (Array.isArray(entry.shadowCredentials.candidates)) {
+            const genId = entry.shadowCredentials.generatedAt || entry.shadowCredentials.iceUfrag;
+            if (entry.lastDispatchedTrickleId !== genId) {
+                entry.lastDispatchedTrickleId = genId;
+                dispatchShadowTrickleCandidates(pc, entry.shadowCredentials.candidates);
             }
         }
-
-        if (remaining.length === 0) {
-            rtcWaitersByBridgeId.delete(bridgeId);
-        } else {
-            rtcWaitersByBridgeId.set(bridgeId, remaining);
-        }
-
-        for (const waiter of matched) {
-            clearTimeout(waiter.timer);
-            waiter.resolve(payload);
-        }
-    }
-
-    function rejectShadowReady(bridgeId, reason = 'shadow_error') {
-        if (!bridgeId) return;
-
-        rtcLastErrorByBridgeId.set(bridgeId, reason);
-
-        const waiters = rtcWaitersByBridgeId.get(bridgeId);
-        if (!waiters || waiters.length === 0) return;
-
-        rtcWaitersByBridgeId.delete(bridgeId);
-        for (const waiter of waiters) {
-            clearTimeout(waiter.timer);
-            waiter.resolve(null);
-        }
-    }
-
-    function awaitShadowReady(bridgeId, timeoutMs, expectedSdpType) {
-        if (!bridgeId) return Promise.resolve(null);
-
-        // Check cache — only accept if the cached entry's sdpType matches.
-        const cached = rtcReadyByBridgeId.get(bridgeId);
-        if (cached) {
-            const cachedType = (cached.sdpType ?? '').toLowerCase();
-            const expected = (expectedSdpType ?? '').toLowerCase();
-            if (!expected || !cachedType || expected === cachedType) {
-                return Promise.resolve(cached);
-            }
-            // Cache exists but wrong type — fall through to wait for the right one.
-        }
-
-        return new Promise((resolve) => {
-            const timer = setTimeout(() => {
-                const list = rtcWaitersByBridgeId.get(bridgeId) ?? [];
-                rtcWaitersByBridgeId.set(
-                    bridgeId,
-                    list.filter((item) => item.resolve !== resolve)
-                );
-                resolve(null);
-            }, timeoutMs);
-
-            const waiters = rtcWaitersByBridgeId.get(bridgeId) ?? [];
-            waiters.push({ resolve, timer, expectedSdpType });
-            rtcWaitersByBridgeId.set(bridgeId, waiters);
-        });
-    }
-
-    function consumeShadowErrorReason(bridgeId) {
-        if (!bridgeId) return null;
-        const reason = rtcLastErrorByBridgeId.get(bridgeId) ?? null;
-        rtcLastErrorByBridgeId.delete(bridgeId);
-        return reason;
     }
 
     function buildDescriptionLike(originalDescription, nextSdp) {
@@ -839,14 +756,16 @@
         if (entry.closedEmitted) return;
 
         entry.closedEmitted = true;
-        rtcReadyByBridgeId.delete(entry.bridgeId);
-        rejectShadowReady(entry.bridgeId);
 
         entry.shadowCredentials = null;
         entry.lastOriginalLocalSdp = null;
         entry.lastCreateActionType = null;
         entry.lastDispatchedTrickleId = null;
         entry.lastRemoteOfferSdp = null;
+        entry.shadowLocalEmitted = false;
+        entry._cachedPinnedSdp = null;
+
+        stopSilentAudioKeepalive();
 
         emitShadowEvent('BCR_RTC_SHADOW_CLOSE', {
             bridgeId: entry.bridgeId,
@@ -931,7 +850,10 @@
                     return;
                 }
                 BCR_LOG('[BCR] Received SHADOW_READY bridgeId=', bridgeId);
-                resolveShadowReady(bridgeId, payload);
+                // Eagerly store credentials and apply trickle ICE candidates.
+                // setLocalDescription is non-blocking — credentials are applied async.
+                existingEntry.shadowCredentials = payload;
+                _applyCredentialsAndTrickle(pc, existingEntry);
             }
         }
 
@@ -940,7 +862,8 @@
             const bridgeId = payload?.bridgeId;
             if (typeof bridgeId === 'string' && bridgeId.length > 0) {
                 BCR_LOG('[BCR] Received SHADOW_ERROR bridgeId=', bridgeId, 'stage=', payload?.stage, 'reason=', payload?.reason);
-                rejectShadowReady(bridgeId, payload?.reason ?? 'shadow_error');
+                // No action needed — setLocalDescription is non-blocking,
+                // and the localDescription getter will return original SDP as fallback.
             }
         }
 
@@ -1025,10 +948,9 @@
             if (!desc || !desc.sdp) return desc;
             const entry = rtcStateByPeer.get(pc);
             if (!entry || !entry.shadowCredentials) return desc;
-            // Apply codec pinning + transport munging so Teams only sees our pinned codecs.
-            const pinnedSdp = filterSdpToPreferredCodecs(desc.sdp);
+            // Use cached pinned SDP if available to avoid redundant filtering.
+            const pinnedSdp = entry._cachedPinnedSdp || filterSdpToPreferredCodecs(desc.sdp);
             const mungedSdp = mungeSdpTransport(pinnedSdp, entry.shadowCredentials);
-            // Return a plain object that looks like RTCSessionDescription
             return { type: desc.type, sdp: mungedSdp };
         }
 
@@ -1081,56 +1003,30 @@
             const sdpType = (description.type ?? '').toLowerCase();
             const origSdpString = entry.lastOriginalLocalSdp || description.sdp;
 
-            // Check if credentials are already set and sdpType matches entry.lastCreateActionType
-            const hasCachedCreds = entry.shadowCredentials &&
-                sdpType === (entry.lastCreateActionType ?? '').toLowerCase();
+            // Fire-and-forget: emit SHADOW_LOCAL if not already emitted for this sdpType.
+            // Unlike the old blocking design, we do NOT await SHADOW_READY here.
+            // The localDescription getter handles munging when credentials arrive.
+            if (!entry.shadowLocalEmitted || sdpType !== (entry.lastCreateActionType ?? '').toLowerCase()) {
+                entry.lastCreateActionType = sdpType;
+                entry.lastOriginalLocalSdp = description.sdp;
+                entry.shadowLocalEmitted = true;
+                const pinnedSdp = filterSdpToPreferredCodecs(description.sdp);
+                entry._cachedPinnedSdp = pinnedSdp;
 
-            if (!hasCachedCreds) {
-                // If we didn't go through createOffer/createAnswer first (or if type doesn't match),
-                // we should emit the event and delete the cached ready entry if it is an offer.
-                if (!entry.lastCreateActionType || sdpType !== (entry.lastCreateActionType ?? '').toLowerCase()) {
-                    entry.lastCreateActionType = description.type;
-                    entry.lastOriginalLocalSdp = description.sdp;
-                    const pinnedSdp = filterSdpToPreferredCodecs(description.sdp);
+                captureIceServersFromConnection(this);
 
-                    captureIceServersFromConnection(this);
+                emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
+                    bridgeId: entry.bridgeId,
+                    sdpType: description.type ?? 'unknown',
+                    sdp: pinnedSdp,
+                    iceServers: entry.iceServers ?? [],
+                    timestamp: Date.now(),
+                });
 
-                    emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
-                        bridgeId: entry.bridgeId,
-                        sdpType: description.type ?? 'unknown',
-                        sdp: pinnedSdp,
-                        iceServers: entry.iceServers ?? [],
-                        timestamp: Date.now(),
-                    });
+                BCR_LOG('[BCR] Emitted SHADOW_LOCAL (non-blocking) type:', description.type ?? 'unknown', 'bridgeId=', entry.bridgeId);
 
-                    BCR_LOG('[BCR] Captured SDP type:', description.type ?? 'unknown', 'direction=local bridgeId=', entry.bridgeId);
-
-                    if (sdpType === 'offer') {
-                        rtcReadyByBridgeId.delete(entry.bridgeId);
-                    }
-                }
-
-                const abortCtrl = new AbortController();
-                keepSfuConnectionAlive(abortCtrl.signal);
-                const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS, sdpType);
-                abortCtrl.abort();
-
-                const currentEntry = ensureRtcState(this);
-                if (currentEntry.bridgeId !== entry.bridgeId) {
-                    BCR_LOG('[BCR] BridgeId changed during setLocalDescription; fail-open with original SDP');
-                    return origSetLocalDescription.apply(this, args);
-                }
-
-                if (!shadowReady) {
-                    const errReason = consumeShadowErrorReason(entry.bridgeId);
-                    BCR_LOG('[BCR] SHADOW_READY timeout or error, fail-open bridgeId=', entry.bridgeId, 'reason=', errReason ?? 'timeout');
-                    entry.shadowCredentials = null;
-                } else {
-                    entry.shadowCredentials = shadowReady;
-                    BCR_LOG('[BCR] Shadow credentials stored bridgeId=', entry.bridgeId);
-                }
-            } else {
-                BCR_LOG('[BCR] Skipping redundant SHADOW_LOCAL wait, using cached credentials bridgeId=', entry.bridgeId);
+                // Start silent audio to prevent tab throttling during the call
+                startSilentAudioKeepalive();
             }
 
             // CRITICAL: Pass the ORIGINAL SDP to Chrome's native method.
@@ -1142,28 +1038,17 @@
 
             const result = await origSetLocalDescription.apply(this, [chromeSafeDescription, ...args.slice(1)]);
 
-            // After Chrome accepts the original SDP, mutate the argument if the framework reads it later.
-            // Apply codec pinning + transport munging so Teams only sees our pinned codecs.
+            // If credentials already arrived (fast Go path), apply immediately.
+            // Otherwise, the localDescription getter will munge on-read.
             if (entry.shadowCredentials) {
-                const pinnedForMutation = filterSdpToPreferredCodecs(origSdpString);
+                const pinnedForMutation = entry._cachedPinnedSdp || filterSdpToPreferredCodecs(origSdpString);
                 const targetSdp = mungeSdpTransport(pinnedForMutation, entry.shadowCredentials);
                 try {
                     description.sdp = targetSdp;
-                    BCR_LOG('[BCR] Description object mutated with codec-pinned shadow SDP bridgeId=', entry.bridgeId);
-                } catch (_) {
-                    BCR_LOG('[BCR] Description object mutation failed (frozen) bridgeId=', entry.bridgeId);
-                }
-            }
-
-            // After setLocalDescription succeeds, start trickling the ICE candidates 
-            // cached securely inside the shadow setup properties out into the VDI framework.
-            if (entry.shadowCredentials && Array.isArray(entry.shadowCredentials.candidates)) {
-                // Deduplicate by tracking the signature of the generation
-                const generationId = entry.shadowCredentials.generatedAt || entry.shadowCredentials.iceUfrag;
-                if (entry.lastDispatchedTrickleId !== generationId) {
-                    entry.lastDispatchedTrickleId = generationId;
-                    dispatchShadowTrickleCandidates(this, entry.shadowCredentials.candidates);
-                }
+                    BCR_LOG('[BCR] Description object mutated with shadow SDP bridgeId=', entry.bridgeId);
+                } catch (_) {}
+                // Trickle ICE candidates
+                _applyCredentialsAndTrickle(this, entry);
             }
 
             return result;
@@ -1201,11 +1086,7 @@
 
                 BCR_LOG('[BCR] Captured SDP type:', description.type, 'direction=remote bridgeId=', entry.bridgeId);
 
-                // When a new remote offer arrives, the shadow PC will be rebuilt with
-                // fresh credentials. Invalidate any stale SHADOW_READY so the upcoming
-                // setLocalDescription(answer) waits for the fresh response.
                 if (descType === 'offer') {
-                    rtcReadyByBridgeId.delete(entry.bridgeId);
                     entry.lastRemoteOfferSdp = effectiveRemoteSdp;
                 }
 
@@ -1266,22 +1147,14 @@
             entry.lastCreateActionType = actionType;
             entry.lastOriginalLocalSdp = origDescription.sdp;
 
-            // ── SDP Codec Pinning ─────────────────────────────────────────────
-            // Filter the SDP to only advertise the preferred codecs BEFORE
-            // sending it to Go and to the SFU. This constrains the SFU to use
-            // only H264 + Opus, preventing mid-session codec switches that would
-            // trigger renegotiation cascades in the loopback player.
+            // ── SDP Codec Pinning ─────────────────────────────────────────────────────
             const pinnedSdp = filterSdpToPreferredCodecs(origDescription.sdp);
+            entry._cachedPinnedSdp = pinnedSdp;
 
             captureIceServersFromConnection(this);
 
-            emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
-                bridgeId: entry.bridgeId,
-                sdpType: origDescription.type ?? actionType,
-                sdp: pinnedSdp,
-                iceServers: entry.iceServers ?? [],
-                timestamp: Date.now(),
-            });
+            // SHADOW_LOCAL emission is deferred to setLocalDescription to avoid
+            // sending duplicate events when Teams calls createOffer then setLocalDescription.
 
             BCR_LOG('[BCR] Captured SDP type:', origDescription.type ?? actionType, 'direction=local build from', actionType, 'bridgeId=', entry.bridgeId);
 
@@ -1290,7 +1163,6 @@
         }
 
         rtcProto.createOffer = function patchedCreateOffer(...args) {
-            rtcReadyByBridgeId.delete(ensureRtcState(this).bridgeId);
             return patchedCreateAction.call(this, origCreateOffer, 'offer', ...args);
         };
 
