@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"log"
 	"math"
 	"net"
@@ -20,6 +21,12 @@ type App struct {
 
 	windowMu        sync.Mutex
 	lastWindowApply time.Time
+
+	// mseActive is set to true once MSE (YouTube) media chunks start arriving,
+	// and false when the video is removed. It gates window show/hide so that
+	// the WebRTC overlay and the YouTube overlay do not interfere with each other.
+	mseActiveMu sync.Mutex
+	mseActive   bool
 
 	mediaEngine *engine.Engine
 }
@@ -48,6 +55,34 @@ func (a *App) startup(ctx context.Context) {
 			OnVideoUpdate: func(update engine.VideoUpdate) {
 				b := update.Payload.ScreenBounds
 				a.applyWindowFromTelemetry(b.X, b.Y, b.Width, b.Height)
+				// Show/hide window based on playback state.
+				state := update.Payload.Playback.State
+				switch state {
+				case "playing":
+					a.showIfNeeded()
+				case "paused", "ended":
+					a.hideIfMSEMode()
+				}
+			},
+			OnVideoLifecycle: func(evtType string, videoID string) {
+				log.Printf("[bcr_client][video] lifecycle evtType=%s videoId=%s", evtType, videoID)
+				runtime.EventsEmit(a.ctx, "onVideoLifecycle", evtType, videoID)
+				if evtType == "VIDEO_REMOVED" {
+					a.hideIfMSEMode()
+				}
+			},
+			OnMediaChunk: func(header engine.MediaChunkHeader, chunkData []byte) {
+				// Encode chunk bytes as base64 for JSON-safe Wails event transport.
+				chunkB64 := base64.StdEncoding.EncodeToString(chunkData)
+				runtime.EventsEmit(a.ctx, "onMediaChunk",
+					header.Seq,
+					header.TrackType,
+					header.MimeType,
+					header.Codec,
+					header.SourceBufferID,
+					header.IsInitSegment,
+					chunkB64,
+				)
 			},
 			OnLog: func(message string) {
 				log.Println(message)
@@ -189,4 +224,45 @@ func (a *App) applyWindowFromTelemetry(x, y, w, h float64) {
 	a.SetWindowSize(iw, ih)
 
 	log.Printf("[Telemetry] VIDEO_UPDATE applied pos=(%d, %d) size=(%d, %d)", ix, iy, iw, ih)
+}
+
+// showIfNeeded shows the window and marks MSE as active. Safe to call on every
+// VIDEO_UPDATE with state=playing — it is idempotent.
+func (a *App) showIfNeeded() {
+	a.mseActiveMu.Lock()
+	if !a.mseActive {
+		a.mseActive = true
+		a.mseActiveMu.Unlock()
+		log.Println("[bcr_client][video] MSE active — showing overlay window")
+		runtime.WindowShow(a.ctx)
+		return
+	}
+	a.mseActiveMu.Unlock()
+}
+
+// hideIfMSEMode hides the window only when MSE (YouTube) is the active mode.
+// It does NOT hide during WebRTC sessions, preventing cross-feature interference.
+func (a *App) hideIfMSEMode() {
+	a.mseActiveMu.Lock()
+	defer a.mseActiveMu.Unlock()
+	if a.mseActive {
+		a.mseActive = false
+		log.Println("[bcr_client][video] MSE inactive — hiding overlay window")
+		runtime.WindowHide(a.ctx)
+	}
+}
+
+// NotifyMSEActive is called by the frontend when the MSE pipeline starts
+// receiving chunks. This gives Go-side awareness of MSE activity independent
+// of the playback state telemetry (which may lag slightly).
+func (a *App) NotifyMSEActive(active bool) {
+	a.mseActiveMu.Lock()
+	prev := a.mseActive
+	a.mseActive = active
+	a.mseActiveMu.Unlock()
+	if active && !prev {
+		log.Println("[bcr_client][video] MSE pipeline started (notified by frontend)")
+	} else if !active && prev {
+		log.Println("[bcr_client][video] MSE pipeline stopped (notified by frontend)")
+	}
 }

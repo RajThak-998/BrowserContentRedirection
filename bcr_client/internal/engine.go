@@ -161,7 +161,16 @@ func (e *Engine) readControlLoop(conn SignalingConn) {
 			return
 		}
 
-		if mt != 1 { // 1 = TextMessage
+		// Binary messages are media chunk frames: [u32 headerLen LE][headerJSON][rawChunk]
+		if mt != 1 {
+			e.handleMediaChunk(message)
+			continue
+		}
+
+		// Text messages: check if it's a binary frame embedded as text (starts with non-'{').
+		// The bridge sends binary frames with msgType=BinaryMessage, but we guard both paths.
+		if len(message) >= 4 && message[0] != '{' {
+			e.handleMediaChunk(message)
 			continue
 		}
 
@@ -172,6 +181,8 @@ func (e *Engine) readControlLoop(conn SignalingConn) {
 		if e.handleVideoUpdate(message) {
 			continue
 		}
+
+		e.handleVideoLifecycle(message)
 	}
 }
 
@@ -187,6 +198,59 @@ func (e *Engine) handleVideoUpdate(message []byte) bool {
 		e.cb.OnVideoUpdate(evt)
 	}
 	return true
+}
+
+func (e *Engine) handleVideoLifecycle(message []byte) bool {
+	var evt VideoLifecycle
+	if err := json.Unmarshal(message, &evt); err != nil {
+		return false
+	}
+	if evt.Type != "VIDEO_ADDED" && evt.Type != "VIDEO_REMOVED" {
+		return false
+	}
+	if e.cb.OnVideoLifecycle != nil {
+		e.cb.OnVideoLifecycle(evt.Type, evt.Payload.ID)
+	}
+	return true
+}
+
+// handleMediaChunk parses a binary media frame and dispatches the chunk
+// to the OnMediaChunk callback. Frame format: [u32 headerLen LE][headerJSON][rawChunk]
+func (e *Engine) handleMediaChunk(data []byte) {
+	if e.cb.OnMediaChunk == nil {
+		return
+	}
+	if len(data) < 4 {
+		e.logf("[bcr_client][media] binary frame too small (%d bytes) — dropped", len(data))
+		return
+	}
+
+	headerLen := int(binary.LittleEndian.Uint32(data[:4]))
+	if headerLen <= 0 || 4+headerLen > len(data) {
+		e.logf("[bcr_client][media] invalid header length=%d frame=%d — dropped", headerLen, len(data))
+		return
+	}
+
+	headerBytes := data[4 : 4+headerLen]
+	chunkBytes := data[4+headerLen:]
+
+	// The outer frame has type MEDIA_CHUNK with a nested payload.
+	// Unmarshal via the framed header struct.
+	type frameHeader struct {
+		Type    string          `json:"type"`
+		Payload MediaChunkHeader `json:"payload"`
+	}
+	var fh frameHeader
+	if err := json.Unmarshal(headerBytes, &fh); err != nil {
+		e.logf("[bcr_client][media] header decode failed: %v", err)
+		return
+	}
+	if fh.Type != "MEDIA_CHUNK" {
+		e.logf("[bcr_client][media] unexpected binary frame type=%q — dropped", fh.Type)
+		return
+	}
+
+	e.cb.OnMediaChunk(fh.Payload, chunkBytes)
 }
 
 // ─── Raw Session Lifecycle ────────────────────────────────────────────────────

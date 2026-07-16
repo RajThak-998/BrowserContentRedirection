@@ -153,7 +153,7 @@ func handleExtensionMessage(msgType int, data []byte, registry *Registry) {
 		// Existing telemetry path unchanged.
 		registry.Broadcast(msgType, data)
 
-		if isVideoUpdatePacket(data) || isRTCShadowUpstreamPacket(data) {
+		if isVideoUpdatePacket(data) || isRTCShadowUpstreamPacket(data) || isVideoLifecyclePacket(data) {
 			mediaBridge.tryForwardText(data)
 		}
 
@@ -215,6 +215,14 @@ func isRTCShadowDownstreamPacket(data []byte) bool {
 	default:
 		return false
 	}
+}
+
+func isVideoLifecyclePacket(data []byte) bool {
+	var pkt Packet
+	if err := json.Unmarshal(data, &pkt); err != nil {
+		return false
+	}
+	return pkt.Type == "VIDEO_ADDED" || pkt.Type == "VIDEO_REMOVED"
 }
 
 func handleMediaBinaryFrame(data []byte, registry *Registry) {
@@ -587,7 +595,31 @@ func (b *bridgeForwarder) runBridgeLoop() {
 }
 
 func (b *bridgeForwarder) tryForwardBinary(track, mime string, seq int64, isInit bool, data []byte) {
-	// Binary media chunks are legacy; media flows directly to bcr_client over direct raw WebRTC.
+	b.start()
+
+	if len(b.sendCh) > (bridgeControlQueue*3)/4 {
+		if isInit {
+			log.Printf("[Bridge] MEDIA_CHUNK_BIN dropped reason=bridge_busy track=%s seq=%d", track, seq)
+		}
+		return
+	}
+
+	// data is the full framed binary packet: [u32 headerLen LE][headerJSON][rawChunk].
+	// Copy it so the caller's buffer can be reused safely.
+	payload := append([]byte(nil), data...)
+
+	select {
+	case b.sendCh <- bridgeMessage{
+		msgType:    websocket.BinaryMessage,
+		data:       payload,
+		packetType: "MEDIA_CHUNK",
+		bridgeID:   "",
+	}:
+	default:
+		if isInit {
+			log.Printf("[Bridge] MEDIA_CHUNK_BIN dropped reason=bridge_queue_full track=%s seq=%d", track, seq)
+		}
+	}
 }
 
 func (b *bridgeForwarder) tryForwardText(data []byte) {
@@ -598,12 +630,16 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 		packetType == PacketTypeRTCShadowClose ||
 		packetType == PacketTypeRTCShadowCandidate ||
 		packetType == PacketTypeRTCShadowIceServers
+	// Video lifecycle events forwarded so bcr_client can manage overlay window.
+	isVideoLifecycle := packetType == "VIDEO_ADDED" || packetType == "VIDEO_REMOVED"
 
 	if len(b.sendCh) > (bridgeControlQueue*3)/4 {
 		if isShadow {
 			log.Printf("[Bridge] SHADOW_UP dropped reason=bridge_busy type=%s bridgeId=%s", packetType, bridgeID)
 		}
-		return
+		if !isVideoLifecycle {
+			return
+		}
 	}
 
 	payload := append([]byte(nil), data...)

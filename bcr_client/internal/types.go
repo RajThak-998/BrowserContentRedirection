@@ -17,9 +17,11 @@ type PreferredCodecs struct {
 }
 
 type Callbacks struct {
-	OnLoopbackOffer func(bridgeID string, sdp string)
-	OnVideoUpdate   func(update VideoUpdate)
-	OnLog           func(message string)
+	OnLoopbackOffer   func(bridgeID string, sdp string)
+	OnVideoUpdate     func(update VideoUpdate)
+	OnVideoLifecycle  func(evtType string, videoID string)
+	OnMediaChunk      func(header MediaChunkHeader, chunkData []byte)
+	OnLog             func(message string)
 }
 
 type Packet struct {
@@ -38,8 +40,32 @@ type Bounds struct {
 type VideoUpdate struct {
 	Type    string `json:"type"`
 	Payload struct {
+		ID           string `json:"id"`
 		ScreenBounds Bounds `json:"screenBounds"`
+		Playback     struct {
+			State string `json:"state"`
+		} `json:"playback"`
 	} `json:"payload"`
+}
+
+// VideoLifecycle carries VIDEO_ADDED / VIDEO_REMOVED events.
+type VideoLifecycle struct {
+	Type    string `json:"type"`
+	Payload struct {
+		ID string `json:"id"`
+	} `json:"payload"`
+}
+
+// MediaChunkHeader matches the binary frame header produced by bcr_host.
+type MediaChunkHeader struct {
+	Seq            int64   `json:"seq"`
+	Size           int     `json:"size"`
+	TS             float64 `json:"ts"`
+	TrackType      string  `json:"trackType"`
+	MimeType       string  `json:"mimeType"`
+	Codec          string  `json:"codec"`
+	SourceBufferID string  `json:"sourceBufferId"`
+	IsInitSegment  bool    `json:"isInitSegment"`
 }
 
 type RTCShadowRemotePayload struct {
