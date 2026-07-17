@@ -156,6 +156,7 @@ window.onload = function () {
     let pendingSourceBuffers = {}; // keyed by trackType, stores fullMime for SourceBuffers to create on sourceopen
     let mseReady = false;
     let mseInitCount = 0;          // how many init segments received — used for first-chunk logging
+    let activeVideoID = null;      // the unique ID of the video currently playing/redirecting
 
     /**
      * Base64 → Uint8Array (no extra dependencies)
@@ -181,9 +182,10 @@ window.onload = function () {
             Object.keys(sourceBuffers).forEach((type) => {
                 try {
                     const sb = sourceBuffers[type];
-                    if (!sb.updating) {
-                        mediaSource.removeSourceBuffer(sb);
-                    }
+                    try {
+                        sb.abort(); // Abort any pending updates to immediately stop updating
+                    } catch (_) {}
+                    mediaSource.removeSourceBuffer(sb);
                 } catch (e) { /* ignore */ }
             });
             if (mediaSource.readyState === 'open') {
@@ -198,6 +200,7 @@ window.onload = function () {
         mediaSource = null;
         mseReady = false;
         mseInitCount = 0;
+        activeVideoID = null;
 
         // Revoke old object URL and clear srcObject so the video element resets
         if (videoElement.src && videoElement.src.startsWith('blob:')) {
@@ -276,16 +279,35 @@ window.onload = function () {
             chunkQueues = {};
             configuredMimeTypes = {};
             pendingSourceBuffers = {};
+            mseInitCount = 0;
+            activeVideoID = null;
         });
 
         mediaSource.addEventListener('sourceended', () => {
             logTerminal("[MSE] MediaSource sourceended");
         });
 
+        // Show the overlay and start playback only when the browser signals it
+        // has enough buffered data — not before, to avoid flashing a blank window.
+        videoElement.addEventListener('canplay', () => {
+            if (playbackMode !== 'mse') return; // torn down before canplay fired
+            videoElement.play().catch((e) => {
+                logTerminal(`[MSE] canplay auto-play blocked: ${e}`);
+            });
+            if (window.go && window.go.main && window.go.main.App) {
+                window.go.main.App.NotifyMSEActive(true).catch(() => {});
+            }
+        }, { once: true });
+
+        // Recover from native video decode errors (bad segments, GPU reset, etc.)
+        videoElement.addEventListener('error', () => {
+            if (videoElement.error && playbackMode === 'mse') {
+                logErrorTerm(`[MSE] Video element error (code=${videoElement.error.code}) — resetting pipeline`);
+                teardownMSE();
+            }
+        }, { once: true });
+
         setMode('mse');
-        if (window.go && window.go.main && window.go.main.App) {
-            window.go.main.App.NotifyMSEActive(true).catch(() => {});
-        }
         logTerminal("[MSE] Pipeline set up — waiting for sourceopen");
     }
 
@@ -320,10 +342,12 @@ window.onload = function () {
     /**
      * Handle a single incoming media chunk (called from Wails event handler).
      */
-    function handleMediaChunk(seq, trackType, mimeType, codec, sourceBufferID, isInitSegment, chunkB64) {
+    function handleMediaChunk(seq, trackType, mimeType, codec, sourceBufferID, isInitSegment, chunkB64, videoID) {
         // Lazily set up MSE on first chunk
         if (!mediaSource) {
             setupMSE();
+            activeVideoID = videoID;
+            logTerminal(`[MSE] Set activeVideoID to ${activeVideoID}`);
         }
 
         const data = base64ToUint8Array(chunkB64);
@@ -331,17 +355,23 @@ window.onload = function () {
 
         if (isInitSegment) {
             mseInitCount++;
-            logTerminal(`[MSE][${trackType}][${sourceBufferID}] Init segment #${mseInitCount} mimeType=${mimeType} codec=${codec} size=${data.length}`);
+            logTerminal(`[MSE][${trackType}][${sourceBufferID}] Init segment #${mseInitCount} mimeType=${mimeType} codec=${codec} size=${data.length} videoId=${videoID}`);
+
+            // A new init segment signals a new codec context for this track.
+            // Flush ALL previously queued chunks — they belong to the prior init and
+            // must NOT be fed to a freshly-configured SourceBuffer (causes decode errors).
+            // YouTube sends one init segment per adaptive quality stream; we only want
+            // the latest one for each track.
+            chunkQueues[trackType] = [];
 
             if (mseReady) {
                 const sb = sourceBuffers[trackType];
                 if (!sb) {
-                    // Create SourceBuffer if this is the first init for this trackType
+                    // First init for this trackType in this MSE session — create the SourceBuffer.
                     try {
                         const newSb = mediaSource.addSourceBuffer(fullMime);
                         newSb.mode = 'segments';
                         sourceBuffers[trackType] = newSb;
-                        chunkQueues[trackType] = [];
                         configuredMimeTypes[trackType] = fullMime;
 
                         newSb.addEventListener('updateend', () => {
@@ -357,58 +387,50 @@ window.onload = function () {
                         return;
                     }
                 } else if (configuredMimeTypes[trackType] !== fullMime) {
-                    // Codec change / resolution switch — call changeType dynamically
-                    logTerminal(`[MSE][${trackType}] Changing codec configuration: ${configuredMimeTypes[trackType]} → ${fullMime}`);
+                    // Codec / resolution change — call changeType to reconfigure the decoder.
+                    logTerminal(`[MSE][${trackType}] Codec change: ${configuredMimeTypes[trackType]} → ${fullMime}`);
                     try {
                         if (typeof sb.changeType === 'function') {
                             sb.changeType(fullMime);
                             configuredMimeTypes[trackType] = fullMime;
                         } else {
-                            logErrorTerm(`[MSE][${trackType}] changeType not supported by browser`);
+                            logErrorTerm(`[MSE][${trackType}] changeType not supported — keeping existing config`);
                         }
                     } catch (e) {
                         logErrorTerm(`[MSE][${trackType}] changeType failed: ${e}`);
                     }
                 }
+                // Same codec: reuse existing SourceBuffer — fall through to queue init below.
             } else {
-                // sourceopen not yet fired — save config and queue it
+                // sourceopen not yet fired — store config and queue ONLY this init segment.
+                // (chunkQueues[trackType] was already cleared above, so only the latest init is kept.)
                 pendingSourceBuffers[trackType] = fullMime;
-                if (!chunkQueues[trackType]) {
-                    chunkQueues[trackType] = [];
-                }
                 chunkQueues[trackType].push(data);
                 return;
             }
         }
 
-        // Queue the chunk
+        // Queue this chunk (init or media segment).
         if (!chunkQueues[trackType]) {
             chunkQueues[trackType] = [];
         }
         chunkQueues[trackType].push(data);
 
-        // Start draining if MSE is ready and SourceBuffer exists
+        // Drain as soon as the SourceBuffer is ready.
         if (mseReady && sourceBuffers[trackType]) {
             drainQueue(trackType);
-        }
-
-        // Attempt autoplay on first media chunk
-        if (seq === 0 || (isInitSegment && mseInitCount === 1)) {
-            videoElement.play().catch((e) => {
-                logTerminal(`[MSE] play() blocked (autoplay policy?): ${e}`);
-            });
         }
     }
 
     // ── Wails event: onMediaChunk ─────────────────────────────────────────
-    // Arguments: seq, trackType, mimeType, codec, sourceBufferId, isInitSegment, chunkB64
-    window.runtime.EventsOn("onMediaChunk", (seq, trackType, mimeType, codec, sourceBufferID, isInitSegment, chunkB64) => {
+    // Arguments: seq, trackType, mimeType, codec, sourceBufferId, isInitSegment, chunkB64, videoId
+    window.runtime.EventsOn("onMediaChunk", (seq, trackType, mimeType, codec, sourceBufferID, isInitSegment, chunkB64, videoID) => {
         // Don't process MSE chunks while in WebRTC mode (e.g. Teams call active)
         if (playbackMode === 'webrtc') {
             return;
         }
         try {
-            handleMediaChunk(seq, trackType, mimeType, codec, sourceBufferID, isInitSegment, chunkB64);
+            handleMediaChunk(seq, trackType, mimeType, codec, sourceBufferID, isInitSegment, chunkB64, videoID);
         } catch (e) {
             logErrorTerm(`[MSE] onMediaChunk handler error: ${e}`);
         }
@@ -417,7 +439,9 @@ window.onload = function () {
     // ── Wails event: onVideoLifecycle ────────────────────────────────────
     window.runtime.EventsOn("onVideoLifecycle", (evtType, videoID) => {
         logTerminal(`[Video] lifecycle evtType=${evtType} videoId=${videoID}`);
-        if (evtType === "VIDEO_REMOVED" && playbackMode === 'mse') {
+        if (evtType === "VIDEO_REMOVED" && (!activeVideoID || videoID === activeVideoID)) {
+            // Teardown ONLY if the active main video is removed, or if no active video was set yet.
+            // This prevents hover/preview videos from tearing down the active main session.
             teardownMSE();
         }
     });

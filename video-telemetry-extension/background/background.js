@@ -493,6 +493,9 @@ function _normalizeMediaPayload(payload) {
             sourceBufferId: typeof payload.sourceBufferId === "string" && payload.sourceBufferId.length > 0
                 ? payload.sourceBufferId
                 : "unknown",
+            videoId: typeof payload.videoId === "string" && payload.videoId.length > 0
+                ? payload.videoId
+                : "unknown",
             isInitSegment: payload.isInitSegment === true,
             chunkBytes: payload.chunkBytes,
         },

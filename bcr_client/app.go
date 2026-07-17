@@ -55,14 +55,9 @@ func (a *App) startup(ctx context.Context) {
 			OnVideoUpdate: func(update engine.VideoUpdate) {
 				b := update.Payload.ScreenBounds
 				a.applyWindowFromTelemetry(b.X, b.Y, b.Width, b.Height)
-				// Show/hide window based on playback state.
-				state := update.Payload.Playback.State
-				switch state {
-				case "playing":
-					a.showIfNeeded()
-				case "paused", "ended":
-					a.hideIfMSEMode()
-				}
+				// Window visibility is managed exclusively by NotifyMSEActive() called
+				// from the frontend — not by VDI playback state, which flaps rapidly
+				// during quality switches and causes window oscillation.
 			},
 			OnVideoLifecycle: func(evtType string, videoID string) {
 				log.Printf("[bcr_client][video] lifecycle evtType=%s videoId=%s", evtType, videoID)
@@ -82,6 +77,7 @@ func (a *App) startup(ctx context.Context) {
 					header.SourceBufferID,
 					header.IsInitSegment,
 					chunkB64,
+					header.VideoID,
 				)
 			},
 			OnLog: func(message string) {
@@ -252,17 +248,19 @@ func (a *App) hideIfMSEMode() {
 	}
 }
 
-// NotifyMSEActive is called by the frontend when the MSE pipeline starts
-// receiving chunks. This gives Go-side awareness of MSE activity independent
-// of the playback state telemetry (which may lag slightly).
+// NotifyMSEActive is called by the frontend when the MSE pipeline becomes live
+// (canplay event fired) or is torn down. It drives the overlay window visibility
+// so the window only shows when the thin client is actually rendering video.
 func (a *App) NotifyMSEActive(active bool) {
 	a.mseActiveMu.Lock()
 	prev := a.mseActive
 	a.mseActive = active
 	a.mseActiveMu.Unlock()
 	if active && !prev {
-		log.Println("[bcr_client][video] MSE pipeline started (notified by frontend)")
+		log.Println("[bcr_client][video] MSE active — showing overlay window")
+		runtime.WindowShow(a.ctx)
 	} else if !active && prev {
-		log.Println("[bcr_client][video] MSE pipeline stopped (notified by frontend)")
+		log.Println("[bcr_client][video] MSE inactive — hiding overlay window")
+		runtime.WindowHide(a.ctx)
 	}
 }

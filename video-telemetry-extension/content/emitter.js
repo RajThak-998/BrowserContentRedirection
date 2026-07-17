@@ -81,26 +81,22 @@ class Emitter {
         );
     }
 
-    /**
-     * Send a MEDIA_CHUNK event with metadata + raw chunk bytes.
-     *
-     * @param {{seq:number,size:number,ts:number,trackType:string,chunk:ArrayBuffer}} payload
-     */
     emitMediaChunk(payload) {
         const chunkView = new Uint8Array(payload.chunk);
 
         this._send({
             type: "MEDIA_CHUNK",
             payload: {
-                seq: payload.seq,
-                size: payload.size,
-                ts: payload.ts,
-                trackType: payload.trackType ?? "unknown",
-                mimeType: payload.mimeType ?? "unknown",
-                codec: payload.codec ?? "unknown",
+                seq:            payload.seq,
+                size:           payload.size,
+                ts:             payload.ts,
+                trackType:      payload.trackType ?? "unknown",
+                mimeType:       payload.mimeType ?? "unknown",
+                codec:          payload.codec ?? "unknown",
                 sourceBufferId: payload.sourceBufferId ?? "unknown",
-                isInitSegment: payload.isInitSegment === true,
-                chunkBytes: Array.from(chunkView),
+                videoId:        payload.videoId ?? "unknown",
+                isInitSegment:  payload.isInitSegment === true,
+                chunkBytes:     Array.from(chunkView),
             },
         });
     }

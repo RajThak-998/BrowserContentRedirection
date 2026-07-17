@@ -142,6 +142,13 @@
     // YouTube uses: ms = new MediaSource() → video.src = URL.createObjectURL(ms)
     // We need this map to suppress the MS when video.src is set to a blob URL.
     const blobUrlToMediaSource = new Map();
+    // Reverse lookup: MediaSource → the <video> element it was assigned to.
+    // Populated by the src/srcObject setters below. Used for O(1) eager suppression
+    // in patchedAppendBuffer without iterating the DOM.
+    const mediaSourceToVideo = new WeakMap();
+    // Reverse lookup: SourceBuffer → its owning MediaSource.
+    // Populated by patchedAddSourceBuffer. Part of the same O(1) eager-suppression chain.
+    const sourceBufferToMediaSource = new WeakMap();
 
     const origCreateObjectURL = URL.createObjectURL.bind(URL);
     URL.createObjectURL = function patchedCreateObjectURL(obj) {
@@ -162,9 +169,11 @@
         if (!ms || state.suppressedMediaSources.has(ms)) return;
         state.suppressedMediaSources.add(ms);
         try {
-            const active = ms.activeSourceBuffers;
-            for (let i = 0; i < active.length; i++) {
-                state.suppressedSourceBuffers.add(active[i]);
+            // Suppress ALL existing SourceBuffers (ms.sourceBuffers = all,
+            // ms.activeSourceBuffers = only the active subset — we need both).
+            const all = ms.sourceBuffers;
+            for (let i = 0; i < all.length; i++) {
+                state.suppressedSourceBuffers.add(all[i]);
             }
         } catch (_) { }
     }
@@ -172,19 +181,23 @@
     // ─── Video Suppression ────────────────────────────────────────────────────
     /**
      * Suppress a video element:
+     *   - Pause and mute immediately (no audio from VDI from this point).
      *   - Add to suppressedVideos so all prototype patches gate on it.
-     *   - Pause immediately.
-     *   - Suppress any already-attached MediaSource.
-     *   - Call origLoad() to flush the GPU decode pipeline (also detaches the
-     *     current MediaSource; page JS will re-assign, which our srcObject patch
-     *     will catch and mark suppressed).
+     *   - Suppress any already-attached MediaSource + its existing SourceBuffers.
+     *   - All future appendBuffer calls on suppressed SBs are intercepted:
+     *     forwarded to BCR pipeline, NOT passed to the native decoder.
+     *   - We deliberately do NOT call origLoad() to avoid detaching the MediaSource,
+     *     which would flood the pipeline with a new round of init segments.
      */
     function suppressVideo(video) {
         if (state.suppressedVideos.has(video)) return;
         state.suppressedVideos.add(video);
         state.primaryVideo = video;
 
+        // Immediately pause and silence — no GPU decode from this point.
         video.pause();
+        video.muted = true;
+        video.preload = 'none';
 
         // Suppress any already-attached MediaSource (srcObject path)
         try {
@@ -202,19 +215,26 @@
             }
         } catch (_) { }
 
-        // Flush GPU decode pipeline.  Also causes the browser to detach the
-        // MediaSource — page will re-assign, hitting our patched setter.
-        _bypass = true;
+        // NOTE: We deliberately do NOT call origLoad() here.
+        // Calling load() detaches the MediaSource, causing YouTube to immediately
+        // reattach it and flood the pipeline with fresh init segments — which was
+        // crashing the thin-client MSE session repeatedly.
+        BCR_LOG('[BCR] suppressVideo: video suppressed, GPU decode gated');
+    }
+
+    function isMainVideoCandidate(video) {
         try {
-            origLoad.call(video);
-        } finally {
-            _bypass = false;
+            if (window.location.hostname.includes('youtube.com')) {
+                // Main YouTube player video is inside #movie_player or has .html5-main-video class.
+                // Avoid mini hover-previews.
+                return !!video.closest('#movie_player') || video.classList.contains('html5-main-video');
+            }
+            // Generic page fallback: check if video is reasonably sized
+            const rect = video.getBoundingClientRect();
+            return rect.width >= 450 && rect.height >= 250;
+        } catch (_) {
+            return false;
         }
-
-        // Prevent autoplay and preloading
-        video.muted = true;
-        video.preload = 'none';
-
     }
 
     // ─── Primary Video Election ────────────────────────────────────────────────
@@ -223,6 +243,7 @@
      * so they are never elected over a visible one.
      */
     function scoreVideo(video) {
+        if (!isMainVideoCandidate(video)) return 0;
         try {
             const rect = video.getBoundingClientRect();
             const area = rect.width * rect.height;
@@ -1310,6 +1331,10 @@
                 return srcObjectDesc.get.call(this);
             },
             set(value) {
+                // Track MS → video for eager suppression lookup.
+                if (value instanceof MediaSource) {
+                    mediaSourceToVideo.set(value, this);
+                }
                 if (!_bypass && state.suppressedVideos.has(this)) {
                     if (value instanceof MediaSource) {
                         // Pre-mark so addSourceBuffer sees it immediately
@@ -1331,6 +1356,10 @@
                 return srcDesc.get.call(this);
             },
             set(value) {
+                // Track blob-URL MS → video for eager suppression lookup.
+                if (value && blobUrlToMediaSource.has(value)) {
+                    mediaSourceToVideo.set(blobUrlToMediaSource.get(value), this);
+                }
                 if (!_bypass && state.suppressedVideos.has(this)) {
                     if (value && blobUrlToMediaSource.has(value)) {
                         state.suppressedMediaSources.add(blobUrlToMediaSource.get(value));
@@ -1459,6 +1488,7 @@
             const sb = origAdd.call(this, mimeType);
             try {
                 setSourceBufferMeta(sb, mimeType);
+                sourceBufferToMediaSource.set(sb, this); // for eager-suppression reverse lookup
                 if (state.suppressedMediaSources.has(this)) {
                     state.suppressedSourceBuffers.add(sb);
                 }
@@ -1491,49 +1521,62 @@
      *   - Call original appendBuffer normally.
      */
     SourceBuffer.prototype.appendBuffer = function patchedAppendBuffer(data) {
+        // Eager suppression: when data first flows through an unsuppressed SourceBuffer,
+        // immediately try to elect + suppress the primary video. This eliminates the
+        // MutationObserver timing race where SourceBuffers are created before the video
+        // element grows large enough to be scored by the DOM observer.
+        if (!_bypass && !state.suppressedSourceBuffers.has(this)) {
+            electPrimaryVideo();
+        }
+
         const isSuppressed = state.suppressedSourceBuffers.has(this);
 
-        try {
-            const view = toByteView(data);
-            if (view) {
-                const copied = view.slice(); // fresh copy — original 'data' stays intact
-
-                const meta = sourceBufferMeta.get(this) ?? {
-                    trackType: 'unknown',
-                    mimeType: 'unknown',
-                    codec: 'unknown',
-                    sourceBufferId: getOrCreateSourceBufferId(this),
-                };
-
-                // Log format once per unique (trackType, mimeType, codec) triplet
-                const formatKey = `${meta.trackType}|${meta.mimeType}|${meta.codec}`;
-                if (!loggedFormats.has(formatKey)) {
-                    loggedFormats.add(formatKey);
-                }
-
-                const isInitSegment = detectInitSegment(copied);
-
-                // Always forward telemetry — BCR WebRTC pipeline needs every chunk.
-                // copied.buffer is transferred (zero-copy) to the content script.
-                window.postMessage(
-                    {
-                        type: 'BCR_MEDIA_CHUNK',
-                        size: copied.byteLength,
-                        ts: performance.now(),
-                        trackType: meta.trackType,
-                        mimeType: meta.mimeType,
-                        codec: meta.codec,
-                        sourceBufferId: meta.sourceBufferId,
-                        isInitSegment,
-                        chunkBuffer: copied.buffer,
-                    },
-                    '*',
-                    [copied.buffer]  // transfer ownership to content script
-                );
-            }
-        } catch (_) { }
-
         if (isSuppressed) {
+            try {
+                const view = toByteView(data);
+                if (view) {
+                    const copied = view.slice(); // fresh copy — original 'data' stays intact
+
+                    const ms = sourceBufferToMediaSource.get(this);
+                    const video = ms ? mediaSourceToVideo.get(ms) : null;
+                    const videoId = video ? video.getAttribute('data-bcr-video-id') : null;
+
+                    const meta = sourceBufferMeta.get(this) ?? {
+                        trackType: 'unknown',
+                        mimeType: 'unknown',
+                        codec: 'unknown',
+                        sourceBufferId: getOrCreateSourceBufferId(this),
+                    };
+
+                    // Log format once per unique (trackType, mimeType, codec) triplet
+                    const formatKey = `${meta.trackType}|${meta.mimeType}|${meta.codec}`;
+                    if (!loggedFormats.has(formatKey)) {
+                        loggedFormats.add(formatKey);
+                    }
+
+                    const isInitSegment = detectInitSegment(copied);
+
+                    // Forward only suppressed/redirected media chunks to the BCR pipeline.
+                    // copied.buffer is transferred (zero-copy) to the content script.
+                    window.postMessage(
+                        {
+                            type: 'BCR_MEDIA_CHUNK',
+                            size: copied.byteLength,
+                            ts: performance.now(),
+                            trackType: meta.trackType,
+                            mimeType: meta.mimeType,
+                            codec: meta.codec,
+                            sourceBufferId: meta.sourceBufferId,
+                            videoId: videoId || 'unknown',
+                            isInitSegment,
+                            chunkBuffer: copied.buffer,
+                        },
+                        '*',
+                        [copied.buffer]  // transfer ownership to content script
+                    );
+                }
+            } catch (_) { }
+
             // Gate the native call — decoder never receives this data.
             // Fire synthetic updateend so page.js streaming loop continues.
             const sb = this;

@@ -56,6 +56,9 @@ class VideoRegistry {
         const tracker = new VideoTracker(id, videoEl);
 
         this._registry.set(videoEl, {id, tracker});
+        try {
+            videoEl.setAttribute('data-bcr-video-id', id);
+        } catch (_) {}
         Emitter.getInstance().emitAdded(id);
     }
 
@@ -71,6 +74,9 @@ class VideoRegistry {
 
         entry.tracker.destroy();
         this._registry.delete(videoEl);
+        try {
+            videoEl.removeAttribute('data-bcr-video-id');
+        } catch (_) {}
         Emitter.getInstance().emitRemoved(entry.id);
     }
 

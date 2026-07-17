@@ -79,6 +79,7 @@
             const mimeType = data.mimeType ?? "unknown";
             const codec = data.codec ?? "unknown";
             const sourceBufferId = data.sourceBufferId ?? "unknown";
+            const videoId = data.videoId ?? "unknown";
             const isInitSegment = data.isInitSegment === true;
 
             if (!ENABLE_MEDIA_FORWARD) return;
@@ -108,6 +109,7 @@
                 mimeType,
                 codec,
                 sourceBufferId,
+                videoId,
                 isInitSegment,
                 chunk: chunkBuffer,
             });

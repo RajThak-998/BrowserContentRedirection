@@ -65,6 +65,7 @@ type MediaChunkHeader struct {
 	MimeType       string  `json:"mimeType"`
 	Codec          string  `json:"codec"`
 	SourceBufferID string  `json:"sourceBufferId"`
+	VideoID        string  `json:"videoId"`
 	IsInitSegment  bool    `json:"isInitSegment"`
 }
 
