@@ -163,6 +163,7 @@ class Transport {
                 mimeType: payload.mimeType,
                 codec: payload.codec,
                 sourceBufferId: payload.sourceBufferId,
+                videoId: payload.videoId,
                 isInitSegment: payload.isInitSegment === true,
             },
             meta: event.meta ?? {},

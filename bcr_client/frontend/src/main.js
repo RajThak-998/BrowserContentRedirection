@@ -233,7 +233,8 @@ window.onload = function () {
         mediaSource = new MediaSource();
         videoElement.src = URL.createObjectURL(mediaSource);
 
-        mediaSource.addEventListener('sourceopen', () => {
+        mediaSource.addEventListener('sourceopen', (e) => {
+            if (e.target !== mediaSource) return;
             logTerminal("[MSE] MediaSource sourceopen — pipeline ready");
             mseReady = true;
 
@@ -269,7 +270,8 @@ window.onload = function () {
             });
         });
 
-        mediaSource.addEventListener('sourceclose', () => {
+        mediaSource.addEventListener('sourceclose', (e) => {
+            if (e.target !== mediaSource) return;
             logTerminal("[MSE] MediaSource sourceclose — resetting for fresh session");
             mseReady = false;
             // Null out mediaSource so the next arriving chunk triggers setupMSE() for a fresh session.
@@ -283,7 +285,8 @@ window.onload = function () {
             activeVideoID = null;
         });
 
-        mediaSource.addEventListener('sourceended', () => {
+        mediaSource.addEventListener('sourceended', (e) => {
+            if (e.target !== mediaSource) return;
             logTerminal("[MSE] MediaSource sourceended");
         });
 

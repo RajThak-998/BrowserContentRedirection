@@ -191,8 +191,25 @@
      */
     function suppressVideo(video) {
         if (state.suppressedVideos.has(video)) return;
+
+        if (state.primaryVideo && state.primaryVideo !== video) {
+            try {
+                state.primaryVideo.removeAttribute('data-bcr-primary');
+            } catch (_) {}
+        }
+
         state.suppressedVideos.add(video);
         state.primaryVideo = video;
+
+        try {
+            if (!video.hasAttribute('data-bcr-video-id')) {
+                const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+                    ? crypto.randomUUID()
+                    : `video-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+                video.setAttribute('data-bcr-video-id', id);
+            }
+            video.setAttribute('data-bcr-primary', '1');
+        } catch (_) {}
 
         // Immediately pause and silence — no GPU decode from this point.
         video.pause();
@@ -215,6 +232,9 @@
             }
         } catch (_) { }
 
+        // Start silent audio keepalive to prevent background tab CPU/occlusion throttling
+        startSilentAudioKeepalive();
+
         // NOTE: We deliberately do NOT call origLoad() here.
         // Calling load() detaches the MediaSource, causing YouTube to immediately
         // reattach it and flood the pipeline with fresh init segments — which was
@@ -225,9 +245,27 @@
     function isMainVideoCandidate(video) {
         try {
             if (window.location.hostname.includes('youtube.com')) {
-                // Main YouTube player video is inside #movie_player or has .html5-main-video class.
-                // Avoid mini hover-previews.
-                return !!video.closest('#movie_player') || video.classList.contains('html5-main-video');
+                // Reject if the video is part of any hover preview or thumbnail component
+                if (
+                    video.closest('ytd-rich-item-renderer') ||
+                    video.closest('ytd-video-renderer') ||
+                    video.closest('ytd-grid-video-renderer') ||
+                    video.closest('yt-lockup-view-model') ||
+                    video.closest('ytd-compact-video-renderer') ||
+                    video.closest('ytd-thumbnail') ||
+                    video.closest('.ytSpecTouchFeedbackShapeHost') ||
+                    video.closest('.ytSpecTouchFeedbackShapeTouchResponse') ||
+                    video.closest('.ytSpecTouchFeedbackShapeThumbnailSizeLarge') ||
+                    video.closest('.ytSpecTouchFeedbackShapeTriggerEvents')
+                ) {
+                    return false;
+                }
+
+                // Accept only if it belongs to the main player or the official miniplayer
+                return !!video.closest('#movie_player') || 
+                       !!video.closest('.ytp-miniplayer-scrim') ||
+                       !!video.closest('.ytp-miniplayer-ui') ||
+                       !!video.closest('.ytp-miniplayer-view');
             }
             // Generic page fallback: check if video is reasonably sized
             const rect = video.getBoundingClientRect();

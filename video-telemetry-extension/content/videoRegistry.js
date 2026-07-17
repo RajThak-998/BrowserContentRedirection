@@ -52,13 +52,13 @@ class VideoRegistry {
      */
     _registerVideo(videoEl) {
         if (this._registry.has(videoEl)) return;
-        const id = this._generateId();
-        const tracker = new VideoTracker(id, videoEl);
+        if (!videoEl.hasAttribute('data-bcr-primary')) return;
 
+        const id = videoEl.getAttribute('data-bcr-video-id');
+        if (!id) return;
+
+        const tracker = new VideoTracker(id, videoEl);
         this._registry.set(videoEl, {id, tracker});
-        try {
-            videoEl.setAttribute('data-bcr-video-id', id);
-        } catch (_) {}
         Emitter.getInstance().emitAdded(id);
     }
 
@@ -83,6 +83,18 @@ class VideoRegistry {
     _startMutationObserver() {
         this._mutationObserver = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
+                if (mutation.type === 'attributes' && mutation.attributeName === 'data-bcr-primary') {
+                    const target = mutation.target;
+                    if (target.tagName === 'VIDEO') {
+                        if (target.hasAttribute('data-bcr-primary')) {
+                            this._registerVideo(target);
+                        } else {
+                            this._unregisterVideo(target);
+                        }
+                    }
+                    continue;
+                }
+
                 mutation.addedNodes.forEach((node) => {
                     if (node.nodeType !== Node.ELEMENT_NODE) return;
 
@@ -108,21 +120,11 @@ class VideoRegistry {
         this._mutationObserver.observe(document.body, {
             childList: true,
             subtree: true,
+            attributes: true,
+            attributeFilter: ['data-bcr-primary'],
         });
     }
 
-    /**
-     * Generate a unique ID for a video element.
-     * Uses crypto.randomUUID where available, falls back to timestamp+random.
-     *
-     * @returns {string}
-     */
-    _generateId() {
-        if (typeof crypto !== "undefined" && crypto.randomUUID) {
-            return crypto.randomUUID();
-        }
-        return `video-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    }
 }
 
 // Singleton static property
