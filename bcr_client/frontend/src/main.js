@@ -1,6 +1,55 @@
 // Wait for Wails to inject runtime bridging
 window.onload = function () {
     const videoElement = document.getElementById("videoPlayer");
+    const audioElement = document.createElement("audio");
+    audioElement.id = "audioPlayer";
+    audioElement.autoplay = true;
+    audioElement.playsInline = true;
+    audioElement.muted = false;
+    audioElement.style.display = "none";
+    document.body.appendChild(audioElement);
+
+    // Synchronize audio playback with video element
+    videoElement.addEventListener('play', () => {
+        if (playbackMode === 'mse') {
+            audioElement.play().catch((err) => logTerminal(`[Sync] Audio play blocked: ${err}`));
+        }
+    });
+
+    videoElement.addEventListener('pause', () => {
+        if (playbackMode === 'mse') {
+            audioElement.pause();
+        }
+    });
+
+    videoElement.addEventListener('seeking', () => {
+        if (playbackMode === 'mse') {
+            audioElement.currentTime = videoElement.currentTime;
+        }
+    });
+
+    videoElement.addEventListener('ratechange', () => {
+        if (playbackMode === 'mse') {
+            audioElement.playbackRate = videoElement.playbackRate;
+        }
+    });
+
+    videoElement.addEventListener('volumechange', () => {
+        if (playbackMode === 'mse') {
+            audioElement.volume = videoElement.volume;
+            audioElement.muted = videoElement.muted;
+        }
+    });
+
+    // Correct drift if video and audio drift apart by more than 150ms
+    videoElement.addEventListener('timeupdate', () => {
+        if (playbackMode === 'mse' && !videoElement.paused) {
+            const drift = Math.abs(videoElement.currentTime - audioElement.currentTime);
+            if (drift > 0.15) {
+                audioElement.currentTime = videoElement.currentTime;
+            }
+        }
+    });
 
     function logTerminal(message) {
         console.log(message);
@@ -149,12 +198,12 @@ window.onload = function () {
     // MSE Player (YouTube video redirection)
     // ==========================================
 
-    let mediaSource = null;
-    let sourceBuffers = {};        // keyed by trackType ('video' or 'audio')
-    let chunkQueues = {};          // queued chunks waiting while SourceBuffer is updating, keyed by trackType
-    let configuredMimeTypes = {};  // keyed by trackType, tracks the full MIME type configured for the SourceBuffer
-    let pendingSourceBuffers = {}; // keyed by trackType, stores fullMime for SourceBuffers to create on sourceopen
-    let mseReady = false;
+    let mediaSources = { video: null, audio: null };
+    let sourceBuffers = { video: null, audio: null };
+    let chunkQueues = { video: [], audio: [] };
+    let configuredMimeTypes = { video: null, audio: null };
+    let pendingSourceBuffers = { video: null, audio: null };
+    let mseReady = { video: false, audio: false };
     let mseInitCount = 0;          // how many init segments received — used for first-chunk logging
     let activeVideoID = null;      // the unique ID of the video currently playing/redirecting
 
@@ -175,30 +224,30 @@ window.onload = function () {
      * VIDEO_REMOVED.
      */
     function teardownMSE() {
-        if (!mediaSource) return;
+        if (!mediaSources.video && !mediaSources.audio) return;
         logTerminal("[MSE] Tearing down MSE pipeline");
 
-        try {
-            Object.keys(sourceBuffers).forEach((type) => {
-                try {
-                    const sb = sourceBuffers[type];
-                    try {
-                        sb.abort(); // Abort any pending updates to immediately stop updating
-                    } catch (_) {}
-                    mediaSource.removeSourceBuffer(sb);
-                } catch (e) { /* ignore */ }
-            });
-            if (mediaSource.readyState === 'open') {
-                mediaSource.endOfStream();
-            }
-        } catch (e) { /* ignore */ }
+        ['video', 'audio'].forEach((type) => {
+            const ms = mediaSources[type];
+            if (!ms) return;
+            try {
+                const sb = sourceBuffers[type];
+                if (sb) {
+                    try { sb.abort(); } catch (_) {}
+                    ms.removeSourceBuffer(sb);
+                }
+                if (ms.readyState === 'open') {
+                    ms.endOfStream();
+                }
+            } catch (e) { /* ignore */ }
+        });
 
-        sourceBuffers = {};
-        chunkQueues = {};
-        configuredMimeTypes = {};
-        pendingSourceBuffers = {};
-        mediaSource = null;
-        mseReady = false;
+        sourceBuffers = { video: null, audio: null };
+        chunkQueues = { video: [], audio: [] };
+        configuredMimeTypes = { video: null, audio: null };
+        pendingSourceBuffers = { video: null, audio: null };
+        mediaSources = { video: null, audio: null };
+        mseReady = { video: false, audio: false };
         mseInitCount = 0;
         activeVideoID = null;
 
@@ -210,6 +259,13 @@ window.onload = function () {
         videoElement.removeAttribute('src');
         videoElement.srcObject = null;
 
+        if (audioElement.src && audioElement.src.startsWith('blob:')) {
+            URL.revokeObjectURL(audioElement.src);
+        }
+        audioElement.src = '';
+        audioElement.removeAttribute('src');
+        audioElement.srcObject = null;
+
         setMode('idle');
         if (window.go && window.go.main && window.go.main.App) {
             window.go.main.App.NotifyMSEActive(false).catch(() => {});
@@ -218,100 +274,109 @@ window.onload = function () {
     }
 
     /**
-     * Create and attach a fresh MediaSource to the video element. Called on
+     * Create and attach a fresh MediaSource to the target element. Called on
      * the first MEDIA_CHUNK that arrives while in idle or MSE mode.
      */
-    function setupMSE() {
-        if (mediaSource) return; // already set up
+    function setupTrackMSE(trackType) {
+        if (mediaSources[trackType]) return; // already set up
 
-        // Detach any existing WebRTC stream
-        if (videoElement.srcObject) {
+        logTerminal(`[MSE][${trackType}] Setting up MediaSource`);
+
+        // Detach any existing WebRTC stream (only for video element)
+        if (trackType === 'video' && videoElement.srcObject) {
             logTerminal("[MSE] Detaching WebRTC srcObject to switch to MSE mode");
             videoElement.srcObject = null;
         }
 
-        mediaSource = new MediaSource();
-        videoElement.src = URL.createObjectURL(mediaSource);
+        const ms = new MediaSource();
+        mediaSources[trackType] = ms;
 
-        mediaSource.addEventListener('sourceopen', (e) => {
-            if (e.target !== mediaSource) return;
-            logTerminal("[MSE] MediaSource sourceopen — pipeline ready");
-            mseReady = true;
+        const targetEl = (trackType === 'video') ? videoElement : audioElement;
+        targetEl.src = URL.createObjectURL(ms);
 
-            // Create any SourceBuffers that received init segments before sourceopen
-            Object.keys(pendingSourceBuffers).forEach((trackType) => {
-                const fullMime = pendingSourceBuffers[trackType];
-                if (!sourceBuffers[trackType]) {
-                    try {
-                        const newSb = mediaSource.addSourceBuffer(fullMime);
-                        newSb.mode = 'segments';
-                        sourceBuffers[trackType] = newSb;
-                        if (!chunkQueues[trackType]) chunkQueues[trackType] = []; // preserve any queued init segment
-                        configuredMimeTypes[trackType] = fullMime;
+        ms.addEventListener('sourceopen', (e) => {
+            if (e.target !== ms) return;
+            logTerminal(`[MSE][${trackType}] MediaSource sourceopen — pipeline ready`);
+            mseReady[trackType] = true;
 
-                        newSb.addEventListener('updateend', () => {
-                            drainQueue(trackType);
-                        });
-                        newSb.addEventListener('error', (e) => {
-                            logErrorTerm(`[MSE][${trackType}] SourceBuffer error: ${e}`);
-                        });
+            // Create the SourceBuffer if we received the init segment before sourceopen
+            const fullMime = pendingSourceBuffers[trackType];
+            if (fullMime && !sourceBuffers[trackType]) {
+                try {
+                    const newSb = ms.addSourceBuffer(fullMime);
+                    newSb.mode = 'segments';
+                    sourceBuffers[trackType] = newSb;
+                    if (!chunkQueues[trackType]) chunkQueues[trackType] = [];
+                    configuredMimeTypes[trackType] = fullMime;
 
-                        logTerminal(`[MSE][${trackType}] SourceBuffer created (deferred) for ${fullMime}`);
-                    } catch (e) {
-                        logErrorTerm(`[MSE][${trackType}] Failed to create deferred SourceBuffer for ${fullMime}: ${e}`);
-                    }
+                    newSb.addEventListener('updateend', () => {
+                        drainQueue(trackType);
+                    });
+                    newSb.addEventListener('error', (err) => {
+                        logErrorTerm(`[MSE][${trackType}] SourceBuffer error: ${err}`);
+                    });
+
+                    logTerminal(`[MSE][${trackType}] SourceBuffer created (deferred) for ${fullMime}`);
+                } catch (err) {
+                    logErrorTerm(`[MSE][${trackType}] Failed to create deferred SourceBuffer for ${fullMime}: ${err}`);
                 }
-            });
-            pendingSourceBuffers = {};
-
-            // Flush any queued chunks that arrived before sourceopen
-            Object.keys(chunkQueues).forEach((type) => {
-                drainQueue(type);
-            });
-        });
-
-        mediaSource.addEventListener('sourceclose', (e) => {
-            if (e.target !== mediaSource) return;
-            logTerminal("[MSE] MediaSource sourceclose — resetting for fresh session");
-            mseReady = false;
-            // Null out mediaSource so the next arriving chunk triggers setupMSE() for a fresh session.
-            // Without this, the dead MediaSource stays referenced and new chunks are silently dropped.
-            mediaSource = null;
-            sourceBuffers = {};
-            chunkQueues = {};
-            configuredMimeTypes = {};
-            pendingSourceBuffers = {};
-            mseInitCount = 0;
-            activeVideoID = null;
-        });
-
-        mediaSource.addEventListener('sourceended', (e) => {
-            if (e.target !== mediaSource) return;
-            logTerminal("[MSE] MediaSource sourceended");
-        });
-
-        // Show the overlay and start playback only when the browser signals it
-        // has enough buffered data — not before, to avoid flashing a blank window.
-        videoElement.addEventListener('canplay', () => {
-            if (playbackMode !== 'mse') return; // torn down before canplay fired
-            videoElement.play().catch((e) => {
-                logTerminal(`[MSE] canplay auto-play blocked: ${e}`);
-            });
-            if (window.go && window.go.main && window.go.main.App) {
-                window.go.main.App.NotifyMSEActive(true).catch(() => {});
+                pendingSourceBuffers[trackType] = null;
             }
-        }, { once: true });
 
-        // Recover from native video decode errors (bad segments, GPU reset, etc.)
-        videoElement.addEventListener('error', () => {
-            if (videoElement.error && playbackMode === 'mse') {
-                logErrorTerm(`[MSE] Video element error (code=${videoElement.error.code}) — resetting pipeline`);
-                teardownMSE();
-            }
-        }, { once: true });
+            // Flush any queued chunks
+            drainQueue(trackType);
+        });
 
-        setMode('mse');
-        logTerminal("[MSE] Pipeline set up — waiting for sourceopen");
+        ms.addEventListener('sourceclose', (e) => {
+            if (e.target !== ms) return;
+            logTerminal(`[MSE][${trackType}] MediaSource sourceclose — resetting for fresh session`);
+            mseReady[trackType] = false;
+            mediaSources[trackType] = null;
+            sourceBuffers[trackType] = null;
+            chunkQueues[trackType] = [];
+            configuredMimeTypes[trackType] = null;
+            pendingSourceBuffers[trackType] = null;
+        });
+
+        ms.addEventListener('sourceended', (e) => {
+            if (e.target !== ms) return;
+            logTerminal(`[MSE][${trackType}] MediaSource sourceended`);
+        });
+
+        if (trackType === 'video') {
+            // Show the overlay and start playback only when the browser signals it
+            // has enough buffered data — not before, to avoid flashing a blank window.
+            videoElement.addEventListener('canplay', () => {
+                if (playbackMode !== 'mse') return; // torn down before canplay fired
+                videoElement.play().catch((e) => {
+                    logTerminal(`[MSE] canplay auto-play blocked: ${e}`);
+                });
+                if (window.go && window.go.main && window.go.main.App) {
+                    window.go.main.App.NotifyMSEActive(true).catch(() => {});
+                }
+            }, { once: true });
+
+            // Recover from native video decode errors (bad segments, GPU reset, etc.)
+            videoElement.addEventListener('error', () => {
+                if (videoElement.error && playbackMode === 'mse') {
+                    logErrorTerm(`[MSE] Video element error (code=${videoElement.error.code}) — resetting pipeline`);
+                    teardownMSE();
+                }
+            }, { once: true });
+        } else {
+            // Ensure audio element plays when it's ready
+            audioElement.addEventListener('canplay', () => {
+                if (playbackMode !== 'mse') return;
+                audioElement.play().catch((e) => {
+                    logTerminal(`[MSE] audio canplay auto-play blocked: ${e}`);
+                });
+            }, { once: true });
+        }
+
+        if (playbackMode !== 'mse') {
+            setMode('mse');
+        }
+        logTerminal(`[MSE][${trackType}] Pipeline set up — waiting for sourceopen`);
     }
 
     /**
@@ -347,16 +412,18 @@ window.onload = function () {
      */
     function handleMediaChunk(seq, trackType, mimeType, codec, sourceBufferID, isInitSegment, chunkB64, videoID) {
         // If the video ID changes, tear down the stale session to prevent QuotaExceededError
-        if (mediaSource && videoID && videoID !== 'unknown' && activeVideoID && activeVideoID !== 'unknown' && videoID !== activeVideoID) {
+        if ((mediaSources.video || mediaSources.audio) && videoID && videoID !== 'unknown' && activeVideoID && activeVideoID !== 'unknown' && videoID !== activeVideoID) {
             logTerminal(`[MSE] videoID changed from ${activeVideoID} to ${videoID} — tearing down stale session`);
             teardownMSE();
         }
 
-        // Lazily set up MSE on first chunk
-        if (!mediaSource) {
-            setupMSE();
-            activeVideoID = videoID;
-            logTerminal(`[MSE] Set activeVideoID to ${activeVideoID}`);
+        // Lazily set up MSE on first chunk for this track
+        if (!mediaSources[trackType]) {
+            setupTrackMSE(trackType);
+            if (!activeVideoID || activeVideoID === 'unknown') {
+                activeVideoID = videoID;
+                logTerminal(`[MSE] Set activeVideoID to ${activeVideoID}`);
+            }
         } else if (videoID && videoID !== 'unknown' && activeVideoID !== videoID) {
             // Update activeVideoID if it was previously unset or unknown
             activeVideoID = videoID;
@@ -370,19 +437,14 @@ window.onload = function () {
             mseInitCount++;
             logTerminal(`[MSE][${trackType}][${sourceBufferID}] Init segment #${mseInitCount} mimeType=${mimeType} codec=${codec} size=${data.length} videoId=${videoID}`);
 
-            // A new init segment signals a new codec context for this track.
-            // Flush ALL previously queued chunks — they belong to the prior init and
-            // must NOT be fed to a freshly-configured SourceBuffer (causes decode errors).
-            // YouTube sends one init segment per adaptive quality stream; we only want
-            // the latest one for each track.
+            // Flush prior queue for this track type
             chunkQueues[trackType] = [];
 
-            if (mseReady) {
+            if (mseReady[trackType]) {
                 const sb = sourceBuffers[trackType];
                 if (!sb) {
-                    // First init for this trackType in this MSE session — create the SourceBuffer.
                     try {
-                        const newSb = mediaSource.addSourceBuffer(fullMime);
+                        const newSb = mediaSources[trackType].addSourceBuffer(fullMime);
                         newSb.mode = 'segments';
                         sourceBuffers[trackType] = newSb;
                         configuredMimeTypes[trackType] = fullMime;
@@ -400,7 +462,6 @@ window.onload = function () {
                         return;
                     }
                 } else if (configuredMimeTypes[trackType] !== fullMime) {
-                    // Codec / resolution change — call changeType to reconfigure the decoder.
                     logTerminal(`[MSE][${trackType}] Codec change: ${configuredMimeTypes[trackType]} → ${fullMime}`);
                     try {
                         if (typeof sb.changeType === 'function') {
@@ -413,10 +474,7 @@ window.onload = function () {
                         logErrorTerm(`[MSE][${trackType}] changeType failed: ${e}`);
                     }
                 }
-                // Same codec: reuse existing SourceBuffer — fall through to queue init below.
             } else {
-                // sourceopen not yet fired — store config and queue ONLY this init segment.
-                // (chunkQueues[trackType] was already cleared above, so only the latest init is kept.)
                 pendingSourceBuffers[trackType] = fullMime;
                 chunkQueues[trackType].push(data);
                 return;
@@ -430,7 +488,7 @@ window.onload = function () {
         chunkQueues[trackType].push(data);
 
         // Drain as soon as the SourceBuffer is ready.
-        if (mseReady && sourceBuffers[trackType]) {
+        if (mseReady[trackType] && sourceBuffers[trackType]) {
             drainQueue(trackType);
         }
     }

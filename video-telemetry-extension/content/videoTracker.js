@@ -77,13 +77,7 @@ class VideoTracker {
             height: rect.height,
         };
 
-        // ── Screen-absolute coords (CSS px) ──────────────────────────────────
-        // Used by bcr_client (GLFW SetPos) which needs screen-absolute coords.
-        // window.screenX/Y = browser window top-left on the screen.
-        // chromeUIHeight   = tabs + address bar + bookmarks bar height.
-        // Browser UI (tabs/address/bookmarks/title bar) sits above the viewport.
-        // getBoundingClientRect() is viewport-relative, so we shift by this offset
-        // to convert into true screen coordinates for native window placement.
+       
         const chromeUIHeight = Math.max(0, window.outerHeight - window.innerHeight);
         const screenBounds = {
             x:      rect.left  + window.screenX,

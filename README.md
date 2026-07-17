@@ -1,207 +1,101 @@
 # BCR — Browser Content Relay
 
-> A real-time WebRTC media redirection pipeline that intercepts in-browser RTP streams and redirects them to a hardware-accelerated native desktop overlay — bypassing the browser renderer entirely.
-
-[![Go Version](https://img.shields.io/badge/Go-1.22%2B-00ADD8?style=flat-square&logo=go)](https://go.dev/)
-[![Pion WebRTC](https://img.shields.io/badge/Pion-WebRTC-blueviolet?style=flat-square)](https://github.com/pion/webrtc)
-[![Wails](https://img.shields.io/badge/Wails-v2-red?style=flat-square&logo=wails)](https://wails.io/)
-[![Chrome Extension](https://img.shields.io/badge/Chrome_Extension-MV3-yellow?style=flat-square&logo=googlechrome)](https://developer.chrome.com/docs/extensions/mv3/)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%28X11%29-orange?style=flat-square&logo=linux)](https://www.kernel.org/)
-[![WebRTC](https://img.shields.io/badge/Protocol-WebRTC%20%7C%20SRTP%20%7C%20DTLS-informational?style=flat-square)](https://webrtc.org/)
+A real-time media redirection pipeline that intercepts in-browser streams and redirects them to a hardware-accelerated native desktop overlay — bypassing the VDI browser renderer entirely.
 
 ---
 
-## Overview
+## 🎥 1. YouTube Video Redirection (MSE)
 
-In Virtual Desktop Infrastructure (VDI) and heavy browser-based communication apps (e.g., Microsoft Teams on the web), rendering live WebRTC video inside the browser's main thread is expensive: it competes for CPU and GPU resources, introduces latency, and is opaque to native optimization layers.
+YouTube redirection intercepts adaptive video and audio chunks (MSE) in the VDI Chrome browser and streams them down to a native Wails player overlay.
 
-BCR solves this through **shadow signaling** — a technique that hijacks the WebRTC negotiation at the SDP layer, without modifying the web application or the remote SFU. The result is a direct, out-of-browser SRTP media path from the remote server to a native, always-on-top Wails overlay window that tracks the browser's `<video>` element in real time.
+### Developer / Local Setup
 
-**No screen scraping. No frame repacking. No browser plugin APIs for media access.** BCR operates entirely at the transport layer.
+> [!IMPORTANT]
+> **Prerequisite:** For production RDP/VDI environments, compile and register the RDP Dynamic Virtual Channel plugin. Follow the registry registration and compilation steps in the [RDP Dynamic Virtual Channel (DVC) DLL Plugin](#3-rdp-dynamic-virtual-channel-dvc-dll-plugin) section first.
 
----
-
-## System Architecture
-
-```mermaid
-graph TD
-    subgraph Browser Context
-        VDI[Web App / Teams]
-        Ext[Chrome Extension MV3]
-        DOM[DOM Video Tracker]
-        VDI -->|SDP Negotiation| Ext
-        DOM -->|Geometry Coordinates| Ext
-    end
-
-    subgraph Relay Context
-        Host[bcr_host / Go WebSocket Relay]
-        Ext <-->|WS :8765| Host
-    end
-
-    subgraph Native Desktop Context
-        Engine[bcr_client / Raw WebRTC Engine]
-        Player[Wails Native Overlay]
-        Host <-->|WS :8081| Engine
-        Engine -->|Decrypted RTP via Loopback| Player
-        Engine -->|Window Coordinates| Player
-    end
-
-    subgraph Remote Network
-        SFU[Teams / Remote SFU]
-        VDI -.->|Munged App Signaling| SFU
-        Engine <-->|Direct ICE / DTLS / SRTP| SFU
-    end
+#### Step 1 — Start the Native Client Overlay (on the Local Client Machine)
+The Wails native player renders the redirected video stream hardware-accelerated on the user's physical machine.
+```bash
+cd bcr_client
+go mod tidy
+cd frontend && npm install && cd ..
+wails dev
+# Launches the Wails Native Player UI overlay window
 ```
 
-The system comprises three isolated components:
+#### Step 2 — Load the Chrome Extension (on the VDI Host)
+1. Open Google Chrome/Chromium inside the VDI session and navigate to `chrome://extensions`.
+2. Toggle **Developer mode** in the top right corner.
+3. Click **Load unpacked** and select the `video-telemetry-extension/` directory.
 
-**`video-telemetry-extension`** — A Manifest V3 Chrome extension operating inside the VDI web app. It monkey-patches `RTCPeerConnection` at the prototype level to intercept `createOffer`, `setLocalDescription`, and `setRemoteDescription`. It also tracks the spatial geometry of the target `<video>` DOM element via `ResizeObserver` and `IntersectionObserver`, forwarding all data over WebSocket.
-
-**`bcr_host`** — A lightweight Go middleware server that bridges network isolation between the sandboxed browser extension and the native client. Exposes a WebSocket relay on `:8765` (Chrome) and `:8081` (native client).
-
-**`bcr_client`** — The core engine. It receives hijacked SDPs, synthesizes ICE/DTLS credentials, performs a direct handshake with the remote SFU, handles SRTP decryption, and maintains a local loopback WebRTC session feeding the Wails renderer.
-
----
-
-## Core Flow
-
-```mermaid
-sequenceDiagram
-    participant Chrome as VDI Web App
-    participant Ext as Chrome Extension
-    participant Client as bcr_client (Go Engine)
-    participant Wails as Wails UI Overlay
-    participant SFU as Remote SFU
-
-    Chrome->>Ext: pc.createOffer() / setLocalDescription
-    Ext->>Client: Forward Original Local SDP (via bcr_host)
-    Client->>Client: Pin Codecs, Generate Shadow ICE & DTLS Fingerprint
-    Client->>Ext: Return Shadow Credentials
-
-    Ext->>Ext: Munge SDP (Replace ICE/DTLS with Shadow Credentials)
-    Chrome->>SFU: Send Munged Offer via App Transport
-
-    SFU->>Chrome: Send Remote Answer SDP
-    Chrome->>Ext: pc.setRemoteDescription
-    Ext->>Client: Forward Remote Answer SDP
-
-    Client->>SFU: Perform Direct ICE Gather & DTLS Handshake
-    Note over Client,SFU: Direct SRTP Media Transport Established
-
-    SFU->>Client: Stream Encrypted SRTP Media
-    Client->>Client: Decrypt SRTP → Raw RTP
-    Client->>Client: Dispatch RTCP PLI to Maintain Stream
-
-    Client->>Wails: Lazy-Load Track on First RTP Packet
-    Client->>Wails: Stream Decrypted RTP via Loopback WebRTC
-    Note over Wails: Hardware-Accelerated Video in Native Overlay
+#### Step 3 — Start the Relay Host (on the VDI Host)
+Start the relay server with the browser extension already preloaded in Chrome.
+```bash
+cd bcr_host
+go mod tidy
+go run .
+# Listens on :8765 (VDI browser extension websocket) and :8081 (client control channel)
 ```
 
----
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Extension | Vanilla JS, Manifest V3, prototype-level monkey-patching |
-| Relay Server | Go 1.22+, Gorilla WebSocket |
-| WebRTC Engine | Pion WebRTC (`pion/dtls`, `pion/srtp`, `pion/ice`, `pion/webrtc`) |
-| Native Overlay | Wails v2 (Go + WebKit), X11 |
-| Protocols | ICE, DTLS-SRTP, RTCP, SDP |
-| Platform | Linux (X11), `webkit2gtk4.0` |
+#### Step 4 — Play the Video
+Once running, play any YouTube video in Chrome on the VDI browser. The native overlay window will automatically cover the video element, play the synchronized audio locally on the client, and render the VP9/H.264 video.
 
 ---
 
-## Key Features
+## 📞 2. WebRTC Live Call Offloading
 
-- **Zero-copy SDP hijacking** — intercepts WebRTC negotiation at the JS prototype level without touching the web application source.
-- **Shadow credential synthesis** — generates a synthetic ICE ufrag/pwd and DTLS fingerprint, replacing the browser's in the outbound SDP offer. The remote SFU is unaware of the redirect.
-- **Direct SFU transport** — `bcr_client` establishes its own ICE + DTLS-SRTP session directly with the remote server, receiving encrypted media without browser involvement.
-- **SRTP decryption pipeline** — raw SRTP packets from the SFU are decrypted using low-level Pion SRTP primitives into plain RTP, bypassing high-level WebRTC API constraints.
-- **Lazy track loading** — tracks are added to the local loopback `PeerConnection` only upon arrival of the first RTP packet for that SSRC, preventing premature decoder initialization.
-- **DOM geometry tracking** — continuous `ResizeObserver` / `IntersectionObserver` telemetry feeds `<video>` element coordinates to the Wails overlay, which repositions itself frame-accurately over the browser canvas.
-- **Codec pinning** — SDP munging enforces a stable VP8/H.264 + Opus media profile, eliminating mid-stream renegotiation instability.
+WebRTC redirection pipeline intercepts browser RTP streams at the JavaScript prototype layer, synthesizes shadow DTLS/ICE configurations, and offloads decryption and rendering to the local client.
+
+### Key Features
+* **Zero-copy SDP hijacking** — Intercepts WebRTC negotiation at the JS prototype level.
+* **Shadow credential synthesis** — Generates instant shadow credentials to allow Teams to proceed immediately, trickling actual ICE candidates in the background (Trickle ICE).
+* **Direct SFU transport** — Client connects directly to the remote server, receiving media packets natively.
+
+### Developer / Local Setup
+Follow the same startup steps as the YouTube Redirection. Once a WebRTC call is joined (e.g. Teams on the web), the extension automatically redirects the live stream to the native player overlay.
+
+---
+
+## 🔌 3. RDP Dynamic Virtual Channel (DVC) DLL Plugin
+
+For seamless VDI redirection over RDP, the client and the VDI host communicate through a dynamic virtual channel instead of raw WebSocket connections. This is done using a native Windows RDP plugin DLL.
+
+### Step 1 — Compile the DLL Plugin (on Client Machine)
+To compile the plugin DLL using `g++` inside MSYS2 / MinGW:
+```bash
+cd bcr_client/dvc_plugin
+g++ -shared -static -o bcr_dvc_plugin.dll dvc_plugin.cpp -lwtsapi32 -lws2_32 -lole32 -luuid
+```
+
+### Step 2 — Register the DLL in the Windows Registry
+To let the Windows Remote Desktop Client (`mstsc.exe`) know about the plugin, register it on the **physical local client machine**:
+
+1. Open **Registry Editor** (`regedit.exe`).
+2. Navigate to the following path:
+   `HKEY_CURRENT_USER\Software\Microsoft\Terminal Server Client\Default\AddIns`
+3. Create a new Registry Key (Folder) named:
+   `bcr_dvc_plugin`
+4. Inside the `bcr_dvc_plugin` key, create a new **String Value (REG_SZ)**:
+   * **Value Name**: `Name`
+   * **Value Data**: The absolute file path to the compiled DLL (e.g., `C:\Development\BrowserContentRedirection\bcr_client\dvc_plugin\bcr_dvc_plugin.dll`).
+
+When you launch Remote Desktop Connection (`mstsc.exe`) and connect to your VDI host, the RDP client will automatically load the DLL and establish the `BCR_VC` virtual channel bridge.
 
 ---
 
 ## Technical Deep Dive
 
 ### 1. Media Starvation via Missing RTCP Feedback
+* **Problem:** Completing the DTLS handshake with the remote SFU resulted in zero media packets because modern SFUs gate RTP streams.
+* **Solution:** Added a proactive RTCP feedback loop in the Go engine to begin dispatching periodic RTCP PLI requests to the SFU on handshake completion.
 
-**Problem:** After successfully completing the DTLS handshake with the remote SFU, zero media packets arrived. The connection appeared healthy but was silent.
+### 2. WebKit Decoder Deadlocks (Lazy Track Loading)
+* **Problem:** Allocating all transceivers simultaneously caused WebKit rendering crash loops.
+* **Solution:** Implemented lazy track loading in `loopback.go`. Tracks are dynamically added to the local connection only upon arrival of the first decrypted RTP packet for that SSRC.
 
-**Root cause:** Modern SFUs implement receiver-driven media gating. They withhold RTP streams until the receiver demonstrates active RTCP participation — specifically, they wait for a PLI (Picture Loss Indication) or RR (Receiver Report) before committing bandwidth to an unproven path.
-
-**Solution:** Engineered a proactive RTCP feedback loop in the Go engine. On DTLS handshake completion, the client immediately begins dispatching periodic RTCP PLI requests to the SFU. This signals receiver readiness and triggers the SFU to begin streaming. The loop is maintained for the session lifetime to sustain media flow.
-
----
-
-### 2. WebKit Decoder Deadlocks — "Lazy Track Loading"
-
-**Problem:** When decrypted RTP was fed into the Wails WebKit renderer via a loopback `PeerConnection`, pre-allocating all tracks at session setup caused the renderer to deadlock and crash. Multiple simultaneous decoder initializations in WebKit's media pipeline exceeded safe concurrency bounds.
-
-**Root cause:** WebKit's internal decoder pool has finite capacity. Allocating N decoders simultaneously — before any actual payload has arrived — triggers resource contention, resulting in mutex deadlocks and process termination.
-
-**Solution:** Implemented lazy track loading in `loopback.go`. Tracks are dynamically injected into the local `PeerConnection` only at the moment the first decrypted RTP packet for a given SSRC is observed. This serializes decoder initialization naturally, eliminating the race condition entirely.
-
----
-
-### 3. Renegotiation Cascades and SDP Role Conflicts
-
-**Problem:** Teams' SFU performs aggressive mid-stream renegotiations — switching codecs, adding/removing tracks, and toggling `a=setup` DTLS roles. Each renegotiation event caused transceiver state mismatches in the shadow session, crashing the local `PeerConnection`.
-
-**Root cause:** The shadow session's codec and DTLS role state diverged from the SFU's expectations during renegotiation, producing SDP offers that violated the established session contract (e.g., conflicting `active`/`passive` role assignments).
-
-**Solution:** Implemented SDP munging at the extension layer to pin the media profile to a single stable codec set (VP8/H.264 + Opus) on the initial offer. Role conflicts were resolved by enforcing a consistent `a=setup:active` posture in all outbound SDPs, preventing the shadow session from entering an indeterminate role state during renegotiation.
-
----
-
-## Installation
-
-### Prerequisites
-
-- Go 1.22+
-- Wails v2 CLI (`go install github.com/wailsapp/wails/v2/cmd/wails@latest`)
-- Node.js (for Wails frontend)
-- Chromium / Google Chrome
-- Linux with X11
-- System libraries: `libX11-devel`, `webkit2gtk4.0-devel`
-
-### Step 1 — Start the Relay Server
-
-```bash
-cd BCR/bcr_host
-go mod tidy
-go run .
-# Listens on :8765 (Chrome WS) and :8081 (bcr_client control channel)
-```
-
-### Step 2 — Start the Native Client Overlay
-
-```bash
-cd BCR/bcr_client
-go mod tidy
-cd frontend && npm install && cd ..
-wails dev
-# Starts the Wails native renderer and Go WebRTC engine
-```
-
-### Step 3 — Load the Chrome Extension
-
-1. Navigate to `chrome://extensions` in Chromium.
-2. Enable **Developer mode**.
-3. Click **Load unpacked** and select `BCR/video-telemetry-extension/`.
-
----
-
-## Usage
-
-1. Ensure `bcr_host` and `bcr_client` are running.
-2. Open the target web app (e.g., Microsoft Teams on the web) in Chromium with the extension loaded.
-3. Join a WebRTC call. The extension intercepts the SDP negotiation automatically.
-4. The Wails native overlay appears, positioned over the browser's `<video>` element, rendering the hardware-accelerated stream.
-
-No configuration required for standard deployments. The extension, relay, and client communicate over localhost WebSocket connections established at startup.
+### 3. Dual MediaSource Audio Fix (MSE)
+* **Problem:** Edge WebView2 on the native client restricts `MediaSource` to exactly one active `SourceBuffer` for WebM streams, throwing `QuotaExceededError` if both video and audio buffers are added to the same instance.
+* **Solution:** Configured separate `MediaSource` objects for the `<video>` player and a dynamically generated `<audio>` player, syncing playback state, volume, and time drift in real-time.
 
 ---
 
@@ -209,48 +103,11 @@ No configuration required for standard deployments. The extension, relay, and cl
 
 ```
 BCR/
-├── bcr_host/                  # Go WebSocket relay server
+├── bcr_host/                  # Go WebSocket & DVC host relay server
 ├── bcr_client/                # Go WebRTC engine + Wails overlay
-│   ├── raw_session.go         # Shadow credential synthesis, direct SFU handshake
-│   ├── loopback.go            # Local PeerConnection, lazy track loading
-│   └── frontend/              # Wails WebKit renderer
-└── video-telemetry-extension/ # Manifest V3 Chrome extension
+│   ├── dvc_plugin/            # Windows RDP DLL connector
+│   ├── raw_session.go         # Direct handshakes with remote SFU
+│   ├── loopback.go            # Local WebRTC loopback stream
+│   └── frontend/              # Wails player UI
+└── video-telemetry-extension/ # Manifest V3 browser extension
 ```
----
-
-## Dynamic Virtual Channel Plugin
-
-To compile the RDP dynamic virtual channel plugin DLL using `g++` inside MSYS2 / MinGW, run the following:
-```bash
-cd bcr_client/dvc_plugin
-g++ -shared -static -o bcr_dvc_plugin.dll dvc_plugin.cpp -lwtsapi32 -lws2_32 -lole32 -luuid
-```
-
-
-## for the optimisation we need to do these things
-1. call for the browser native pc.configuration() to get the ice servers at the construcutor
-2. use of pre signed dtls certificate to speed up the sdp munging
-
-## options 
-Option 5: Instant Credentials + Trickle ICE (The Best Strategy)
-How it works: Go does not wait for ICE candidate gathering to finish before sending BCR_RTC_SHADOW_READY.
-Go generates its DTLS fingerprint and ICE ufrag/pwd instantly (0ms, no network I/O needed).
-Go immediately sends BCR_RTC_SHADOW_READY to the browser containing the fingerprint and ufrag/pwd (with an empty candidates array).
-The browser munges these credentials into the SDP instantly. The wait inside setLocalDescription is now under 50ms.
-Teams POSTs the offer to the SFU immediately.
-Go gathers ICE candidates in the background and trickles them to the browser via BCR_RTC_SHADOW_ICE_CANDIDATE over the next 1–2 seconds, which trickles them to the SFU.
-Critique: This is the gold standard for WebRTC call offloading. It completely eliminates the ~29-second delay, meaning there is zero risk of TCP connection resets or timeouts. Teams gets its SDP immediately, and connectivity checks happen asynchronously via standard WebRTC trickle.
-Verdict: The absolute best option.
-My Recommendation for Your Scenario
-The best approach is to combine Option 5 (Instant Credentials + Go Trickle ICE) with Option 3 (Dynamic Getter):
-
-Modify the Go Client (Option 5): Configure Go to send the BCR_RTC_SHADOW_READY event containing the DTLS fingerprint, IP, and ICE credentials immediately upon receiving BCR_RTC_SHADOW_LOCAL. Do not wait for Go's ICE gathering to complete before sending the credentials. Trickle Go's candidates as they become available.
-Implement the Dynamic Getter in JS (Option 3): Keep the Javascript interceptor extremely robust by implementing the prototype-based dynamic getter. This protects against any scenario where Teams JS reads the SDP synchronously or Chrome throws errors, and acts as a bulletproof safety layer.
-Would you like to implement the dynamic JS getter first to secure the browser-side of this pipeline?
-
-
----
-
-## License
-
-See `LICENSE` for terms.
