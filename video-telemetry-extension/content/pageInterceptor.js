@@ -1374,6 +1374,15 @@
                     mediaSourceToVideo.set(value, this);
                 }
                 if (!_bypass && state.suppressedVideos.has(this)) {
+                    if (value) {
+                        try {
+                            const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+                                ? crypto.randomUUID()
+                                : `video-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+                            this.setAttribute('data-bcr-video-id', id);
+                            this.setAttribute('data-bcr-primary', '1');
+                        } catch (_) {}
+                    }
                     if (value instanceof MediaSource) {
                         // Pre-mark so addSourceBuffer sees it immediately
                         state.suppressedMediaSources.add(value);
@@ -1399,6 +1408,15 @@
                     mediaSourceToVideo.set(blobUrlToMediaSource.get(value), this);
                 }
                 if (!_bypass && state.suppressedVideos.has(this)) {
+                    if (value) {
+                        try {
+                            const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+                                ? crypto.randomUUID()
+                                : `video-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+                            this.setAttribute('data-bcr-video-id', id);
+                            this.setAttribute('data-bcr-primary', '1');
+                        } catch (_) {}
+                    }
                     if (value && blobUrlToMediaSource.has(value)) {
                         state.suppressedMediaSources.add(blobUrlToMediaSource.get(value));
                     }

@@ -346,11 +346,21 @@ window.onload = function () {
      * Handle a single incoming media chunk (called from Wails event handler).
      */
     function handleMediaChunk(seq, trackType, mimeType, codec, sourceBufferID, isInitSegment, chunkB64, videoID) {
+        // If the video ID changes, tear down the stale session to prevent QuotaExceededError
+        if (mediaSource && videoID && videoID !== 'unknown' && activeVideoID && activeVideoID !== 'unknown' && videoID !== activeVideoID) {
+            logTerminal(`[MSE] videoID changed from ${activeVideoID} to ${videoID} — tearing down stale session`);
+            teardownMSE();
+        }
+
         // Lazily set up MSE on first chunk
         if (!mediaSource) {
             setupMSE();
             activeVideoID = videoID;
             logTerminal(`[MSE] Set activeVideoID to ${activeVideoID}`);
+        } else if (videoID && videoID !== 'unknown' && activeVideoID !== videoID) {
+            // Update activeVideoID if it was previously unset or unknown
+            activeVideoID = videoID;
+            logTerminal(`[MSE] Sync activeVideoID to ${activeVideoID}`);
         }
 
         const data = base64ToUint8Array(chunkB64);

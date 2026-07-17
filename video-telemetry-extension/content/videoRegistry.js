@@ -83,10 +83,16 @@ class VideoRegistry {
     _startMutationObserver() {
         this._mutationObserver = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
-                if (mutation.type === 'attributes' && mutation.attributeName === 'data-bcr-primary') {
+                if (mutation.type === 'attributes' && (mutation.attributeName === 'data-bcr-primary' || mutation.attributeName === 'data-bcr-video-id')) {
                     const target = mutation.target;
                     if (target.tagName === 'VIDEO') {
-                        if (target.hasAttribute('data-bcr-primary')) {
+                        if (target.hasAttribute('data-bcr-primary') && target.hasAttribute('data-bcr-video-id')) {
+                            const currentId = target.getAttribute('data-bcr-video-id');
+                            const registered = this._registry.get(target);
+                            if (registered && registered.id !== currentId) {
+                                // Reused player got a new video session ID. Clean up old session first.
+                                this._unregisterVideo(target);
+                            }
                             this._registerVideo(target);
                         } else {
                             this._unregisterVideo(target);
@@ -121,7 +127,7 @@ class VideoRegistry {
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ['data-bcr-primary'],
+            attributeFilter: ['data-bcr-primary', 'data-bcr-video-id'],
         });
     }
 
