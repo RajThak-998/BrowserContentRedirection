@@ -1,3 +1,5 @@
+// handle the ipc between vdi and thin client
+
 #ifdef _stdcall
 #undef _stdcall
 #endif
