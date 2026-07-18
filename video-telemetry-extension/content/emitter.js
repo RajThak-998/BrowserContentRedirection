@@ -178,6 +178,18 @@ class Emitter {
         );
     }
 
+    emitRtcShadowPreWarm(payload) {
+        this._sendWithRetry(
+            {
+                type: "RTC_SHADOW_PRE_WARM",
+                payload: {
+                    timestamp: payload.timestamp ?? Date.now(),
+                },
+            },
+            this._MAX_RETRIES
+        );
+    }
+
     // ─── Internal ─────────────────────────────────────────────────────────────
 
     _sendWithRetry(message, retriesLeft) {

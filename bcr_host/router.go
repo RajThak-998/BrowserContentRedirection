@@ -196,7 +196,7 @@ func isRTCShadowUpstreamPacket(data []byte) bool {
 	}
 
 	switch pkt.Type {
-	case PacketTypeRTCShadowRemote, PacketTypeRTCShadowLocal, PacketTypeRTCShadowClose, PacketTypeRTCShadowCandidate, PacketTypeRTCShadowIceServers:
+	case PacketTypeRTCShadowRemote, PacketTypeRTCShadowLocal, PacketTypeRTCShadowClose, PacketTypeRTCShadowCandidate, PacketTypeRTCShadowIceServers, PacketTypeRTCShadowPreWarm:
 		return true
 	default:
 		return false
@@ -210,7 +210,7 @@ func isRTCShadowDownstreamPacket(data []byte) bool {
 	}
 
 	switch pkt.Type {
-	case PacketTypeRTCShadowReady, PacketTypeRTCShadowError, PacketTypeRTCShadowCandidate:
+	case PacketTypeRTCShadowReady, PacketTypeRTCShadowError, PacketTypeRTCShadowCandidate, PacketTypeRTCShadowPreWarmReady:
 		return true
 	default:
 		return false
@@ -576,7 +576,8 @@ func (b *bridgeForwarder) runBridgeLoop() {
 						msg.packetType == PacketTypeRTCShadowLocal ||
 						msg.packetType == PacketTypeRTCShadowClose ||
 						msg.packetType == PacketTypeRTCShadowCandidate ||
-						msg.packetType == PacketTypeRTCShadowIceServers {
+						msg.packetType == PacketTypeRTCShadowIceServers ||
+						msg.packetType == PacketTypeRTCShadowPreWarm {
 						log.Printf("[Bridge] SHADOW_UP -> client type=%s bridgeId=%s", msg.packetType, msg.bridgeID)
 					}
 
@@ -630,7 +631,8 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 		packetType == PacketTypeRTCShadowLocal ||
 		packetType == PacketTypeRTCShadowClose ||
 		packetType == PacketTypeRTCShadowCandidate ||
-		packetType == PacketTypeRTCShadowIceServers
+		packetType == PacketTypeRTCShadowIceServers ||
+		packetType == PacketTypeRTCShadowPreWarm
 	// Video lifecycle events forwarded so bcr_client can manage overlay window.
 	isVideoLifecycle := packetType == "VIDEO_ADDED" || packetType == "VIDEO_REMOVED"
 

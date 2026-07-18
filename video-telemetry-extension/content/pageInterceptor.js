@@ -350,6 +350,23 @@
         window.postMessage({ type, payload }, '*');
     }
 
+    // ─── Page-Load Pre-Warm ────────────────────────────────────────────────────
+    let _preWarmedCredentials = null;
+    let _preWarmRequested = false;
+
+    function requestPreWarm() {
+        if (_preWarmRequested) return;
+        const host = window.location.hostname || '';
+        if (!host.includes('teams.microsoft.com') && !host.includes('teams.live.com')) {
+            return;
+        }
+        _preWarmRequested = true;
+        emitShadowEvent('BCR_SHADOW_PRE_WARM', { timestamp: Date.now() });
+        BCR_LOG('[BCR] Pre-warm requested at page load');
+    }
+
+    requestPreWarm();
+
     function captureIceServersFromConnection(pc) {
         const entry = ensureRtcState(pc);
         try {
@@ -886,6 +903,16 @@
             const pc = new origRTCPeerConnection(...args);
             attachPeerLifecycleHooks(pc);
 
+            if (_preWarmedCredentials) {
+                const entry = ensureRtcState(pc);
+                entry.shadowCredentials = _preWarmedCredentials;
+                entry.preWarmId = _preWarmedCredentials.preWarmId;
+                _preWarmedCredentials = null; // consumed, one-time use
+                BCR_LOG('[BCR] Pre-warmed credentials bound to bridgeId=', entry.bridgeId);
+            } else {
+                BCR_LOG('[BCR] WARNING: No pre-warmed credentials available at RTCPeerConnection construction');
+            }
+
             // Capture the ICE server configuration from the VDI app so the shadow PC
             // can use the same STUN/TURN servers for connectivity.
             const config = args[0];
@@ -920,6 +947,12 @@
 
         const data = event.data;
         if (!data || typeof data.type !== 'string') return;
+
+        if (data.type === 'BCR_RTC_SHADOW_PRE_WARM_READY') {
+            _preWarmedCredentials = data.payload;
+            BCR_LOG('[BCR] Pre-warmed credentials received, preWarmId=', data.payload?.preWarmId);
+            return;
+        }
 
         if (data.type === 'BCR_RTC_SHADOW_READY') {
             const payload = data.payload;
@@ -1033,7 +1066,10 @@
             const desc = origGetter.call(pc);
             if (!desc || !desc.sdp) return desc;
             const entry = rtcStateByPeer.get(pc);
-            if (!entry || !entry.shadowCredentials) return desc;
+            if (!entry || !entry.shadowCredentials) {
+                BCR_LOG('[BCR] ⚠️ localDescription getter: no shadow credentials — returning UNMUNGED SDP!');
+                return desc;
+            }
             // Use cached pinned SDP if available to avoid redundant filtering.
             const pinnedSdp = entry._cachedPinnedSdp || filterSdpToPreferredCodecs(desc.sdp);
             const mungedSdp = mungeSdpTransport(pinnedSdp, entry.shadowCredentials);
@@ -1106,6 +1142,7 @@
                     sdpType: description.type ?? 'unknown',
                     sdp: pinnedSdp,
                     iceServers: entry.iceServers ?? [],
+                    preWarmId: entry.preWarmId ?? '',
                     timestamp: Date.now(),
                 });
 
@@ -1124,18 +1161,20 @@
 
             const result = await origSetLocalDescription.apply(this, [chromeSafeDescription, ...args.slice(1)]);
 
-            // If credentials already arrived (fast Go path), apply immediately.
-            // Otherwise, the localDescription getter will munge on-read.
-            if (entry.shadowCredentials) {
-                const pinnedForMutation = entry._cachedPinnedSdp || filterSdpToPreferredCodecs(origSdpString);
-                const targetSdp = mungeSdpTransport(pinnedForMutation, entry.shadowCredentials);
-                try {
-                    description.sdp = targetSdp;
-                    BCR_LOG('[BCR] Description object mutated with shadow SDP bridgeId=', entry.bridgeId);
-                } catch (_) {}
-                // Trickle ICE candidates
-                _applyCredentialsAndTrickle(this, entry);
-            }
+            // ── COMMENTED OUT: old setter-based munge ─────────────────────
+            // Kept for reference. Munge now happens at createOffer time.
+            // If createOffer munge is confirmed working, this block can be deleted.
+            //
+            // if (entry.shadowCredentials) {
+            //     const pinnedForMutation = entry._cachedPinnedSdp || filterSdpToPreferredCodecs(origSdpString);
+            //     const targetSdp = mungeSdpTransport(pinnedForMutation, entry.shadowCredentials);
+            //     try {
+            //         description.sdp = targetSdp;
+            //         BCR_LOG('[BCR] Description object mutated with shadow SDP bridgeId=', entry.bridgeId);
+            //     } catch (_) {}
+            //     // Trickle ICE candidates
+            //     _applyCredentialsAndTrickle(this, entry);
+            // }
 
             return result;
         };
@@ -1244,8 +1283,36 @@
 
             BCR_LOG('[BCR] Captured SDP type:', origDescription.type ?? actionType, 'direction=local build from', actionType, 'bridgeId=', entry.bridgeId);
 
+            // ── Transport Munge at createOffer ────────────────────────────
+            // If pre-warmed credentials are available, munge the SDP NOW.
+            // Teams gets the fully munged SDP directly — no getter race.
+            let sdpToReturn = pinnedSdp;
+
+            if (entry.shadowCredentials) {
+                const mungedSdp = mungeSdpTransport(pinnedSdp, entry.shadowCredentials);
+                if (mungedSdp && mungedSdp !== pinnedSdp) {
+                    sdpToReturn = mungedSdp;
+                    BCR_LOG('[BCR] ✅ createOffer/createAnswer: SDP munged with shadow credentials',
+                            'bridgeId=', entry.bridgeId,
+                            'ufrag=', entry.shadowCredentials.iceUfrag?.substring(0, 8) + '...');
+                } else {
+                    BCR_LOG('[BCR] ⚠️ createOffer/createAnswer: mungeSdpTransport returned unchanged SDP!',
+                            'bridgeId=', entry.bridgeId,
+                            'hasCreds=', !!entry.shadowCredentials,
+                            'ufrag=', entry.shadowCredentials?.iceUfrag ?? 'null',
+                            'pwd=', entry.shadowCredentials?.icePwd ? 'present' : 'null',
+                            'fingerprint=', entry.shadowCredentials?.dtlsFingerprint ? 'present' : 'null',
+                            'candidates=', entry.shadowCredentials?.candidates?.length ?? 0);
+                }
+            } else {
+                BCR_LOG('[BCR] ⚠️ createOffer/createAnswer: NO shadow credentials available at createOffer time!',
+                        'bridgeId=', entry.bridgeId,
+                        'preWarmRequested=', _preWarmRequested,
+                        'Falling back to getter-based munge (race risk)');
+            }
+
             // Must return an object that circumvents strict instanceof RTCSessionDescription checks inside RxJS / React data pipelines
-            return buildDescriptionLike(origDescription, pinnedSdp);
+            return buildDescriptionLike(origDescription, sdpToReturn);
         }
 
         rtcProto.createOffer = function patchedCreateOffer(...args) {

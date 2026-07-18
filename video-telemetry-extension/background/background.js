@@ -20,12 +20,14 @@ const RTC_UPSTREAM_TYPES = new Set([
     "RTC_SHADOW_CLOSE",
     "RTC_SHADOW_ICE_CANDIDATE",
     "RTC_SHADOW_ICE_SERVERS",
+    "RTC_SHADOW_PRE_WARM",
 ]);
 
 const RTC_DOWNSTREAM_TYPES = new Set([
     "RTC_SHADOW_READY",
     "RTC_SHADOW_ERROR",
     "RTC_SHADOW_ICE_CANDIDATE",
+    "RTC_SHADOW_PRE_WARM_READY",
 ]);
 
 // ─── Media Counters ─────────────────────────────────────────────────────────
@@ -320,6 +322,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case "RTC_SHADOW_CLOSE":
         case "RTC_SHADOW_ICE_CANDIDATE":
         case "RTC_SHADOW_ICE_SERVERS":
+        case "RTC_SHADOW_PRE_WARM":
             _handleRtcShadow(message, sender, sendResponse);
             break;
 
@@ -372,20 +375,24 @@ function _handleRtcShadow(message, sender, sendResponse) {
         return;
     }
 
-    const bridgeId = message.payload?.bridgeId;
-    if (typeof bridgeId !== "string" || bridgeId.length === 0) {
-        sendResponse({status: "error", reason: "bridgeId required"});
-        return;
+    if (message.type !== "RTC_SHADOW_PRE_WARM") {
+        const bridgeId = message.payload?.bridgeId;
+        if (typeof bridgeId !== "string" || bridgeId.length === 0) {
+            sendResponse({status: "error", reason: "bridgeId required"});
+            return;
+        }
+        _rememberRtcRoute(bridgeId, sender);
     }
-
-    _rememberRtcRoute(bridgeId, sender);
 
     const enrichedMessage = _enrichWithSenderMeta(message, sender);
 
     try {
         Transport.getInstance().send(enrichedMessage);
         if (message.type === "RTC_SHADOW_CLOSE") {
-            _rtcBridgeRoutes.delete(bridgeId);
+            const bridgeId = message.payload?.bridgeId;
+            if (bridgeId) {
+                _rtcBridgeRoutes.delete(bridgeId);
+            }
         }
         sendResponse({status: "ok"});
     } catch (err) {
@@ -395,6 +402,27 @@ function _handleRtcShadow(message, sender, sendResponse) {
 }
 
 function _routeRtcShadowToContent(packet) {
+    if (packet.type === "RTC_SHADOW_PRE_WARM_READY") {
+        const tabId = packet.meta?.tabId;
+        const frameId = packet.meta?.frameId ?? 0;
+        if (typeof tabId === "number") {
+            chrome.tabs.sendMessage(
+                tabId,
+                {
+                    type: packet.type,
+                    payload: packet.payload ?? {},
+                },
+                { frameId: frameId },
+                () => {
+                    if (chrome.runtime.lastError) {
+                        // ignore/discard if tab closed
+                    }
+                }
+            );
+        }
+        return;
+    }
+
     const bridgeId = packet?.payload?.bridgeId;
     if (typeof bridgeId !== "string" || bridgeId.length === 0) {
         return;

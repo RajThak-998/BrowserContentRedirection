@@ -380,6 +380,32 @@ func newRawShadowSession(bridgeID string, logf func(string, ...any)) *rawShadowS
 
 // ─── Phase 1 ─────────────────────────────────────────────────────────────────
 
+// InitFromPreWarm binds a pre-warmed ICE agent and returns the RTCShadowReadyPayload immediately.
+func (s *rawShadowSession) InitFromPreWarm(pw *PreWarm, sdpType string) (*RTCShadowReadyPayload, error) {
+	s.mu.Lock()
+	if s.state != stateNew {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("InitFromPreWarm called in wrong state: %v", s.state)
+	}
+	s.mu.Unlock()
+
+	pw.BindToSession(s, s.bridgeID)
+
+	s.mu.Lock()
+	ready := s.localCredentials
+	s.mu.Unlock()
+
+	if ready == nil {
+		return nil, fmt.Errorf("failed to bind pre-warmed agent: credentials nil")
+	}
+
+	// Make sure the sdpType is correct in the returned payload
+	retReady := *ready
+	retReady.SDPType = sdpType
+
+	return &retReady, nil
+}
+
 // Init generates the local transport identity (DTLS cert + ICE agent), gathers
 // candidates, and returns the RTCShadowReadyPayload that the engine sends back
 // to the JavaScript via RTC_SHADOW_READY.

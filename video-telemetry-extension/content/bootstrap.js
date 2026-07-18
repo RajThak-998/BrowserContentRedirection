@@ -40,6 +40,11 @@
             const data = event.data;
             if (!data || typeof data.type !== "string") return;
 
+            if (data.type === "BCR_SHADOW_PRE_WARM") {
+                Emitter.getInstance().emitRtcShadowPreWarm(data.payload ?? {});
+                return;
+            }
+
             if (data.type === "BCR_RTC_SHADOW_REMOTE") {
                 Emitter.getInstance().emitRtcShadowRemote(data.payload ?? {});
                 return;
@@ -124,6 +129,14 @@
 
         _onRuntimeMessage = (message) => {
             if (!message || typeof message.type !== "string") return;
+
+            if (message.type === "RTC_SHADOW_PRE_WARM_READY") {
+                window.postMessage({
+                    type: "BCR_RTC_SHADOW_PRE_WARM_READY",
+                    payload: message.payload ?? {},
+                }, "*");
+                return;
+            }
 
             if (message.type === "RTC_SHADOW_READY") {
                 window.postMessage({

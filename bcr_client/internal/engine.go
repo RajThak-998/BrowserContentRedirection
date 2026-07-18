@@ -74,6 +74,9 @@ type Engine struct {
 	unknownPTMu   sync.Mutex
 	unknownPTs    map[uint8]bool
 	strictDropPTs map[uint8]bool
+
+	preWarmMu     sync.Mutex
+	activePreWarm *PreWarm
 }
 
 func New(cfg Config, cb Callbacks) *Engine {
@@ -140,6 +143,9 @@ func (e *Engine) handleTCPConnection(netConn net.Conn) {
 	e.bridgeMu.Unlock()
 
 	e.logf("[bcr_client] TCP signaling connection accepted from %s", netConn.RemoteAddr())
+
+	// Auto-warm on first bcr_host connection
+	go e.warmUp(conn)
 
 	defer func() {
 		e.bridgeMu.Lock()
@@ -312,6 +318,13 @@ func (e *Engine) closeShadowSession(bridgeID string) {
 	}
 
 	e.closeLoopbackSession(bridgeID)
+
+	e.bridgeMu.RLock()
+	conn := e.controlConn
+	e.bridgeMu.RUnlock()
+	if conn != nil {
+		go e.warmUp(conn)
+	}
 }
 
 func (e *Engine) closeLoopbackSession(bridgeID string) {
@@ -461,6 +474,35 @@ func (e *Engine) retryBridge(conn SignalingConn, bridgeID string, session *rawSh
 	e.triggerConnect(conn, bridgeID, session, remoteSDP, sdpType, gen)
 }
 
+func (e *Engine) warmUp(conn SignalingConn) {
+	defaultServers := []IceServer{
+		{URLs: []string{
+			"stun:stun.l.google.com:19302",
+			"stun:stun1.l.google.com:19302",
+			"stun:stun2.l.google.com:19302",
+		}},
+	}
+	stunURIs := iceServersToStunURIs(defaultServers, e.logf, "prewarm-init")
+
+	e.logf("[bcr_client] starting pre-warm agent")
+	pw, err := newPreWarm(stunURIs, e.logf)
+	if err != nil {
+		e.logf("[bcr_client] failed to create pre-warm agent: %v", err)
+		return
+	}
+
+	e.preWarmMu.Lock()
+	e.activePreWarm = pw
+	e.preWarmMu.Unlock()
+
+	readyPayload := pw.ToReadyPayload()
+	if err := writeJSONPacket(conn, "RTC_SHADOW_PRE_WARM_READY", readyPayload); err != nil {
+		e.logf("[bcr_client] failed to send RTC_SHADOW_PRE_WARM_READY: %v", err)
+	} else {
+		e.logf("[bcr_client] sent RTC_SHADOW_PRE_WARM_READY preWarmId=%s", pw.id)
+	}
+}
+
 // ─── handleShadowLocal ────────────────────────────────────────────────────────
 
 // handleShadowLocal is called when the browser fires its local SDP event
@@ -550,6 +592,15 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 	// Mark ICE role: offerer = controlling (Dial), answerer = controlled (Accept).
 	session.isOfferer = sdpType == "offer"
 
+	e.preWarmMu.Lock()
+	pw := e.activePreWarm
+	e.preWarmMu.Unlock()
+
+	usePreWarm := false
+	if pw != nil && payload.PreWarmID != "" && pw.id == payload.PreWarmID {
+		usePreWarm = true
+	}
+
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -568,7 +619,19 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 		}
 		session.mu.Unlock()
 
-		ready, err := session.Init(ctx, sdpType)
+		var ready *RTCShadowReadyPayload
+		var err error
+
+		if usePreWarm {
+			e.logf("[raw][%s] Found active pre-warm session %s matching payload", bridgeID, pw.id)
+			if len(payload.IceServers) > 0 {
+				pw.AddICEServers(payload.IceServers, e.logf)
+			}
+			ready, err = session.InitFromPreWarm(pw, sdpType)
+		} else {
+			ready, err = session.Init(ctx, sdpType)
+		}
+
 		if err != nil {
 			e.logf("[raw][%s] Init failed: %v", bridgeID, err)
 			e.sendShadowError(conn, bridgeID, "init_failed", err, true)
@@ -734,6 +797,10 @@ func (e *Engine) handleShadowPacket(conn SignalingConn, message []byte) bool {
 	}
 
 	switch pkt.Type {
+	case "RTC_SHADOW_PRE_WARM":
+		go e.warmUp(conn)
+		return true
+
 	case "RTC_SHADOW_LOCAL":
 		var payload RTCShadowLocalPayload
 		if err := json.Unmarshal(pkt.Payload, &payload); err != nil {
