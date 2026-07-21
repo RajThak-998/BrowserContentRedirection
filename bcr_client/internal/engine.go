@@ -77,6 +77,13 @@ type Engine struct {
 
 	preWarmMu     sync.Mutex
 	activePreWarm *PreWarm
+	// preWarmByID retains every pre-warm agent we have handed out, keyed by its
+	// id. The browser may hold the id of an earlier pre-warm than the current
+	// activePreWarm (the extension can request pre-warm more than once), and
+	// matching only against activePreWarm silently discarded the warm agent and
+	// forced a cold ICE gather (~11s to first srflx). Looking up by id keeps the
+	// warm agent usable regardless of how many pre-warms have been issued.
+	preWarmByID map[string]*PreWarm
 }
 
 func New(cfg Config, cb Callbacks) *Engine {
@@ -145,8 +152,7 @@ func (e *Engine) handleTCPConnection(netConn net.Conn) {
 	e.logf("[bcr_client] TCP signaling connection accepted from %s", netConn.RemoteAddr())
 
 	// Auto-warm on first bcr_host connection
-	go e.warmUp(conn)
-
+	go e.warmUp(conn, nil)
 	defer func() {
 		e.bridgeMu.Lock()
 		if e.controlConn == conn {
@@ -323,7 +329,7 @@ func (e *Engine) closeShadowSession(bridgeID string) {
 	conn := e.controlConn
 	e.bridgeMu.RUnlock()
 	if conn != nil {
-		go e.warmUp(conn)
+		go e.warmUp(conn, nil)
 	}
 }
 
@@ -474,15 +480,10 @@ func (e *Engine) retryBridge(conn SignalingConn, bridgeID string, session *rawSh
 	e.triggerConnect(conn, bridgeID, session, remoteSDP, sdpType, gen)
 }
 
-func (e *Engine) warmUp(conn SignalingConn) {
-	defaultServers := []IceServer{
-		{URLs: []string{
-			"stun:stun.l.google.com:19302",
-			"stun:stun1.l.google.com:19302",
-			"stun:stun2.l.google.com:19302",
-		}},
-	}
-	stunURIs := iceServersToStunURIs(defaultServers, e.logf, "prewarm-init")
+func (e *Engine) warmUp(conn SignalingConn, meta json.RawMessage) {
+	// Pre-warm with bcr_client's OWN STUN/TURN so the pre-warmed agent can gather a
+	// routable srflx/relay ahead of the call, independent of Teams' (flaky) TURN creds.
+	stunURIs := iceServersToStunURIs(ownIceServers(), e.logf, "prewarm-init")
 
 	e.logf("[bcr_client] starting pre-warm agent")
 	pw, err := newPreWarm(stunURIs, e.logf)
@@ -493,10 +494,32 @@ func (e *Engine) warmUp(conn SignalingConn) {
 
 	e.preWarmMu.Lock()
 	e.activePreWarm = pw
+	if e.preWarmByID == nil {
+		e.preWarmByID = make(map[string]*PreWarm)
+	}
+	e.preWarmByID[pw.id] = pw
 	e.preWarmMu.Unlock()
 
 	readyPayload := pw.ToReadyPayload()
-	if err := writeJSONPacket(conn, "RTC_SHADOW_PRE_WARM_READY", readyPayload); err != nil {
+	rawPayload, err := json.Marshal(readyPayload)
+	if err != nil {
+		e.logf("[bcr_client] failed to marshal RTC_SHADOW_PRE_WARM_READY payload: %v", err)
+		return
+	}
+
+	pkt := Packet{
+		Type:    "RTC_SHADOW_PRE_WARM_READY",
+		Payload: rawPayload,
+		Meta:    meta,
+	}
+
+	rawMsg, err := json.Marshal(pkt)
+	if err != nil {
+		e.logf("[bcr_client] failed to marshal RTC_SHADOW_PRE_WARM_READY packet: %v", err)
+		return
+	}
+
+	if err := conn.WriteMessage(1, rawMsg); err != nil {
 		e.logf("[bcr_client] failed to send RTC_SHADOW_PRE_WARM_READY: %v", err)
 	} else {
 		e.logf("[bcr_client] sent RTC_SHADOW_PRE_WARM_READY preWarmId=%s", pw.id)
@@ -514,7 +537,10 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 		return
 	}
 
-	// fmt.Println("sdp to inspect: " + payload.SDP)
+	// Full SDP summary goes to the log file only — keeps the terminal readable.
+	e.vlogf("[bcr_client] [SDP-INSPECT] bridgeId=%s type=%s %s",
+		payload.BridgeID, payload.SDPType, ShortenSDP(payload.SDP))
+
 
 	sdpType := normalizeSDPType(payload.SDPType)
 	bridgeID := payload.BridgeID
@@ -592,17 +618,30 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 	// Mark ICE role: offerer = controlling (Dial), answerer = controlled (Accept).
 	session.isOfferer = sdpType == "offer"
 
+	// Resolve the pre-warm the browser actually bound to: prefer an exact id
+	// match from the retained set, and only fall back to activePreWarm.
 	e.preWarmMu.Lock()
 	pw := e.activePreWarm
+	matchedByID := false
+	if payload.PreWarmID != "" {
+		if byID, ok := e.preWarmByID[payload.PreWarmID]; ok && byID != nil {
+			pw = byID
+			matchedByID = true
+		}
+	}
+	activeID := "nil"
+	if e.activePreWarm != nil {
+		activeID = e.activePreWarm.id
+	}
 	e.preWarmMu.Unlock()
 
-	usePreWarm := false
-	if pw != nil && payload.PreWarmID != "" && pw.id == payload.PreWarmID {
-		usePreWarm = true
-	}
+	usePreWarm := pw != nil && payload.PreWarmID != "" && pw.id == payload.PreWarmID
+
+	e.logf("[raw][%s] usePreWarm evaluation: payloadPreWarmID=%q activePreWarmID=%q matchedByID=%v usePreWarm=%v",
+		payload.BridgeID, payload.PreWarmID, activeID, matchedByID, usePreWarm)
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
 		// Set up late candidate trickle BEFORE Init so no candidates are missed.
@@ -638,6 +677,12 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 			return
 		}
 
+		// Reconstruct and print the new munged SDP that the browser is returning to Teams.
+		// Use this block to paste into chrome://webrtc-internals or check the final signaling payload.
+		munged := MungeSDPTransport(payload.SDP, ready.ICEUfrag, ready.ICEPwd, ready.DTLSFingerprint)
+		e.vlogf("[bcr_client] [SDP-MUNGED] bridgeId=%s type=%s\n--- BEGIN MUNGED SDP ---\n%s\n--- END MUNGED SDP ---",
+			bridgeID, sdpType, munged)
+
 		if err := writeJSONPacket(conn, "RTC_SHADOW_READY", ready); err != nil {
 			e.logf("[raw][%s] send SHADOW_READY failed: %v", bridgeID, err)
 		}
@@ -656,6 +701,12 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 			} else {
 				e.logf("[raw][%s] Init(answer) done — waiting for remote offer SDP", bridgeID)
 			}
+		} else {
+			// Offerer path: nothing more happens until the SFU's answer round-trips
+			// back through Teams' signaling and arrives as RTC_SHADOW_REMOTE. If the
+			// "RTC_SHADOW_REMOTE ... sdpType=answer" line never appears below, the SFU
+			// answer never reached us (offer/answer exchange with the SFU failed).
+			e.logf("[raw][%s] SHADOW_READY(offer) sent — now AWAITING RTC_SHADOW_REMOTE (SFU answer)", bridgeID)
 		}
 	}()
 }
@@ -798,7 +849,7 @@ func (e *Engine) handleShadowPacket(conn SignalingConn, message []byte) bool {
 
 	switch pkt.Type {
 	case "RTC_SHADOW_PRE_WARM":
-		go e.warmUp(conn)
+		go e.warmUp(conn, pkt.Meta)
 		return true
 
 	case "RTC_SHADOW_LOCAL":
@@ -1199,6 +1250,15 @@ func hashSDP(sdp string) string {
 
 func normalizeSDPType(t string) string {
 	return strings.ToLower(strings.TrimSpace(t))
+}
+
+// vlogf emits a verbose diagnostic that goes to the log file only (never the
+// terminal). Use it for high-volume output such as full SDP dumps.
+func (e *Engine) vlogf(format string, args ...any) {
+	if e.cb.OnVerboseLog == nil {
+		return
+	}
+	e.cb.OnVerboseLog(fmt.Sprintf(format, args...))
 }
 
 func (e *Engine) logf(format string, args ...any) {

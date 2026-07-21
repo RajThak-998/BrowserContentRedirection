@@ -223,7 +223,40 @@ window.onload = function () {
      * Tear down the MSE pipeline. Called when switching to WebRTC mode or on
      * VIDEO_REMOVED.
      */
+    // ── Teardown debounce ──────────────────────────────────────────────────
+    // YouTube momentarily removes and re-adds the <video> element during ad
+    // transitions and DOM reshuffles. Tearing the MSE pipeline down the instant
+    // a VIDEO_REMOVED arrives destroys the SourceBuffer and forces a full
+    // rebuild once media resumes — the visible "player torn down → buffering"
+    // glitch. Instead we defer teardown by a short grace period and cancel it if
+    // the stream proves still alive (a media chunk arrives, or the video is
+    // re-added within the window).
+    const TEARDOWN_GRACE_MS = 700;
+    let pendingTeardownTimer = null;
+
+    function scheduleTeardown(reason) {
+        if (pendingTeardownTimer) return; // already pending
+        logTerminal(`[MSE] teardown scheduled (${reason}) — ${TEARDOWN_GRACE_MS}ms grace`);
+        pendingTeardownTimer = setTimeout(() => {
+            pendingTeardownTimer = null;
+            logTerminal("[MSE] grace period elapsed — tearing down");
+            teardownMSE();
+        }, TEARDOWN_GRACE_MS);
+    }
+
+    function cancelScheduledTeardown(reason) {
+        if (!pendingTeardownTimer) return;
+        clearTimeout(pendingTeardownTimer);
+        pendingTeardownTimer = null;
+        logTerminal(`[MSE] scheduled teardown cancelled (${reason})`);
+    }
+
     function teardownMSE() {
+        // Any explicit teardown supersedes a debounced one.
+        if (pendingTeardownTimer) {
+            clearTimeout(pendingTeardownTimer);
+            pendingTeardownTimer = null;
+        }
         if (!mediaSources.video && !mediaSources.audio) return;
         logTerminal("[MSE] Tearing down MSE pipeline");
 
@@ -295,7 +328,17 @@ window.onload = function () {
         targetEl.src = URL.createObjectURL(ms);
 
         ms.addEventListener('sourceopen', (e) => {
-            if (e.target !== ms) return;
+            // Guard against stale events from a torn-down MediaSource. `e.target`
+            // is always `ms` here (the listener is bound directly to it), so that
+            // comparison is a no-op — the real check is whether `ms` is still the
+            // session's CURRENT MediaSource. Under rapid VIDEO_ADDED/REMOVED churn
+            // (e.g. ad transitions) a session can be torn down and a new one set up
+            // before this old ms's queued 'sourceopen' event is dispatched; without
+            // this check it would still fire and set mseReady[trackType] = true for
+            // a NEWER MediaSource that hasn't actually opened yet, causing
+            // addSourceBuffer() to throw "readyState is not 'open'" and silently
+            // drop that init segment.
+            if (mediaSources[trackType] !== ms) return;
             logTerminal(`[MSE][${trackType}] MediaSource sourceopen — pipeline ready`);
             mseReady[trackType] = true;
 
@@ -328,7 +371,9 @@ window.onload = function () {
         });
 
         ms.addEventListener('sourceclose', (e) => {
-            if (e.target !== ms) return;
+            // Same stale-instance guard as 'sourceopen' above — only the CURRENT
+            // MediaSource for this trackType is allowed to mutate shared state.
+            if (mediaSources[trackType] !== ms) return;
             logTerminal(`[MSE][${trackType}] MediaSource sourceclose — resetting for fresh session`);
             mseReady[trackType] = false;
             mediaSources[trackType] = null;
@@ -339,7 +384,7 @@ window.onload = function () {
         });
 
         ms.addEventListener('sourceended', (e) => {
-            if (e.target !== ms) return;
+            if (mediaSources[trackType] !== ms) return;
             logTerminal(`[MSE][${trackType}] MediaSource sourceended`);
         });
 
@@ -371,6 +416,18 @@ window.onload = function () {
                     logTerminal(`[MSE] audio canplay auto-play blocked: ${e}`);
                 });
             }, { once: true });
+
+            // Recover from native audio decode errors, mirroring the video error
+            // handler above. Without this, one bad Opus segment sets
+            // HTMLMediaElement.error permanently — every subsequent appendBuffer()
+            // call then throws InvalidStateError forever, and audio silently stays
+            // dead for the rest of the session while video keeps playing.
+            audioElement.addEventListener('error', () => {
+                if (audioElement.error && playbackMode === 'mse') {
+                    logErrorTerm(`[MSE] Audio element error (code=${audioElement.error.code}) — resetting pipeline`);
+                    teardownMSE();
+                }
+            }, { once: true });
         }
 
         if (playbackMode !== 'mse') {
@@ -389,6 +446,13 @@ window.onload = function () {
 
         if (!sb || !queue || queue.length === 0) return;
         if (sb.updating) return; // will be called again from updateend
+
+        // Once the media element has faulted, appendBuffer() throws
+        // InvalidStateError unconditionally — trying again per incoming chunk
+        // just spams identical errors until the element's 'error' handler resets
+        // the pipeline. Bail out now and let that handler do the reset.
+        const targetEl = (trackType === 'video') ? videoElement : audioElement;
+        if (targetEl.error) return;
 
         const chunk = queue.shift();
         try {
@@ -411,6 +475,12 @@ window.onload = function () {
      * Handle a single incoming media chunk (called from Wails event handler).
      */
     function handleMediaChunk(seq, trackType, mimeType, codec, sourceBufferID, isInitSegment, chunkB64, videoID) {
+        // Media is still arriving, so any teardown scheduled by a just-fired
+        // VIDEO_REMOVED was a false alarm (ad boundary / DOM reshuffle). Cancel
+        // it. If this chunk belongs to a genuinely different video, the videoID
+        // change check below tears the stale session down explicitly instead.
+        cancelScheduledTeardown("media still flowing");
+
         // If the video ID changes, tear down the stale session to prevent QuotaExceededError
         if ((mediaSources.video || mediaSources.audio) && videoID && videoID !== 'unknown' && activeVideoID && activeVideoID !== 'unknown' && videoID !== activeVideoID) {
             logTerminal(`[MSE] videoID changed from ${activeVideoID} to ${videoID} — tearing down stale session`);
@@ -510,10 +580,18 @@ window.onload = function () {
     // ── Wails event: onVideoLifecycle ────────────────────────────────────
     window.runtime.EventsOn("onVideoLifecycle", (evtType, videoID) => {
         logTerminal(`[Video] lifecycle evtType=${evtType} videoId=${videoID}`);
+        if (evtType === "VIDEO_ADDED") {
+            // A video (re)appeared — the stream is alive again, so abort any
+            // teardown that a preceding VIDEO_REMOVED scheduled (ad boundary).
+            cancelScheduledTeardown("VIDEO_ADDED");
+            return;
+        }
         if (evtType === "VIDEO_REMOVED" && (!activeVideoID || videoID === activeVideoID)) {
             // Teardown ONLY if the active main video is removed, or if no active video was set yet.
             // This prevents hover/preview videos from tearing down the active main session.
-            teardownMSE();
+            // Deferred through scheduleTeardown so a quick re-add (ad transition)
+            // doesn't cause a full pipeline rebuild + rebuffer.
+            scheduleTeardown(`VIDEO_REMOVED ${videoID}`);
         }
     });
 

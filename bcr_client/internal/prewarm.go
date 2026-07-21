@@ -132,7 +132,7 @@ func (pw *PreWarm) BindToSession(s *rawShadowSession, bridgeID string) {
 		ICEUfrag:        pw.ufrag,
 		ICEPwd:          pw.pwd,
 		DTLSFingerprint: "sha-256 " + pw.fingerprint,
-		LocalIP:         detectLocalIPv4(),
+		LocalIP:         "0.0.0.0",
 		Candidates:      pw.candidates,
 		GeneratedAt:     pw.createdAt.UnixMilli(),
 		ExpiresAt:       time.Now().Add(60 * time.Second).UnixMilli(),
@@ -205,15 +205,13 @@ func (pw *PreWarm) AddICEServers(servers []IceServer, logf func(string, ...any))
 		line := "a=candidate:" + c.Marshal()
 
 		pw.mu.Lock()
-		idx := len(pw.candidates)
 		pw.candidates = append(pw.candidates, line)
 		cb := pw.onLateCandidate
-		readySent := pw.readySentCount > 0
 		pw.mu.Unlock()
 
 		logf("[prewarm][%s] gathered recreated agent candidate: %s", pw.id, line)
 
-		if readySent && idx >= pw.readySentCount && cb != nil {
+		if cb != nil {
 			logf("[prewarm][%s] late candidate trickle (recreated agent): %s", pw.id, line)
 			cb(line)
 		}

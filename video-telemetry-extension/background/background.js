@@ -419,6 +419,28 @@ function _routeRtcShadowToContent(packet) {
                     }
                 }
             );
+        } else {
+            // Broadcast to all active Teams tabs (e.g. on proactive push when Go reconnects)
+            chrome.tabs.query({ url: "*://*.teams.microsoft.com/*" }, (tabs) => {
+                if (tabs) {
+                    for (const tab of tabs) {
+                        chrome.tabs.sendMessage(tab.id, {
+                            type: packet.type,
+                            payload: packet.payload ?? {},
+                        });
+                    }
+                }
+            });
+            chrome.tabs.query({ url: "*://*.teams.live.com/*" }, (tabs) => {
+                if (tabs) {
+                    for (const tab of tabs) {
+                        chrome.tabs.sendMessage(tab.id, {
+                            type: packet.type,
+                            payload: packet.payload ?? {},
+                        });
+                    }
+                }
+            });
         }
         return;
     }

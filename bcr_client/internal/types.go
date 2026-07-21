@@ -22,6 +22,11 @@ type Callbacks struct {
 	OnVideoLifecycle  func(evtType string, videoID string)
 	OnMediaChunk      func(header MediaChunkHeader, chunkData []byte)
 	OnLog             func(message string)
+
+	// OnVerboseLog receives high-volume diagnostics (full SDP dumps, etc.).
+	// It is intended to be wired to the log file only, so the terminal stays
+	// readable. If nil, verbose messages are dropped entirely.
+	OnVerboseLog func(message string)
 }
 
 type Packet struct {

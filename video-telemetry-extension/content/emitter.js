@@ -128,6 +128,7 @@ class Emitter {
                     sdpType: payload.sdpType ?? "unknown",
                     sdp: payload.sdp ?? "",
                     iceServers: payload.iceServers ?? [],
+                    preWarmId: payload.preWarmId ?? "",
                     timestamp: payload.timestamp ?? Date.now(),
                 },
             },

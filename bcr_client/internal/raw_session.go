@@ -28,6 +28,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -461,21 +462,14 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	}
 
 	// ── Step 3: Convert IceServers → []*stun.URI ─────────────────────────────
-	var stunURIs []*stun.URI
-	if len(s.iceServers) > 0 {
-		stunURIs = iceServersToStunURIs(s.iceServers, s.logf, s.bridgeID)
-	} else {
-		s.logf("[raw][%s] No ICE servers provided by browser, using default fallback STUN servers", s.bridgeID)
-		defaultServers := []IceServer{
-			{URLs: []string{
-				"stun:stun.l.google.com:19302",
-				"stun:stun1.l.google.com:19302",
-				"stun:stun2.l.google.com:19302",
-			}},
-		}
-		stunURIs = iceServersToStunURIs(defaultServers, s.logf, s.bridgeID)
-	}
-	s.logf("[raw][%s] using %d ICE server(s)", s.bridgeID, len(stunURIs))
+	// Always merge bcr_client's OWN ICE servers with whatever Teams supplied, so a
+	// routable srflx/relay candidate can be gathered even when Teams provided none
+	// (iceServersCount=0 because edge.skype.com/trap/tokens was reset by the VDI).
+	own := ownIceServers()
+	merged := append(append([]IceServer{}, s.iceServers...), own...)
+	stunURIs := iceServersToStunURIs(merged, s.logf, s.bridgeID)
+	s.logf("[raw][%s] using %d ICE server URL(s) (browser=%d servers + own=%d servers)",
+		s.bridgeID, len(stunURIs), len(s.iceServers), len(own))
 
 	// ── Step 4: Create ICE agent ──────────────────────────────────────────────
 	gatherDone := make(chan struct{})
@@ -495,6 +489,17 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 		agentConfig.LocalUfrag = reuseUfrag
 		agentConfig.LocalPwd = reusePwd
 		s.logf("[raw][%s] reusing existing ICE credentials: ufrag=%s", s.bridgeID, reuseUfrag)
+	}
+	// Opt-in verbose ICE tracing (set BCR_ICE_DEBUG=1). Routes pion/ice's per-
+	// candidate-pair connectivity-check logs to the same sink as the std logger
+	// (stdout + bcr_client.log), so we can see EXACTLY which pairs were tried and
+	// why each check failed — instead of only the final "connecting canceled".
+	if os.Getenv("BCR_ICE_DEBUG") != "" {
+		lf := logging.NewDefaultLoggerFactory()
+		lf.Writer = log.Default().Writer()
+		lf.DefaultLogLevel = logging.LogLevelDebug
+		agentConfig.LoggerFactory = lf
+		s.logf("[raw][%s] BCR_ICE_DEBUG on — verbose pion/ice tracing enabled", s.bridgeID)
 	}
 
 	agent, err := ice.NewAgent(agentConfig)
@@ -568,7 +573,7 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 		ICEUfrag:        ufrag,
 		ICEPwd:          pwd,
 		DTLSFingerprint: "sha-256 " + fingerprint,
-		LocalIP:         detectLocalIPv4(),
+		LocalIP:         "0.0.0.0",
 		Candidates:      candsCopy,
 		GeneratedAt:     time.Now().UnixMilli(),
 		ExpiresAt:       time.Now().Add(60 * time.Second).UnixMilli(),
@@ -1781,6 +1786,55 @@ func deriveSRTPContextFromMaterial(material []byte, goIsClient bool, profile srt
 
 // iceServersToStunURIs converts engine IceServer entries to []*stun.URI for
 // ice.AgentConfig.Urls. Malformed URLs are skipped with a warning.
+// ownIceServers returns bcr_client's OWN STUN/TURN servers, independent of the
+// ones Teams supplies. bcr_client's host candidates are its local LAN and are
+// unreachable from Microsoft's SFU, so it MUST obtain a routable srflx/relay
+// candidate — and it cannot depend on Teams' TURN creds, which come from
+// edge.skype.com/trap/tokens and are reset intermittently by the VDI (→
+// iceServersCount=0 → host-only gathering → ICE never connects).
+//
+// Configured via env vars so a deployment can point at a reliable TURN server
+// (strongly recommended on restrictive/VDI networks where a direct srflx path
+// may be blocked — prefer a TURNS server on tcp/443 to survive UDP blocks):
+//
+//	BCR_STUN_URLS        comma-separated STUN URLs (overrides the default set)
+//	BCR_TURN_URL         a TURN/TURNS URL, e.g. turns:turn.example.com:443?transport=tcp
+//	BCR_TURN_USERNAME    TURN username
+//	BCR_TURN_CREDENTIAL  TURN password
+func ownIceServers() []IceServer {
+	var servers []IceServer
+
+	var stunURLs []string
+	if env := strings.TrimSpace(os.Getenv("BCR_STUN_URLS")); env != "" {
+		for _, u := range strings.Split(env, ",") {
+			if u = strings.TrimSpace(u); u != "" {
+				stunURLs = append(stunURLs, u)
+			}
+		}
+	} else {
+		// Diverse public STUN — raises the odds at least one is reachable when a
+		// given provider is blocked by the local network.
+		stunURLs = []string{
+			"stun:stun.l.google.com:19302",
+			"stun:stun.cloudflare.com:3478",
+			"stun:global.stun.twilio.com:3478",
+		}
+	}
+	if len(stunURLs) > 0 {
+		servers = append(servers, IceServer{URLs: stunURLs})
+	}
+
+	if turnURL := strings.TrimSpace(os.Getenv("BCR_TURN_URL")); turnURL != "" {
+		servers = append(servers, IceServer{
+			URLs:       []string{turnURL},
+			Username:   os.Getenv("BCR_TURN_USERNAME"),
+			Credential: os.Getenv("BCR_TURN_CREDENTIAL"),
+		})
+	}
+
+	return servers
+}
+
 func iceServersToStunURIs(servers []IceServer, logf func(string, ...any), bridgeID string) []*stun.URI {
 	var out []*stun.URI
 	for _, srv := range servers {

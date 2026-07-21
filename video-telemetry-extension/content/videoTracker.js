@@ -77,11 +77,23 @@ class VideoTracker {
             height: rect.height,
         };
 
-       
+        // ── Screen coords for the native overlay window (Chrome on Windows) ──
+        // window.screenX/screenY, getBoundingClientRect() and outerHeight/
+        // innerHeight are all reported in CSS pixels. The Wails host applies
+        // these two axes differently:
+        //   • WindowSetSize  → scales logical→physical via the window DPI, so
+        //     width/height must stay in CSS pixels (leave them as-is).
+        //   • WindowSetPosition → SetWindowPos with NO DPI scaling, i.e. it
+        //     expects PHYSICAL pixels. So the position must be multiplied by
+        //     devicePixelRatio. At 100% display scaling dpr === 1 (no-op); at
+        //     125%/150%/etc. this is what keeps the overlay aligned.
+        // devicePixelRatio already folds in both OS display scaling and page
+        // zoom, so this stays correct if the user zooms the page.
+        const dpr = window.devicePixelRatio || 1;
         const chromeUIHeight = Math.max(0, window.outerHeight - window.innerHeight);
         const screenBounds = {
-            x:      rect.left  + window.screenX,
-            y:      rect.top   + window.screenY + chromeUIHeight,
+            x:      Math.round((rect.left + window.screenX) * dpr),
+            y:      Math.round((rect.top  + window.screenY + chromeUIHeight) * dpr),
             width:  rect.width,
             height: rect.height,
         };

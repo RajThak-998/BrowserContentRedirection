@@ -34,6 +34,61 @@
         console.log('[BCR-INTERNAL]', ...args);
     }
 
+    function showToast(message) {
+        const id = 'bcr-toast-notification';
+        let container = document.getElementById(id);
+        if (!container) {
+            container = document.createElement('div');
+            container.id = id;
+            container.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                background: rgba(24, 24, 27, 0.85);
+                backdrop-filter: blur(8px);
+                -webkit-backdrop-filter: blur(8px);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                color: #ffffff;
+                padding: 12px 20px;
+                border-radius: 8px;
+                font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                font-size: 14px;
+                font-weight: 500;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+                z-index: 999999;
+                transition: opacity 0.3s ease, transform 0.3s ease;
+                transform: translateY(-20px);
+                opacity: 0;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            `;
+            const target = document.body || document.documentElement;
+            if (target) {
+                target.appendChild(container);
+            }
+        }
+
+        container.textContent = '';
+        const dot = document.createElement('span');
+        dot.style.cssText = 'display:inline-block; width:8px; height:8px; background-color:#10B981; border-radius:50%; box-shadow: 0 0 8px #10B981;';
+        const txt = document.createElement('span');
+        txt.textContent = message;
+        container.appendChild(dot);
+        container.appendChild(txt);
+
+        // Trigger reflow
+        container.offsetHeight;
+
+        container.style.transform = 'translateY(0)';
+        container.style.opacity = '1';
+
+        setTimeout(() => {
+            container.style.transform = 'translateY(-20px)';
+            container.style.opacity = '0';
+        }, 3000);
+    }
+
     try {
         window.BCR_LOG = BCR_LOG;
     } catch (_) {
@@ -327,14 +382,82 @@
     // with RTC_SHADOW_READY before failing open and letting the native browser
     // connection take over (split-brain fallback).
     //
-    // TEMPORARY DEBUG VALUE: raised from 5 000 ms → 60 000 ms while investigating
-    // the Go-side 29-second hang inside createAlignedShadowPC / ICE gathering.
-    // This prevents the browser from racing ahead and sending its native offer to
-    // Azure before Go has finished, which caused the DTLS fingerprint mismatch.
-    //
+    // With pre-warm, Go has already prepared credentials at page load, so
+    // awaitShadowReady() resolves in ~0ms. This timeout is only a safety net
+    // for the rare case where pre-warm is not yet ready when createOffer fires.
+    const RTC_WAIT_TIMEOUT_MS = 60_000;
+
     // Per-PC state stored in a WeakMap (GC-safe) and a bridgeId→PC lookup Map.
     const rtcStateByPeer = new WeakMap();
     const rtcPcByBridgeId = new Map(); // bridgeId → PC (for late candidate trickle)
+
+    // ── Promise-based SHADOW_READY await infrastructure ───────────────────────
+    // rtcReadyByBridgeId: cached resolved SHADOW_READY payloads
+    // rtcWaitersByBridgeId: pending {resolve, timer} waiters for each bridgeId
+    // rtcLastErrorByBridgeId: error reasons for failed shadow sessions
+    const rtcReadyByBridgeId = new Map();
+    const rtcWaitersByBridgeId = new Map();
+    const rtcLastErrorByBridgeId = new Map();
+
+    function resolveShadowReady(bridgeId, payload) {
+        if (!bridgeId) return;
+        rtcReadyByBridgeId.set(bridgeId, payload);
+        rtcLastErrorByBridgeId.delete(bridgeId);
+
+        const waiters = rtcWaitersByBridgeId.get(bridgeId);
+        if (!waiters || waiters.length === 0) return;
+
+        rtcWaitersByBridgeId.delete(bridgeId);
+        for (const waiter of waiters) {
+            clearTimeout(waiter.timer);
+            waiter.resolve(payload);
+        }
+    }
+
+    function rejectShadowReady(bridgeId, reason = 'shadow_error') {
+        if (!bridgeId) return;
+
+        rtcLastErrorByBridgeId.set(bridgeId, reason);
+
+        const waiters = rtcWaitersByBridgeId.get(bridgeId);
+        if (!waiters || waiters.length === 0) return;
+
+        rtcWaitersByBridgeId.delete(bridgeId);
+        for (const waiter of waiters) {
+            clearTimeout(waiter.timer);
+            waiter.resolve(null); // null = failed/timed-out
+        }
+    }
+
+    function awaitShadowReady(bridgeId, timeoutMs) {
+        if (!bridgeId) return Promise.resolve(null);
+
+        // If already resolved (e.g. pre-warm already sent SHADOW_READY), return immediately.
+        const cached = rtcReadyByBridgeId.get(bridgeId);
+        if (cached) return Promise.resolve(cached);
+
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                const list = rtcWaitersByBridgeId.get(bridgeId) ?? [];
+                rtcWaitersByBridgeId.set(
+                    bridgeId,
+                    list.filter((item) => item.resolve !== resolve)
+                );
+                resolve(null); // timeout — fail-open
+            }, timeoutMs);
+
+            const waiters = rtcWaitersByBridgeId.get(bridgeId) ?? [];
+            waiters.push({ resolve, timer });
+            rtcWaitersByBridgeId.set(bridgeId, waiters);
+        });
+    }
+
+    function consumeShadowErrorReason(bridgeId) {
+        if (!bridgeId) return null;
+        const reason = rtcLastErrorByBridgeId.get(bridgeId) ?? null;
+        rtcLastErrorByBridgeId.delete(bridgeId);
+        return reason;
+    }
 
     function generateBridgeId() {
         if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -416,21 +539,8 @@
         return entry;
     }
 
-    // ─── Async Credential Application ────────────────────────────────────────
-    // Called when SHADOW_READY arrives (asynchronously after setLocalDescription
-    // has already returned). Applies trickle ICE candidates to the PC so the
-    // SFU can connect to the shadow transport.
-    function _applyCredentialsAndTrickle(pc, entry) {
-        if (!entry || !entry.shadowCredentials) return;
-        // Trickle candidates (deduplicated by generationId)
-        if (Array.isArray(entry.shadowCredentials.candidates)) {
-            const genId = entry.shadowCredentials.generatedAt || entry.shadowCredentials.iceUfrag;
-            if (entry.lastDispatchedTrickleId !== genId) {
-                entry.lastDispatchedTrickleId = genId;
-                dispatchShadowTrickleCandidates(pc, entry.shadowCredentials.candidates);
-            }
-        }
-    }
+    // (Async credential application was removed — munging is now guaranteed
+    //  synchronously inside createOffer/createAnswer via awaitShadowReady.)
 
     function buildDescriptionLike(originalDescription, nextSdp) {
         const next = {
@@ -539,6 +649,86 @@
         return addr.includes(':');
     }
 
+    // ── DPI Firewall: Host-Candidate Filter ────────────────────────────────────
+    // Returns true if the candidate line is of type 'host'.
+    // Host candidates contain private LAN IPs (10.x, 192.168.x, 169.254.x).
+    // Trickling these to Teams causes Teams to include them in its signaling
+    // POST to the SFU — and the VDI DPI firewall RSTs the TCP connection
+    // when it sees private IPs in outbound HTTP payloads.
+    // Only srflx (STUN-mapped public IPs) and relay (TURN relay IPs) are safe.
+    function isHostCandidate(line) {
+        // candidate line format: candidate:... typ host ...
+        // or with a= prefix:    a=candidate:... typ host ...
+        return /\btyp\s+host\b/.test(line);
+    }
+
+    // ══ BISECT TOGGLES ═════════════════════════════════════════════════════════
+    // Diagnostic switches to isolate WHAT in the munged offer trips the VDI's
+    // reset of POST api.flightproxy.skype.com/api/v2/cpconv. Relay-only candidates
+    // (below) did NOT fix it, so the trigger is in the OFFER BODY or is structural.
+    // Flip ONE at a time, reload the extension, place one call, and check whether
+    // cpconv still resets. All default to the normal (BCR-on) behavior.
+    //
+    //   BCR_SDP_PASSTHROUGH — return Teams' ORIGINAL offer untouched (no codec pin,
+    //     no shadow munge, no candidate interception). This is effectively "extension
+    //     loaded but SDP not modified". If cpconv SUCCEEDS → the reset is caused by our
+    //     SDP modifications (bisect further with the two flags below). If cpconv STILL
+    //     RESETS → BCR's SDP is NOT the trigger; the cause is structural (e.g. a
+    //     conflict with the VDI's own Teams media-optimization) and we pivot.
+    //     NOTE: with this on, media does NOT offload — it's a diagnostic only.
+    //
+    //   BCR_DISABLE_CODEC_PIN — keep shadow munge, but send Teams' full codec list
+    //     instead of pinning to H264+opus. Tests whether the reduced codec set is the
+    //     trigger (it's the biggest content difference vs a working non-BCR offer).
+    //
+    //   BCR_DISABLE_SHADOW_MUNGE — keep codec pin, but do NOT replace ice-ufrag/pwd/
+    //     fingerprint/connection-address. Tests whether the credential munge is the
+    //     trigger. NOTE: with this on, media does NOT offload — diagnostic only.
+    const BCR_SDP_PASSTHROUGH = false;
+    const BCR_DISABLE_CODEC_PIN = false;  // Test 2 done: codec pin is NOT the cpconv trigger
+    const BCR_DISABLE_SHADOW_MUNGE = false;
+
+    // ── DPI Firewall: srflx-Candidate Filter ──────────────────────────────────
+    // When true, only TURN 'relay' candidates are trickled to Teams; 'srflx'
+    // candidates are dropped.
+    //
+    // Why: a srflx candidate advertises the PUBLIC IP of the machine running
+    // bcr_client (e.g. 14.139.108.227) — an address that belongs to a completely
+    // different network than the VDI. A DPI appliance inspecting the outbound
+    // cpconv call-setup POST sees the session advertising media on a foreign
+    // public IP, which is the signature of media redirection, and RSTs the
+    // connection (observed as: POST api.flightproxy.skype.com/api/v2/cpconv
+    // net::ERR_CONNECTION_RESET, retried 3x, call never placed).
+    //
+    // Relay candidates carry Microsoft's own Azure TURN addresses (20.202.x.x)
+    // and are indistinguishable from an ordinary Teams call, so they pass.
+    // Media still reaches bcr_client — via Microsoft's TURN relay instead of
+    // directly — at the cost of a small amount of extra latency.
+    //
+    // Set to false to restore srflx trickling (direct path, lower latency) if
+    // the DPI policy allows it.
+    //
+    // UPDATE: proven safe and NECESSARY. bcr_client's host candidates are its local
+    // LAN (10.x/192.168.x) — unreachable from Microsoft's SFU. Its ONLY TURN-free
+    // routable candidate is srflx (its public IP). Dropping srflx left the SFU with
+    // no way to reach bcr_client → ICE never connected. Keep srflx flowing.
+    const BCR_RELAY_ONLY_CANDIDATES = false;
+
+    function isSrflxCandidate(line) {
+        return /\btyp\s+srflx\b/.test(line);
+    }
+
+    // Scrubs `raddr <private-ip> rport <port>` from any candidate line.
+    // srflx candidates carry the STUN-derived public address as the main IP (safe),
+    // but per RFC 5245/8445 they ALSO carry the private local base address in raddr
+    // (the address the STUN mapping was discovered from) — same for relay candidates,
+    // where raddr holds the local reflexive address behind the TURN allocation.
+    // No-op if the line has no raddr token.
+    function scrubCandidateRaddr(line) {
+        // Replace: raddr <any-ip> rport <port>  →  raddr 0.0.0.0 rport <port>
+        return line.replace(/(\braddr\s+)[^\s]+(\s+rport\b)/, '$10.0.0.0$2');
+    }
+
     function dispatchShadowTrickleCandidates(pc, candidates) {
         let candidateLines = [];
         if (Array.isArray(candidates)) {
@@ -554,29 +744,48 @@
                     BCR_LOG('[BCR] Dropping IPv6 candidate to avoid Teams crash:', trimmed);
                     return false;
                 }
+
+                // Filter out 'typ host' candidates — they carry private LAN IPs.
+                // Trickling private IPs causes Teams to include them in its signaling
+                // POST to the SFU, triggering VDI DPI firewall TCP resets (ERR_CONNECTION_RESET).
+                // Only srflx (public STUN-mapped) and relay (TURN) candidates are safe to trickle.
+                if (isHostCandidate(trimmed)) {
+                    BCR_LOG('[BCR] Dropping host candidate (DPI firewall bypass):', trimmed);
+                    return false;
+                }
+
+                // Drop srflx candidates — they advertise bcr_client's public IP, which
+                // is foreign to the VDI's network and trips the DPI reset on the cpconv
+                // call-setup POST. Only Microsoft-owned TURN relay addresses survive.
+                if (BCR_RELAY_ONLY_CANDIDATES && isSrflxCandidate(trimmed)) {
+                    BCR_LOG('[BCR] Dropping srflx candidate (relay-only mode, DPI bypass):', trimmed);
+                    return false;
+                }
+
                 return true;
             });
+
+            // Scrub raddr from every surviving candidate — srflx and relay both
+            // carry a related-address that can leak a private LAN IP.
+            candidateLines = candidateLines.map(scrubCandidateRaddr);
         }
 
         if (candidateLines.length === 0 && Array.isArray(candidates) && candidates.length > 0) {
             BCR_LOG('[BCR] WARNING: ALL', candidates.length,
-                'shadow candidates were dropped by the IPv6 filter.',
-                'Teams will have no ICE candidates. Check shadow PC network config.',
+                'shadow candidates were dropped by candidate filters.',
+                'Teams will have no ICE candidates. Waiting for srflx/relay...',
                 'Raw dropped candidates:', candidates);
-            // Emit a diagnostic event so the content script / Go side can log it
-            emitShadowEvent('BCR_SHADOW_DIAGNOSTIC', {
-                type: 'ALL_CANDIDATES_FILTERED',
-                droppedCount: candidates.length,
-                droppedSample: candidates.slice(0, 3),
-                timestamp: Date.now(),
-            });
-            return; // nothing to trickle
+            return; // nothing to trickle yet — srflx/relay may arrive later
         }
 
         let mid = '0';
         BCR_LOG('[BCR] Synthetic ICE Trickle queued',
-            candidateLines.length, 'IPv4 candidates (dropped',
-            (candidates.length - candidateLines.length), 'IPv6)');
+            candidateLines.length, 'candidates (dropped',
+            (candidates.length - candidateLines.length), 'host/srflx/IPv6)');
+        // Print the EXACT strings handed to Teams — these end up verbatim in the
+        // cpconv POST body, so this is what the VDI DPI actually inspects.
+        // Verify here that no private IP survives in any addr or raddr field.
+        candidateLines.forEach((line) => BCR_LOG('[BCR]   → dispatching:', line.trim()));
 
         // Dispatch synthetic candidates using queueMicrotask to avoid background tab setTimeout throttling (Efficiency Mode)
         candidateLines.forEach((line) => {
@@ -585,9 +794,6 @@
                     let candidateStr = line.trim();
                     if (candidateStr.startsWith('a=')) {
                         candidateStr = candidateStr.substring(2); // strictly remove "a="
-                    }
-                    if (candidateStr.startsWith('candidate:')) {
-                        candidateStr = candidateStr.substring(10); // strictly remove "candidate:" if present natively
                     }
                     candidateStr = candidateStr.trim();
 
@@ -825,30 +1031,42 @@
         }
 
         // ── ICE candidates ─────────────────────────────────────────────────────
-        // Replace the browser's own a=candidate lines with the shadow PC's
-        // gathered candidates. This points the remote peer at the shadow's
-        // actual transport address (bcr_client's local IP + UDP port).
-        // a=end-of-candidates is also removed; we re-insert it after injection.
+        // Strip Teams' own candidates (they point at the VDI browser, not bcr_client)…
+        const nl = munged.includes('\r\n') ? '\r\n' : '\n';
+        munged = munged.replace(/^a=candidate:.*$/gm, '');
+        munged = munged.replace(/^a=end-of-candidates.*$/gm, '');
+        munged = munged.replace(/(\r?\n){3,}/g, `${nl}${nl}`);
+
+        // …and INJECT bcr_client's own gathered candidates inline instead.
+        //
+        // ROOT CAUSE (proven by diffing the flightproxy /cpconv request body of a
+        // failing BCR call vs a working non-BCR call): Teams builds its cpconv
+        // call-setup POST from localDescription. If that SDP carries NO candidates,
+        // Teams substitutes the placeholder `c=IN IP4 10.10.10.10` / `m=… 1234` /
+        // `a=candidate:… 10.10.10.10 1234 typ host`, and the service RSTs the POST
+        // (ERR_CONNECTION_RESET → call never places). The working non-BCR cpconv
+        // carried inline candidates — including PRIVATE host IPs (172.25.0.219),
+        // IPv6, and srflx with a private raddr — and connected fine. So private IPs
+        // are NOT what the network resets on; an EMPTY/placeholder candidate set is.
+        // Mirror normal Teams: put at least one real candidate inline. bcr_client's
+        // host candidates are ready immediately (pre-warm); the routable relay/srflx
+        // still trickle in afterwards for actual connectivity.
         if (Array.isArray(shadow.candidates) && shadow.candidates.length > 0) {
-            // Detect line ending used in this SDP.
-            const nl = munged.includes('\r\n') ? '\r\n' : '\n';
-
-            // Strip existing candidate and end-of-candidates lines.
-            munged = munged.replace(/^a=candidate:.*$/gm, '');
-            munged = munged.replace(/^a=end-of-candidates.*$/gm, '');
-            // Clean up any blank lines left behind.
-            munged = munged.replace(/(\r?\n){3,}/g, `${nl}${nl}`);
-
-            // Inject shadow candidates after the first a=ice-pwd: line
-            // (which marks the start of the media transport block in BUNDLE).
-            // We inject once only — in BUNDLE mode a single ICE session serves all m-lines.
-            let injected = false;
-            const candidateBlock = shadow.candidates.join(nl) + nl + 'a=end-of-candidates';
-            munged = munged.replace(/(a=ice-pwd:[^\r\n]+)(\r?\n)/g, (match, pwd, newline) => {
-                if (injected) return match;
-                injected = true;
-                return pwd + newline + candidateBlock + newline;
-            });
+            const candBlock = shadow.candidates
+                .map((c) => (typeof c === 'string' ? c.trim() : ''))
+                .filter((c) => c.length > 0)
+                .map((c) => (c.startsWith('a=') ? c : 'a=' + c))
+                .join(nl);
+            if (candBlock) {
+                // Inject into the FIRST BUNDLE m-section only (after its a=ice-pwd);
+                // rtcp-mux + BUNDLE share one transport, exactly as normal Teams does.
+                let injectedCands = false;
+                munged = munged.replace(/(^a=ice-pwd:[^\r\n]+)(\r?\n)/m, (m0, pwd, newline) => {
+                    if (injectedCands) return m0;
+                    injectedCands = true;
+                    return pwd + newline + candBlock + nl;
+                });
+            }
         }
 
         return munged;
@@ -860,13 +1078,17 @@
 
         entry.closedEmitted = true;
 
+        // Clear all cached state for this session.
         entry.shadowCredentials = null;
         entry.lastOriginalLocalSdp = null;
         entry.lastCreateActionType = null;
         entry.lastDispatchedTrickleId = null;
         entry.lastRemoteOfferSdp = null;
-        entry.shadowLocalEmitted = false;
         entry._cachedPinnedSdp = null;
+
+        // Unblock any pending awaitShadowReady() calls for this PC.
+        rtcReadyByBridgeId.delete(entry.bridgeId);
+        rejectShadowReady(entry.bridgeId, `pc_closed:${reason}`);
 
         stopSilentAudioKeepalive();
 
@@ -901,16 +1123,17 @@
 
         const PatchedRTCPeerConnection = function BCRPatchedRTCPeerConnection(...args) {
             const pc = new origRTCPeerConnection(...args);
+            const entry = ensureRtcState(pc);
+            BCR_LOG('[BCR] RTCPeerConnection constructed bridgeId=', entry.bridgeId, 'iceServersCount=', args[0]?.iceServers?.length ?? 0);
             attachPeerLifecycleHooks(pc);
 
             if (_preWarmedCredentials) {
-                const entry = ensureRtcState(pc);
                 entry.shadowCredentials = _preWarmedCredentials;
                 entry.preWarmId = _preWarmedCredentials.preWarmId;
                 _preWarmedCredentials = null; // consumed, one-time use
-                BCR_LOG('[BCR] Pre-warmed credentials bound to bridgeId=', entry.bridgeId);
+                BCR_LOG('[BCR] Pre-warmed credentials bound to bridgeId=', entry.bridgeId, 'preWarmId=', entry.preWarmId);
             } else {
-                BCR_LOG('[BCR] WARNING: No pre-warmed credentials available at RTCPeerConnection construction');
+                BCR_LOG('[BCR] WARNING: No pre-warmed credentials available at RTCPeerConnection construction bridgeId=', entry.bridgeId);
             }
 
             // Capture the ICE server configuration from the VDI app so the shadow PC
@@ -951,6 +1174,7 @@
         if (data.type === 'BCR_RTC_SHADOW_PRE_WARM_READY') {
             _preWarmedCredentials = data.payload;
             BCR_LOG('[BCR] Pre-warmed credentials received, preWarmId=', data.payload?.preWarmId);
+            showToast('BCR Pipeline Ready');
             return;
         }
 
@@ -969,10 +1193,10 @@
                     return;
                 }
                 BCR_LOG('[BCR] Received SHADOW_READY bridgeId=', bridgeId);
-                // Eagerly store credentials and apply trickle ICE candidates.
-                // setLocalDescription is non-blocking — credentials are applied async.
-                existingEntry.shadowCredentials = payload;
-                _applyCredentialsAndTrickle(pc, existingEntry);
+                // Unblock the awaitShadowReady() Promise inside createOffer/createAnswer.
+                // Credentials will be stored on entry.shadowCredentials by patchedCreateAction
+                // after awaitShadowReady() returns — do NOT store them here to avoid races.
+                resolveShadowReady(bridgeId, payload);
             }
         }
 
@@ -981,8 +1205,8 @@
             const bridgeId = payload?.bridgeId;
             if (typeof bridgeId === 'string' && bridgeId.length > 0) {
                 BCR_LOG('[BCR] Received SHADOW_ERROR bridgeId=', bridgeId, 'stage=', payload?.stage, 'reason=', payload?.reason);
-                // No action needed — setLocalDescription is non-blocking,
-                // and the localDescription getter will return original SDP as fallback.
+                // Unblock the awaitShadowReady() Promise with a null (fail-open).
+                rejectShadowReady(bridgeId, payload?.reason ?? 'shadow_error');
             }
         }
 
@@ -1054,42 +1278,56 @@
             });
         }
 
-        // ── localDescription / currentLocalDescription getter patches ────────
-        // The VDI app reads pc.localDescription to obtain the SDP it sends over
-        // signaling. We intercept the getter to return a munged copy containing
-        // the shadow PC's credentials and candidates so the remote peer connects
-        // to the shadow transport instead of the browser's real ICE agent.
+        // ── Local Description Getters Interception ───────────────────────────
+        // Teams and other WebRTC libraries read pc.localDescription / currentLocalDescription
+        // to retrieve the SDP to send over signaling to the SFU. Since we pass
+        // Chrome the original unmunged SDP in setLocalDescription (to keep Chrome's
+        // ICE agent happy), we MUST intercept the getters to return the munged SDP.
         const origLocalDescGetter = Object.getOwnPropertyDescriptor(rtcProto, 'localDescription');
         const origCurrentLocalDescGetter = Object.getOwnPropertyDescriptor(rtcProto, 'currentLocalDescription');
+        const origPendingLocalDescGetter = Object.getOwnPropertyDescriptor(rtcProto, 'pendingLocalDescription');
 
-        function getMungedLocalDesc(origGetter, pc) {
-            const desc = origGetter.call(pc);
-            if (!desc || !desc.sdp) return desc;
+        function getMungedLocalDescription(origGetter, pc) {
+            if (!origGetter) return undefined;
+            const realDesc = origGetter.call(pc);
+            if (!realDesc || typeof realDesc.sdp !== 'string') return realDesc;
+
+            // Honor the bisect toggles: when munging is disabled, Teams' signaling
+            // read of localDescription must also see the un-munged SDP, otherwise
+            // the getter would silently re-munge what createOffer returned raw.
+            if (BCR_SDP_PASSTHROUGH || BCR_DISABLE_SHADOW_MUNGE) return realDesc;
+
             const entry = rtcStateByPeer.get(pc);
-            if (!entry || !entry.shadowCredentials) {
-                BCR_LOG('[BCR] ⚠️ localDescription getter: no shadow credentials — returning UNMUNGED SDP!');
-                return desc;
+            if (entry && entry.shadowCredentials && entry._cachedPinnedSdp) {
+                const munged = mungeSdpTransport(entry._cachedPinnedSdp, entry.shadowCredentials);
+                return buildDescriptionLike(realDesc, munged);
             }
-            // Use cached pinned SDP if available to avoid redundant filtering.
-            const pinnedSdp = entry._cachedPinnedSdp || filterSdpToPreferredCodecs(desc.sdp);
-            const mungedSdp = mungeSdpTransport(pinnedSdp, entry.shadowCredentials);
-            return { type: desc.type, sdp: mungedSdp };
+            return realDesc;
         }
 
         if (origLocalDescGetter && origLocalDescGetter.get) {
             Object.defineProperty(rtcProto, 'localDescription', {
-                get() { return getMungedLocalDesc(origLocalDescGetter.get, this); },
+                get() { return getMungedLocalDescription(origLocalDescGetter.get, this); },
                 configurable: true,
                 enumerable: true,
             });
         }
         if (origCurrentLocalDescGetter && origCurrentLocalDescGetter.get) {
             Object.defineProperty(rtcProto, 'currentLocalDescription', {
-                get() { return getMungedLocalDesc(origCurrentLocalDescGetter.get, this); },
+                get() { return getMungedLocalDescription(origCurrentLocalDescGetter.get, this); },
                 configurable: true,
                 enumerable: true,
             });
         }
+        if (origPendingLocalDescGetter && origPendingLocalDescGetter.get) {
+            Object.defineProperty(rtcProto, 'pendingLocalDescription', {
+                get() { return getMungedLocalDescription(origPendingLocalDescGetter.get, this); },
+                configurable: true,
+                enumerable: true,
+            });
+        }
+
+
 
         if (typeof origSetConfiguration === 'function') {
             BCR_LOG('[BCR] Hooking setConfiguration...');
@@ -1122,61 +1360,18 @@
             const entry = ensureRtcState(this);
             entry.lastSeen = performance.now();
 
-            const sdpType = (description.type ?? '').toLowerCase();
-            const origSdpString = entry.lastOriginalLocalSdp || description.sdp;
-
-            // Fire-and-forget: emit SHADOW_LOCAL if not already emitted for this sdpType.
-            // Unlike the old blocking design, we do NOT await SHADOW_READY here.
-            // The localDescription getter handles munging when credentials arrive.
-            if (!entry.shadowLocalEmitted || sdpType !== (entry.lastCreateActionType ?? '').toLowerCase()) {
-                entry.lastCreateActionType = sdpType;
-                entry.lastOriginalLocalSdp = description.sdp;
-                entry.shadowLocalEmitted = true;
-                const pinnedSdp = filterSdpToPreferredCodecs(description.sdp);
-                entry._cachedPinnedSdp = pinnedSdp;
-
-                captureIceServersFromConnection(this);
-
-                emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
-                    bridgeId: entry.bridgeId,
-                    sdpType: description.type ?? 'unknown',
-                    sdp: pinnedSdp,
-                    iceServers: entry.iceServers ?? [],
-                    preWarmId: entry.preWarmId ?? '',
-                    timestamp: Date.now(),
-                });
-
-                BCR_LOG('[BCR] Emitted SHADOW_LOCAL (non-blocking) type:', description.type ?? 'unknown', 'bridgeId=', entry.bridgeId);
-
-                // Start silent audio to prevent tab throttling during the call
-                startSilentAudioKeepalive();
-            }
-
-            // CRITICAL: Pass the ORIGINAL SDP to Chrome's native method.
+            // CRITICAL: Pass the ORIGINAL (un-munged) SDP to Chrome's native setLocalDescription.
             // Chrome's ICE agent validates that ice-ufrag/pwd match its internal state.
+            // Munging is handled upstream in createOffer/createAnswer — by the time
+            // Teams calls setLocalDescription, the description it passes has already
+            // been munged for the SFU. We must give Chrome the ORIGINAL credentials.
+            const origSdpString = entry.lastOriginalLocalSdp || description.sdp;
             const chromeSafeDescription = {
                 type: description.type,
-                sdp: origSdpString
+                sdp: origSdpString,
             };
 
-            const result = await origSetLocalDescription.apply(this, [chromeSafeDescription, ...args.slice(1)]);
-
-            // ── COMMENTED OUT: old setter-based munge ─────────────────────
-            // Kept for reference. Munge now happens at createOffer time.
-            // If createOffer munge is confirmed working, this block can be deleted.
-            //
-            // if (entry.shadowCredentials) {
-            //     const pinnedForMutation = entry._cachedPinnedSdp || filterSdpToPreferredCodecs(origSdpString);
-            //     const targetSdp = mungeSdpTransport(pinnedForMutation, entry.shadowCredentials);
-            //     try {
-            //         description.sdp = targetSdp;
-            //         BCR_LOG('[BCR] Description object mutated with shadow SDP bridgeId=', entry.bridgeId);
-            //     } catch (_) {}
-            //     // Trickle ICE candidates
-            //     _applyCredentialsAndTrickle(this, entry);
-            // }
-
-            return result;
+            return origSetLocalDescription.apply(this, [chromeSafeDescription, ...args.slice(1)]);
         };
 
         rtcProto.setRemoteDescription = function patchedSetRemoteDescription(...args) {
@@ -1189,6 +1384,14 @@
             ) {
                 const entry = ensureRtcState(this);
                 entry.lastSeen = performance.now();
+
+                // Diagnostic: this fires the moment Teams applies the SFU's remote SDP.
+                // For an offerer, a 'answer' here means the SFU answer DID arrive at the
+                // browser (so if bcr_client never logs RTC_SHADOW_REMOTE, the loss is
+                // between here and Go). If this never fires with type='answer', the SFU
+                // answer never reached the browser at all — the offer/answer exchange failed.
+                BCR_LOG('[BCR] setRemoteDescription received type=', description.type,
+                    'sdpLen=', description.sdp.length, 'bridgeId=', entry.bridgeId);
 
                 const descType = description.type.toLowerCase();
                 let effectiveRemoteSdp = description.sdp;
@@ -1272,47 +1475,127 @@
             entry.lastCreateActionType = actionType;
             entry.lastOriginalLocalSdp = origDescription.sdp;
 
+            // ── BISECT: full passthrough ──────────────────────────────────────────────
+            // Return Teams' original offer with zero BCR modification. Diagnostic only.
+            if (BCR_SDP_PASSTHROUGH) {
+                BCR_LOG('[BCR] BISECT: BCR_SDP_PASSTHROUGH on —', actionType,
+                        'returned UNMODIFIED (no codec pin, no munge, no trickle). Media will NOT offload.');
+                return origDescription;
+            }
+
             // ── SDP Codec Pinning ─────────────────────────────────────────────────────
-            const pinnedSdp = filterSdpToPreferredCodecs(origDescription.sdp);
+            const pinnedSdp = BCR_DISABLE_CODEC_PIN
+                ? origDescription.sdp
+                : filterSdpToPreferredCodecs(origDescription.sdp);
+            if (BCR_DISABLE_CODEC_PIN) {
+                BCR_LOG('[BCR] BISECT: BCR_DISABLE_CODEC_PIN on — sending full codec list for', actionType);
+            }
             entry._cachedPinnedSdp = pinnedSdp;
 
             captureIceServersFromConnection(this);
 
-            // SHADOW_LOCAL emission is deferred to setLocalDescription to avoid
-            // sending duplicate events when Teams calls createOffer then setLocalDescription.
-
-            BCR_LOG('[BCR] Captured SDP type:', origDescription.type ?? actionType, 'direction=local build from', actionType, 'bridgeId=', entry.bridgeId);
-
-            // ── Transport Munge at createOffer ────────────────────────────
-            // If pre-warmed credentials are available, munge the SDP NOW.
-            // Teams gets the fully munged SDP directly — no getter race.
-            let sdpToReturn = pinnedSdp;
-
-            if (entry.shadowCredentials) {
-                const mungedSdp = mungeSdpTransport(pinnedSdp, entry.shadowCredentials);
-                if (mungedSdp && mungedSdp !== pinnedSdp) {
-                    sdpToReturn = mungedSdp;
-                    BCR_LOG('[BCR] ✅ createOffer/createAnswer: SDP munged with shadow credentials',
-                            'bridgeId=', entry.bridgeId,
-                            'ufrag=', entry.shadowCredentials.iceUfrag?.substring(0, 8) + '...');
-                } else {
-                    BCR_LOG('[BCR] ⚠️ createOffer/createAnswer: mungeSdpTransport returned unchanged SDP!',
-                            'bridgeId=', entry.bridgeId,
-                            'hasCreds=', !!entry.shadowCredentials,
-                            'ufrag=', entry.shadowCredentials?.iceUfrag ?? 'null',
-                            'pwd=', entry.shadowCredentials?.icePwd ? 'present' : 'null',
-                            'fingerprint=', entry.shadowCredentials?.dtlsFingerprint ? 'present' : 'null',
-                            'candidates=', entry.shadowCredentials?.candidates?.length ?? 0);
-                }
-            } else {
-                BCR_LOG('[BCR] ⚠️ createOffer/createAnswer: NO shadow credentials available at createOffer time!',
-                        'bridgeId=', entry.bridgeId,
-                        'preWarmRequested=', _preWarmRequested,
-                        'Falling back to getter-based munge (race risk)');
+            // ── Emit SHADOW_LOCAL to Go ───────────────────────────────────────────────
+            // Emit here (not in setLocalDescription) so the await below can block
+            // before Teams gets the SDP — guaranteeing the munge always applies.
+            if (actionType === 'offer') {
+                // Invalidate any stale SHADOW_READY so we wait for fresh credentials.
+                rtcReadyByBridgeId.delete(entry.bridgeId);
             }
 
-            // Must return an object that circumvents strict instanceof RTCSessionDescription checks inside RxJS / React data pipelines
-            return buildDescriptionLike(origDescription, sdpToReturn);
+            emitShadowEvent('BCR_RTC_SHADOW_LOCAL', {
+                bridgeId: entry.bridgeId,
+                sdpType: origDescription.type ?? actionType,
+                sdp: pinnedSdp,
+                iceServers: entry.iceServers ?? [],
+                preWarmId: entry.preWarmId ?? '',
+                timestamp: Date.now(),
+            });
+
+            BCR_LOG('[BCR] Emitted SHADOW_LOCAL from', actionType, 'bridgeId=', entry.bridgeId,
+                    '— blocking for SHADOW_READY (pre-warm resolves ~0ms)');
+
+            // ── BLOCKING WAIT ─────────────────────────────────────────────────────────
+            // Awaits the Go SHADOW_READY signal.
+            // With pre-warm: Go has already prepared the ICE agent; SHADOW_READY
+            //   arrives nearly instantly (~0ms) via InitFromPreWarm().
+            // Without pre-warm: Go runs Init() + ICE gathering (~3-8s), bounded by
+            //   RTC_WAIT_TIMEOUT_MS to prevent Teams from hanging indefinitely.
+            const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
+
+            // Verify the PC hasn't been torn down during the await.
+            const currentEntry = ensureRtcState(this);
+            if (currentEntry.bridgeId !== entry.bridgeId) {
+                BCR_LOG('[BCR] BridgeId changed during', actionType, '; fail-open old=',
+                        entry.bridgeId, 'new=', currentEntry.bridgeId);
+                return buildDescriptionLike(origDescription, pinnedSdp);
+            }
+
+            if (!shadowReady) {
+                const errReason = consumeShadowErrorReason(entry.bridgeId);
+                BCR_LOG('[BCR] ⚠️', actionType, ': SHADOW_READY timeout/error, fail-open bridgeId=',
+                        entry.bridgeId, 'reason=', errReason ?? 'timeout');
+                // Fail-open: return the codec-pinned (but unmunged) SDP so Teams
+                // can attempt native calling rather than getting stuck.
+                return buildDescriptionLike(origDescription, pinnedSdp);
+            }
+
+            // Store credentials for downstream use (addIceCandidate swallow, state mocker, etc.)
+            entry.shadowCredentials = shadowReady;
+
+            // Start silent audio keepalive to prevent background-tab throttling.
+            startSilentAudioKeepalive();
+
+            // ── MUNGE ─────────────────────────────────────────────────────────────────
+            // Replace ice-ufrag, ice-pwd, fingerprint, connection address (0.0.0.0),
+            // and strip all a=candidate lines (trickled asynchronously below).
+            if (BCR_DISABLE_SHADOW_MUNGE) {
+                BCR_LOG('[BCR] BISECT: BCR_DISABLE_SHADOW_MUNGE on — returning codec-pinned but UN-munged',
+                        actionType, '(original ICE/DTLS creds). Media will NOT offload.');
+                return buildDescriptionLike(origDescription, pinnedSdp);
+            }
+            const mungedSdp = mungeSdpTransport(pinnedSdp, shadowReady);
+
+            if (mungedSdp && mungedSdp !== pinnedSdp) {
+                BCR_LOG('[BCR] ✅', actionType, ': SDP munged with shadow credentials bridgeId=',
+                        entry.bridgeId, 'ufrag=', shadowReady.iceUfrag?.substring(0, 8) + '...');
+                // Verifies THIS (browser) munge output, not Go's diagnostic twin.
+                // endOfCandidates MUST be false — declaring it on a candidate-less
+                // offer makes the SFU give up and never answer.
+                BCR_LOG('[BCR] MUNGE-CHECK endOfCandidates=', /^a=end-of-candidates/m.test(mungedSdp),
+                        'candidateLines=', (mungedSdp.match(/^a=candidate:/gm) || []).length,
+                        'trickleOption=', /a=ice-options:[^\r\n]*trickle/.test(mungedSdp),
+                        'sdpLen=', mungedSdp.length);
+            } else {
+                BCR_LOG('[BCR] ⚠️', actionType, ': mungeSdpTransport returned unchanged SDP! bridgeId=',
+                        entry.bridgeId,
+                        'ufrag=', shadowReady.iceUfrag ?? 'null',
+                        'fingerprint=', shadowReady.dtlsFingerprint ? 'present' : 'null',
+                        'candidates=', shadowReady.candidates?.length ?? 0);
+            }
+
+            // ── Trickle candidates asynchronously (with 1500ms delay) ──────────────────
+            // The initial SDP has zero candidates (DPI firewall bypass).
+            // Trickle Go's candidates 1.5 seconds after returning the munged SDP to Teams.
+            // This delay ensures the initial signaling POST (flightproxy cpconv)
+            // completes successfully without candidate leakage, avoiding DPI resets.
+            if (Array.isArray(shadowReady.candidates) && shadowReady.candidates.length > 0) {
+                const pc = this;
+                setTimeout(() => {
+                    // Check if the PeerConnection was closed during the timeout
+                    const currentEntry = rtcStateByPeer.get(pc);
+                    if (!currentEntry || currentEntry.closedEmitted) return;
+
+                    const genId = shadowReady.generatedAt || shadowReady.iceUfrag;
+                    if (currentEntry.lastDispatchedTrickleId !== genId) {
+                        currentEntry.lastDispatchedTrickleId = genId;
+                        dispatchShadowTrickleCandidates(pc, shadowReady.candidates);
+                    }
+                }, 1500);
+            }
+
+            // Must return an object that circumvents strict instanceof RTCSessionDescription
+            // checks inside RxJS / React data pipelines.
+            return buildDescriptionLike(origDescription, mungedSdp ?? pinnedSdp);
         }
 
         rtcProto.createOffer = function patchedCreateOffer(...args) {

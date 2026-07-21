@@ -62,9 +62,13 @@ func (a *App) startup(ctx context.Context) {
 			OnVideoLifecycle: func(evtType string, videoID string) {
 				log.Printf("[bcr_client][video] lifecycle evtType=%s videoId=%s", evtType, videoID)
 				runtime.EventsEmit(a.ctx, "onVideoLifecycle", evtType, videoID)
-				if evtType == "VIDEO_REMOVED" {
-					a.hideIfMSEMode()
-				}
+				// NOTE: window visibility is intentionally NOT hidden here.
+				// A VIDEO_REMOVED fires for hover-preview thumbnails and for the
+				// brief element swap YouTube does at ad boundaries — hiding on it
+				// made the overlay flicker/vanish while the frontend was still
+				// playing. Visibility is now owned exclusively by the frontend via
+				// NotifyMSEActive(false), which it calls only after its debounced
+				// teardown actually runs (see scheduleTeardown in main.js).
 			},
 			OnMediaChunk: func(header engine.MediaChunkHeader, chunkData []byte) {
 				// Encode chunk bytes as base64 for JSON-safe Wails event transport.
@@ -83,6 +87,8 @@ func (a *App) startup(ctx context.Context) {
 			OnLog: func(message string) {
 				log.Println(message)
 			},
+			// Verbose diagnostics (full SDP dumps) go to the log file only.
+			OnVerboseLog: verboseLog,
 		},
 	)
 

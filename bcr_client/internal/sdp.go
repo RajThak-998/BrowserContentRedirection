@@ -377,6 +377,7 @@ func ExtractTransportCCExtID(sdp string) uint8 {
 var fidGroupRe = regexp.MustCompile(`^a=ssrc-group:FID\s+(\d+)\s+(\d+)`)
 
 // ExtractFIDGroups returns a map from RTX SSRC → media SSRC, parsed from
+// ExtractFIDGroups returns a map from RTX SSRC → media SSRC, parsed from
 // "a=ssrc-group:FID <mediaSSRC> <rtxSSRC>" lines in the SDP.
 // This is used to reconstruct the original RTP SSRC during RTX decapsulation.
 func ExtractFIDGroups(sdp string) map[uint32]uint32 {
@@ -396,3 +397,82 @@ func ExtractFIDGroups(sdp string) map[uint32]uint32 {
 	}
 	return out
 }
+
+// ShortenSDP returns a compact, human-readable summary of the SDP's key parameters.
+func ShortenSDP(sdp string) string {
+	ufrag, pwd, fingerprint := ExtractShadowCredentials(sdp)
+
+	// Extract connection lines
+	var cLines []string
+	for _, line := range strings.Split(sdp, "\n") {
+		bare := strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if strings.HasPrefix(bare, "c=") {
+			cLines = append(cLines, bare)
+		}
+	}
+
+	mids := ExtractMediaSections(sdp)
+	var midStr []string
+	for _, m := range mids {
+		midStr = append(midStr, m.Type+":"+m.Port)
+	}
+
+	return "ufrag=" + ufrag + " pwd=" + pwd + " fingerprint=" + fingerprint + " c=[" + strings.Join(cLines, ", ") + "] mids=[" + strings.Join(midStr, ", ") + "]"
+}
+
+// MungeSDPTransport Go implementation of the SDP munger.
+// Replaces ufrag, pwd, fingerprint, connection address (to 0.0.0.0), and removes candidates.
+func MungeSDPTransport(sdp string, ufrag string, pwd string, fingerprint string) string {
+	sep := "\r\n"
+	if !strings.Contains(sdp, "\r\n") {
+		sep = "\n"
+	}
+	lines := strings.Split(sdp, sep)
+	var out []string
+
+	for _, line := range lines {
+		bare := strings.TrimRight(line, "\r")
+
+		// Skip candidates
+		if strings.HasPrefix(bare, "a=candidate:") || strings.HasPrefix(bare, "a=end-of-candidates") {
+			continue
+		}
+
+		// Replace ufrag
+		if strings.HasPrefix(bare, "a=ice-ufrag:") {
+			out = append(out, "a=ice-ufrag:"+ufrag)
+			continue
+		}
+
+		// Replace pwd.
+		// NOTE: no "a=end-of-candidates" is injected here — see the matching comment
+		// in the JS munger (pageInterceptor.js mungeSdpTransport). Declaring
+		// end-of-candidates on a candidate-less offer makes the SFU give up before
+		// trickle delivers anything.
+		if strings.HasPrefix(bare, "a=ice-pwd:") {
+			out = append(out, "a=ice-pwd:"+pwd)
+			continue
+		}
+
+		// Replace fingerprint
+		if strings.HasPrefix(bare, "a=fingerprint:") {
+			if strings.HasPrefix(fingerprint, "sha-256 ") {
+				out = append(out, "a=fingerprint:"+fingerprint)
+			} else {
+				out = append(out, "a=fingerprint:sha-256 "+fingerprint)
+			}
+			continue
+		}
+
+		// Replace connection address
+		if strings.HasPrefix(bare, "c=") {
+			out = append(out, "c=IN IP4 0.0.0.0")
+			continue
+		}
+
+		out = append(out, line)
+	}
+
+	return strings.Join(out, sep)
+}
+
