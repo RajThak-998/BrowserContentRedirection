@@ -714,6 +714,12 @@
     // no way to reach bcr_client → ICE never connected. Keep srflx flowing.
     const BCR_RELAY_ONLY_CANDIDATES = false;
 
+    // Host candidates are bcr_client's local LAN (unreachable from the SFU). They're
+    // inlined into the offer anyway and are harmless to trickle, so we do NOT drop
+    // them by default (the "private IP trips the DPI" theory was disproven). Flip to
+    // true only to experiment with excluding them.
+    const BCR_DROP_HOST_CANDIDATES = false;
+
     function isSrflxCandidate(line) {
         return /\btyp\s+srflx\b/.test(line);
     }
@@ -745,20 +751,20 @@
                     return false;
                 }
 
-                // Filter out 'typ host' candidates — they carry private LAN IPs.
-                // Trickling private IPs causes Teams to include them in its signaling
-                // POST to the SFU, triggering VDI DPI firewall TCP resets (ERR_CONNECTION_RESET).
-                // Only srflx (public STUN-mapped) and relay (TURN) candidates are safe to trickle.
-                if (isHostCandidate(trimmed)) {
-                    BCR_LOG('[BCR] Dropping host candidate (DPI firewall bypass):', trimmed);
+                // Host candidates are NOT dropped anymore. The old "private IPs trip
+                // the DPI" theory was disproven: a working non-BCR cpconv carried
+                // private host IPs (172.25.0.219) and connected fine. Host candidates
+                // are bcr_client's local LAN (useless to the SFU) but harmless, and
+                // mirroring normal Teams (which sends them) is the safe default.
+                if (BCR_DROP_HOST_CANDIDATES && isHostCandidate(trimmed)) {
+                    BCR_LOG('[BCR] Dropping host candidate (toggle):', trimmed);
                     return false;
                 }
 
-                // Drop srflx candidates — they advertise bcr_client's public IP, which
-                // is foreign to the VDI's network and trips the DPI reset on the cpconv
-                // call-setup POST. Only Microsoft-owned TURN relay addresses survive.
+                // srflx is the KEY routable candidate (bcr_client's public IP → pairs
+                // with the SFU's relay). Only dropped if relay-only mode is forced on.
                 if (BCR_RELAY_ONLY_CANDIDATES && isSrflxCandidate(trimmed)) {
-                    BCR_LOG('[BCR] Dropping srflx candidate (relay-only mode, DPI bypass):', trimmed);
+                    BCR_LOG('[BCR] Dropping srflx candidate (relay-only mode):', trimmed);
                     return false;
                 }
 

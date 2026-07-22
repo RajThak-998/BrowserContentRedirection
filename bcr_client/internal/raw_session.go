@@ -58,6 +58,14 @@ const (
 // DisableTransportStateReuse is a diagnostic flag to disable DTLS certificate and ICE credential reuse across connections/reconnects.
 var DisableTransportStateReuse = false
 
+// DisablePreWarm forces the reliable, gather-waiting Init() path instead of the
+// pre-warmed agent. The working 53f5bd94 build had NO pre-warm at all and DTLS
+// connected reliably; the pre-warm (new in f845ebb) — especially its
+// recreate-agent path when Teams supplies TURN — has proven flaky in the VDI
+// (ICE never completing, or DTLS aborting). Hardcoded ON in this test env to
+// force the simpler path that matches the known-good behavior.
+var DisablePreWarm = true
+
 var (
 	globalCert            tls.Certificate
 	globalCertFingerprint string
@@ -476,6 +484,7 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	var (
 		candidateMu sync.Mutex
 		candidates  []string
+		seenSrflx   = make(map[string]bool) // dedupe srflx by mapped public IP
 	)
 
 	agentConfig := &ice.AgentConfig{
@@ -494,12 +503,14 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	// candidate-pair connectivity-check logs to the same sink as the std logger
 	// (stdout + bcr_client.log), so we can see EXACTLY which pairs were tried and
 	// why each check failed — instead of only the final "connecting canceled".
-	if os.Getenv("BCR_ICE_DEBUG") != "" {
+	// Verbose pion/ice tracing hardcoded ON for this test env (no env var needed),
+	// so every candidate-pair connectivity check is captured in bcr_client.log.
+	{
 		lf := logging.NewDefaultLoggerFactory()
 		lf.Writer = log.Default().Writer()
 		lf.DefaultLogLevel = logging.LogLevelDebug
 		agentConfig.LoggerFactory = lf
-		s.logf("[raw][%s] BCR_ICE_DEBUG on — verbose pion/ice tracing enabled", s.bridgeID)
+		s.logf("[raw][%s] verbose pion/ice tracing enabled", s.bridgeID)
 	}
 
 	agent, err := ice.NewAgent(agentConfig)
@@ -523,6 +534,27 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 			}
 			return
 		}
+		// Dedupe srflx candidates by mapped public IP. Pointing at multiple public
+		// STUN servers (Google/Cloudflare/Twilio) yields several srflx entries with
+		// the SAME public IP but different ports — redundant. Keeping one per IP
+		// keeps the offer small and Teams-like (a real Teams offer has one srflx),
+		// avoids wasted ICE checks, and reduces the odd-looking candidate list that
+		// could feed the flaky VDI DPI reset. Host and relay candidates are kept as-is.
+		if c.Type() == ice.CandidateTypeServerReflexive {
+			addr := c.Address()
+			candidateMu.Lock()
+			dup := seenSrflx[addr]
+			if !dup {
+				seenSrflx[addr] = true
+			}
+			candidateMu.Unlock()
+			if dup {
+				s.logf("[raw][%s] skipping duplicate srflx (same public IP %s): %s",
+					s.bridgeID, addr, "a=candidate:"+c.Marshal())
+				return
+			}
+		}
+
 		line := "a=candidate:" + c.Marshal()
 		candidateMu.Lock()
 		idx := len(candidates)
@@ -557,7 +589,23 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	}
 	s.logf("[raw][%s] local ufrag=%s sdpType=%s", s.bridgeID, ufrag, sdpType)
 
-	// ── Step 8: Return immediately without waiting for ICE gathering (Option 5) ──
+	// ── Step 8: Wait (bounded) for ICE gathering to include the srflx ─────────
+	// bcr_client's host candidates are its local LAN and are UNREACHABLE from the
+	// SFU. Its only routable candidate is the srflx (its public IP), which the SFU
+	// pairs with its own relay (proven working: local=<srflx> remote=<SFU relay>).
+	// The srflx takes ~1s to gather via STUN, so we must NOT return host-only —
+	// wait for gathering to finish (bounded) so the srflx is present in
+	// SHADOW_READY.Candidates and gets inlined into the offer the SFU receives.
+	// Anything still arriving after this is trickled via onLateCandidate.
+	gatherCtx, gatherCancel := context.WithTimeout(ctx, 4*time.Second)
+	select {
+	case <-gatherDone:
+		s.logf("[raw][%s] ICE gathering complete", s.bridgeID)
+	case <-gatherCtx.Done():
+		s.logf("[raw][%s] ICE gather wait timed out — continuing with %d candidate(s)", s.bridgeID, len(candidates))
+	}
+	gatherCancel()
+
 	candidateMu.Lock()
 	candsCopy := append([]string(nil), candidates...)
 	candidateMu.Unlock()
@@ -718,8 +766,11 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	)
 
 	// ── DIAG: pion/dtls internal logger to trace handshake flights ──
+	// Trace (not Debug) is required to see the per-flight handshake messages and
+	// the exact reason a certificate is rejected (parse error, sig alg, etc.) —
+	// which is what we need to explain the bad_certificate alert.
 	pionLogFactory := logging.NewDefaultLoggerFactory()
-	pionLogFactory.DefaultLogLevel = logging.LogLevelDebug
+	pionLogFactory.DefaultLogLevel = logging.LogLevelTrace
 	pionLogFactory.Writer = log.Writer()
 
 	dtlsCfg := &dtls.Config{
@@ -2053,15 +2104,19 @@ func (s *rawShadowSession) mediaSummaryLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Logging disabled. Uncomment to restore 5-second health summary:
-			// s.mu.Lock()
-			// ptMap := make(map[uint8]CodecInfo, len(s.ptCodecMap))
-			// for k, v := range s.ptCodecMap { ptMap[k] = v }
-			// s.mu.Unlock()
-			// s.rtcpMu.Lock()
-			// rr, remb, pli, nack := s.rtcpRRCount, s.rtcpREMBCount, s.rtcpPLICount, s.rtcpNACKCount
-			// s.rtcpMu.Unlock()
-			// EmitMediaSummary(s.bridgeID, s.ssrcReg, ptMap, s.rtxMapping, rr, remb, pli, nack, interval.Seconds(), s.logf)
+			// Re-enabled: 5-second ingress (SFU→bcr_client) health summary so we can
+			// measure per-role packets/bitrate/keyframes/LOST/nack/recovered — this is
+			// how we quantify the video packet loss on the media leg.
+			s.mu.Lock()
+			ptMap := make(map[uint8]CodecInfo, len(s.ptCodecMap))
+			for k, v := range s.ptCodecMap {
+				ptMap[k] = v
+			}
+			s.mu.Unlock()
+			s.rtcpMu.Lock()
+			rr, remb, pli, nack := s.rtcpRRCount, s.rtcpREMBCount, s.rtcpPLICount, s.rtcpNACKCount
+			s.rtcpMu.Unlock()
+			EmitMediaSummary(s.bridgeID, s.ssrcReg, ptMap, s.rtxMapping, rr, remb, pli, nack, interval.Seconds(), s.logf)
 		}
 	}
 }

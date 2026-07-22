@@ -635,7 +635,7 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 	}
 	e.preWarmMu.Unlock()
 
-	usePreWarm := pw != nil && payload.PreWarmID != "" && pw.id == payload.PreWarmID
+	usePreWarm := !DisablePreWarm && pw != nil && payload.PreWarmID != "" && pw.id == payload.PreWarmID
 
 	e.logf("[raw][%s] usePreWarm evaluation: payloadPreWarmID=%q activePreWarmID=%q matchedByID=%v usePreWarm=%v",
 		payload.BridgeID, payload.PreWarmID, activeID, matchedByID, usePreWarm)

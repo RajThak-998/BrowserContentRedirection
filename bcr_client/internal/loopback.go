@@ -27,9 +27,10 @@ const (
 	// 512 packets at 30fps ≈ 17 seconds of video, more than enough for jitter.
 	rtpCacheSize = 512
 
-	// nackLogInterval controls how often NACK activity is logged.
-	// Log a summary every N NACKs instead of spamming per-packet.
-	nackLogInterval = 50
+	// nackLogMinInterval is the minimum wall-clock gap between NACK-summary log
+	// lines. Time-based (not per-N-NACKs) so heavy loss can't turn logging into a
+	// self-inflicted CPU/IO storm that starves the SRTP read loop.
+	nackLogMinInterval = 2 * time.Second
 
 	// nackCooldownMs is the minimum interval (in ms) between forwarding
 	// NACKs to the remote VDI for the same SSRC. Prevents flooding.
@@ -113,6 +114,8 @@ type loopbackSession struct {
 	nackLocalMiss  uint64 // NACKs that had to be forwarded to VDI
 	nackTotal      uint64 // total NACK requests received
 	nackLastLog    uint64 // nackTotal value at last log
+
+	nackLastLogTime time.Time // wall-clock of last NACK-summary log (time throttle)
 
 	// Per-SSRC cooldown for forwarding NACKs to VDI.
 	nackLastForward map[uint32]time.Time
@@ -655,11 +658,19 @@ func (ls *loopbackSession) handleNACK(p *rtcp.TransportLayerNack, sender *webrtc
 	missTotal := ls.nackLocalMiss
 	ls.mu.Unlock()
 
-	// Sampled logging: log every nackLogInterval NACKs.
-	if currentTotal-lastLog >= nackLogInterval {
-		ls.mu.Lock()
+	// Time-throttled logging: at most once every nackLogMinInterval, regardless of
+	// NACK volume. Under heavy loss the old every-50-NACKs rule produced ~1000s of
+	// lines/sec, whose synchronous file+stdout writes could starve the SRTP read
+	// loop and cause MORE loss. Keep the counters accurate; just log sparsely.
+	_ = lastLog
+	ls.mu.Lock()
+	shouldLog := time.Since(ls.nackLastLogTime) >= nackLogMinInterval
+	if shouldLog {
+		ls.nackLastLogTime = time.Now()
 		ls.nackLastLog = currentTotal
-		ls.mu.Unlock()
+	}
+	ls.mu.Unlock()
+	if shouldLog {
 		ls.logf("[bcr_client][loopback][%s] NACK summary: total=%d localHit=%d localMiss=%d hitRate=%.1f%% (SSRC %d→%d)",
 			ls.bridgeID, currentTotal, hitTotal, missTotal,
 			float64(hitTotal)/float64(max(currentTotal, 1))*100.0,
