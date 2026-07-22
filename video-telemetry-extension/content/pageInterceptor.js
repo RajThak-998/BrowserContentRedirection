@@ -193,6 +193,125 @@
     const srcObjectDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
     const srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
 
+    // Descriptors for currentTime / paused / duration / playbackRate — captured
+    // before any patch so the virtual playback clock (below) can read the native
+    // values and override the getters without recursing into itself.
+    const currentTimeDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+    const pausedDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'paused');
+    const durationDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'duration');
+    const playbackRateDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
+
+    // ─── Virtual Playback Clock ──────────────────────────────────────────────
+    // PROBLEM: suppressVideo() pauses the primary <video> so it never decodes on
+    // the VDI. But YouTube's streaming engine only fetches media while it believes
+    // playback is progressing: it buffers ~120s ahead of the element's currentTime,
+    // and once the element is paused with currentTime frozen at 0 it stops requesting
+    // new segments. The external bcr_client player keeps playing, drains that initial
+    // ~120s, and then hard-stalls (~2 min in) with nothing left to play.
+    //
+    // FIX: simulate playback on the suppressed element WITHOUT decoding. We report it
+    // as playing (paused=false + play/playing events), advance a synthetic currentTime
+    // at real-time rate, and fire periodic 'timeupdate' events. YouTube then keeps
+    // topping up its forward buffer (~120s ahead of the advancing clock), fetching
+    // segments progressively and in order — exactly as during real playback. The real
+    // element stays paused and muted underneath, so no GPU decode ever happens.
+    const PUMP_INTERVAL_MS = 250;
+    const virtualClock = {
+        video: null,
+        active: false,
+        baseTime: 0,          // media-time (s) anchored at anchorWall
+        anchorWall: 0,        // performance.now() when baseTime was set
+        rate: 1,
+        timer: null,
+    };
+
+    function nativeCurrentTime(el) {
+        try { return currentTimeDesc && currentTimeDesc.get ? currentTimeDesc.get.call(el) : 0; }
+        catch (_) { return 0; }
+    }
+    function nativeDuration(el) {
+        try { return durationDesc && durationDesc.get ? durationDesc.get.call(el) : NaN; }
+        catch (_) { return NaN; }
+    }
+    function nativePlaybackRate(el) {
+        try {
+            const r = playbackRateDesc && playbackRateDesc.get ? playbackRateDesc.get.call(el) : 1;
+            return (typeof r === 'number' && r > 0) ? r : 1;
+        } catch (_) { return 1; }
+    }
+
+    // Current virtual media-time for the active clock (null if inactive).
+    function getVirtualTime() {
+        if (!virtualClock.active || !virtualClock.video) return null;
+        const elapsed = (performance.now() - virtualClock.anchorWall) / 1000;
+        let t = virtualClock.baseTime + elapsed * virtualClock.rate;
+        if (t < 0) t = 0;
+        const dur = nativeDuration(virtualClock.video);
+        if (Number.isFinite(dur) && dur > 0 && t > dur) t = dur;
+        return t;
+    }
+
+    // Re-anchor the clock to a specific media-time (used on seeks / rate changes).
+    function anchorVirtualTime(t) {
+        virtualClock.baseTime = (typeof t === 'number' && t >= 0) ? t : 0;
+        virtualClock.anchorWall = performance.now();
+    }
+
+    function stopVirtualClock() {
+        if (virtualClock.timer) {
+            clearInterval(virtualClock.timer);
+            virtualClock.timer = null;
+        }
+        virtualClock.active = false;
+        virtualClock.video = null;
+    }
+
+    function pumpTick() {
+        const v = virtualClock.video;
+        if (!virtualClock.active || !v) return;
+
+        // Primary video left the DOM — nothing to drive anymore.
+        if (v.isConnected === false) {
+            BCR_LOG('[BCR] Virtual clock: primary video detached — stopping');
+            stopVirtualClock();
+            return;
+        }
+
+        // Track live playback-rate changes so fast-forward / slow-mo stay honest.
+        const r = nativePlaybackRate(v);
+        if (r !== virtualClock.rate) {
+            anchorVirtualTime(getVirtualTime() ?? virtualClock.baseTime);
+            virtualClock.rate = r;
+        }
+
+        const vt = getVirtualTime();
+        const dur = nativeDuration(v);
+        if (Number.isFinite(dur) && dur > 0 && vt !== null && vt >= dur) {
+            // Reached the end of a finite video — idle rather than pumping past duration.
+            return;
+        }
+
+        // Drive YouTube's streaming loop: a 'timeupdate' with an advanced currentTime
+        // makes it recompute buffer-ahead and fetch the next segments in order.
+        try { v.dispatchEvent(new Event('timeupdate')); } catch (_) {}
+    }
+
+    function startVirtualClock(video) {
+        if (!video) return;
+        stopVirtualClock();
+        virtualClock.video = video;
+        virtualClock.active = true;
+        virtualClock.rate = nativePlaybackRate(video);
+        anchorVirtualTime(nativeCurrentTime(video)); // honor a start-at offset (e.g. ?t=30)
+        virtualClock.timer = setInterval(pumpTick, PUMP_INTERVAL_MS);
+
+        // suppressVideo() just fired a real 'pause'; tell YouTube we're playing again
+        // so its streaming engine leaves the paused state and resumes fetching.
+        try { video.dispatchEvent(new Event('play')); } catch (_) {}
+        try { video.dispatchEvent(new Event('playing')); } catch (_) {}
+        BCR_LOG('[BCR] Virtual playback clock started — YouTube will keep fetching beyond the initial buffer');
+    }
+
     // ─── Blob URL → MediaSource Registry ─────────────────────────────────────
     // YouTube uses: ms = new MediaSource() → video.src = URL.createObjectURL(ms)
     // We need this map to suppress the MS when video.src is set to a blob URL.
@@ -295,6 +414,12 @@
         // reattach it and flood the pipeline with fresh init segments — which was
         // crashing the thin-client MSE session repeatedly.
         BCR_LOG('[BCR] suppressVideo: video suppressed, GPU decode gated');
+
+        // Keep YouTube's streaming engine requesting new segments by simulating
+        // playback progress on this (paused, non-decoding) element. Without this it
+        // buffers only ~120s ahead of a frozen currentTime and then stops fetching,
+        // starving the external bcr_client player ~2 minutes in.
+        startVirtualClock(video);
     }
 
     function isMainVideoCandidate(video) {
@@ -1714,6 +1839,47 @@
         if (!_bypass && state.suppressedVideos.has(this)) return;
         return origLoad.call(this);
     };
+
+    // ─── Virtual-clock property overrides ────────────────────────────────────
+    // While the virtual clock drives the primary suppressed video, currentTime must
+    // read as the advancing synthetic time and paused must read false — so YouTube's
+    // streaming engine treats the element as actively playing and keeps fetching.
+    // Gated on `virtualClock.video === this`, so every other media element (previews,
+    // the WebRTC path, etc.) keeps 100% native behavior.
+    if (currentTimeDesc && currentTimeDesc.get && currentTimeDesc.set) {
+        Object.defineProperty(HTMLMediaElement.prototype, 'currentTime', {
+            get() {
+                if (!_bypass && virtualClock.active && virtualClock.video === this) {
+                    const vt = getVirtualTime();
+                    if (vt !== null) return vt;
+                }
+                return currentTimeDesc.get.call(this);
+            },
+            set(value) {
+                // A seek (user scrub or YouTube start-offset) re-anchors the clock…
+                if (!_bypass && virtualClock.active && virtualClock.video === this) {
+                    anchorVirtualTime(value);
+                }
+                // …and still applies natively so YouTube's own seek bookkeeping runs.
+                return currentTimeDesc.set.call(this, value);
+            },
+            configurable: true,
+            enumerable: true,
+        });
+    }
+
+    if (pausedDesc && pausedDesc.get) {
+        Object.defineProperty(HTMLMediaElement.prototype, 'paused', {
+            get() {
+                if (!_bypass && virtualClock.active && virtualClock.video === this) {
+                    return false;
+                }
+                return pausedDesc.get.call(this);
+            },
+            configurable: true,
+            enumerable: true,
+        });
+    }
 
     // srcObject setter → when a suppressed video gets a new MediaSource,
     // mark it suppressed immediately.  We allow the assignment through so
