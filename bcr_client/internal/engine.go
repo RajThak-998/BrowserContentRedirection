@@ -167,6 +167,15 @@ func (e *Engine) handleTCPConnection(netConn net.Conn) {
 }
 
 func (e *Engine) readControlLoop(conn SignalingConn) {
+	mediaCh := make(chan []byte, 4096)
+	defer close(mediaCh)
+
+	go func() {
+		for message := range mediaCh {
+			e.handleMediaChunk(message)
+		}
+	}()
+
 	for {
 		mt, message, err := conn.ReadMessage()
 		if err != nil {
@@ -175,14 +184,22 @@ func (e *Engine) readControlLoop(conn SignalingConn) {
 
 		// Binary messages are media chunk frames: [u32 headerLen LE][headerJSON][rawChunk]
 		if mt != 1 {
-			e.handleMediaChunk(message)
+			select {
+			case mediaCh <- message:
+			default:
+				go e.handleMediaChunk(message)
+			}
 			continue
 		}
 
 		// Text messages: check if it's a binary frame embedded as text (starts with non-'{').
 		// The bridge sends binary frames with msgType=BinaryMessage, but we guard both paths.
 		if len(message) >= 4 && message[0] != '{' {
-			e.handleMediaChunk(message)
+			select {
+			case mediaCh <- message:
+			default:
+				go e.handleMediaChunk(message)
+			}
 			continue
 		}
 

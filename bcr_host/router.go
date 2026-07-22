@@ -71,13 +71,16 @@ func handleExtensionIngressLoop(conn *Connection, registry *Registry) {
 	const (
 		highPriorityQueueSize = 256
 		lowPriorityQueueSize  = 1024
+		mediaQueueSize        = 8192 // Large buffer for MSE media segments
+		mediaIngressTimeout   = 50 * time.Millisecond // 50ms safety cap so backpressure never freezes WebSocket reader
 	)
 
 	highPriorityCh := make(chan extensionIngressMessage, highPriorityQueueSize)
 	lowPriorityCh := make(chan extensionIngressMessage, lowPriorityQueueSize)
+	mediaCh := make(chan extensionIngressMessage, mediaQueueSize)
 
 	var workers sync.WaitGroup
-	workers.Add(2)
+	workers.Add(3)
 
 	go func() {
 		defer workers.Done()
@@ -89,6 +92,15 @@ func handleExtensionIngressLoop(conn *Connection, registry *Registry) {
 	go func() {
 		defer workers.Done()
 		for msg := range lowPriorityCh {
+			handleExtensionMessage(msg.msgType, msg.data, registry)
+		}
+	}()
+
+	// Dedicated media worker — drains MSE segments on its own goroutine so
+	// media processing never competes with telemetry for CPU time.
+	go func() {
+		defer workers.Done()
+		for msg := range mediaCh {
 			handleExtensionMessage(msg.msgType, msg.data, registry)
 		}
 	}()
@@ -131,10 +143,12 @@ func handleExtensionIngressLoop(conn *Connection, registry *Registry) {
 			}
 
 		case websocket.BinaryMessage:
+			// Media segments are loss-intolerant (MSE). Use a blocking send
+			// with timeout so segments are never silently dropped under burst.
 			select {
-			case lowPriorityCh <- msg:
-			default:
-				log.Printf("[router] MEDIA_CHUNK dropped reason=low_priority_queue_full bytes=%d", len(data))
+			case mediaCh <- msg:
+			case <-time.After(mediaIngressTimeout):
+				log.Printf("[router] MEDIA_CHUNK dropped reason=media_ingress_timeout bytes=%d (queue blocked for %s)", len(data), mediaIngressTimeout)
 			}
 
 		default:
@@ -144,6 +158,7 @@ func handleExtensionIngressLoop(conn *Connection, registry *Registry) {
 
 	close(highPriorityCh)
 	close(lowPriorityCh)
+	close(mediaCh)
 	workers.Wait()
 }
 
@@ -320,6 +335,8 @@ func handleMediaBinaryFrame(data []byte, registry *Registry) {
 const (
 	bridgeReconnectDelay = 2 * time.Second
 	bridgeControlQueue   = 512
+	bridgeMediaQueue      = 8192 // Dedicated media egress queue — sized for MSE burst tolerance
+	mediaEgressTimeout    = 50 * time.Millisecond
 )
 
 type bridgeMessage struct {
@@ -379,8 +396,6 @@ func (d *DVCSignalingConn) WriteMessage(msgType int, data []byte) error {
 	payload := make([]byte, 4+length)
 	binary.BigEndian.PutUint32(payload[0:4], length)
 	copy(payload[4:], data)
-	log.Printf("[DVC DIAG] WriteMessage: %d bytes total, prefix=[%02X %02X %02X %02X]",
-		len(payload), payload[0], payload[1], payload[2], payload[3])
 	return d.DVCConn.WriteMessage(payload)
 }
 
@@ -444,15 +459,17 @@ func (d *DVCSignalingConn) ReadMessage() (int, []byte, error) {
 }
 
 type bridgeForwarder struct {
-	startOnce sync.Once
-	sendCh    chan bridgeMessage
+	startOnce   sync.Once
+	sendCh      chan bridgeMessage // signaling / telemetry (text)
+	mediaSendCh chan bridgeMessage // dedicated media egress (binary) — never shares with signaling
 }
 
 var mediaBridge = newBridgeForwarder()
 
 func newBridgeForwarder() *bridgeForwarder {
 	return &bridgeForwarder{
-		sendCh: make(chan bridgeMessage, bridgeControlQueue),
+		sendCh:      make(chan bridgeMessage, bridgeControlQueue),
+		mediaSendCh: make(chan bridgeMessage, bridgeMediaQueue),
 	}
 }
 
@@ -546,41 +563,64 @@ func (b *bridgeForwarder) runBridgeLoop() {
 			}
 		}()
 
-		// Write loop
+		// Write loop — drains both media and signaling channels.
+		// Media gets priority via the nested select: if both channels
+		// have data, media is drained first to prevent MSE stalls.
 		wg.Add(1)
 		go func() {
 			defer func() {
 				triggerStop("write loop exited")
 				wg.Done()
 			}()
-			for {
+
+			writeMsg := func(msg bridgeMessage) bool {
 				select {
-				case msg := <-b.sendCh:
+				case <-stopCh:
+					return false
+				default:
+				}
+
+				if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
 					select {
 					case <-stopCh:
-						return
 					default:
-					}
-
-					if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
-						select {
-						case <-stopCh:
-							return
-						default:
-						}
 						log.Printf("[Bridge] connection write error: %v", err)
+					}
+					return false
+				}
+
+				if msg.packetType == PacketTypeRTCShadowRemote ||
+					msg.packetType == PacketTypeRTCShadowLocal ||
+					msg.packetType == PacketTypeRTCShadowClose ||
+					msg.packetType == PacketTypeRTCShadowCandidate ||
+					msg.packetType == PacketTypeRTCShadowIceServers ||
+					msg.packetType == PacketTypeRTCShadowPreWarm {
+					log.Printf("[Bridge] SHADOW_UP -> client type=%s bridgeId=%s", msg.packetType, msg.bridgeID)
+				}
+				return true
+			}
+
+			for {
+				// Priority: drain all pending media before checking signaling.
+				select {
+				case msg := <-b.mediaSendCh:
+					if !writeMsg(msg) {
 						return
 					}
+					continue
+				default:
+				}
 
-					if msg.packetType == PacketTypeRTCShadowRemote ||
-						msg.packetType == PacketTypeRTCShadowLocal ||
-						msg.packetType == PacketTypeRTCShadowClose ||
-						msg.packetType == PacketTypeRTCShadowCandidate ||
-						msg.packetType == PacketTypeRTCShadowIceServers ||
-						msg.packetType == PacketTypeRTCShadowPreWarm {
-						log.Printf("[Bridge] SHADOW_UP -> client type=%s bridgeId=%s", msg.packetType, msg.bridgeID)
+				// No pending media — wait for either channel or stop.
+				select {
+				case msg := <-b.mediaSendCh:
+					if !writeMsg(msg) {
+						return
 					}
-
+				case msg := <-b.sendCh:
+					if !writeMsg(msg) {
+						return
+					}
 				case <-stopCh:
 					return
 				}
@@ -599,28 +639,22 @@ func (b *bridgeForwarder) runBridgeLoop() {
 func (b *bridgeForwarder) tryForwardBinary(track, mime string, seq int64, isInit bool, data []byte) {
 	b.start()
 
-	if len(b.sendCh) > (bridgeControlQueue*3)/4 {
-		if isInit {
-			log.Printf("[Bridge] MEDIA_CHUNK_BIN dropped reason=bridge_busy track=%s seq=%d", track, seq)
-		}
-		return
-	}
-
 	// data is the full framed binary packet: [u32 headerLen LE][headerJSON][rawChunk].
 	// Copy it so the caller's buffer can be reused safely.
 	payload := append([]byte(nil), data...)
 
+	// Media segments are loss-intolerant (MSE). Use dedicated mediaSendCh with
+	// a blocking send (bounded by timeout) instead of the old non-blocking
+	// drop-on-full pattern that silently discarded segments.
 	select {
-	case b.sendCh <- bridgeMessage{
+	case b.mediaSendCh <- bridgeMessage{
 		msgType:    websocket.BinaryMessage,
 		data:       payload,
 		packetType: "MEDIA_CHUNK",
 		bridgeID:   "",
 	}:
-	default:
-		if isInit {
-			log.Printf("[Bridge] MEDIA_CHUNK_BIN dropped reason=bridge_queue_full track=%s seq=%d", track, seq)
-		}
+	case <-time.After(mediaEgressTimeout):
+		log.Printf("[Bridge] MEDIA_CHUNK_BIN dropped reason=media_egress_queue_full track=%s seq=%d", track, seq)
 	}
 }
 

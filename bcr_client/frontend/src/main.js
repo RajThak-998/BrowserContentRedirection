@@ -284,6 +284,18 @@ window.onload = function () {
         mseInitCount = 0;
         activeVideoID = null;
 
+        // Stop stall watchdog so it doesn't fire against a destroyed pipeline.
+        if (stallWatchdogTimer) {
+            clearInterval(stallWatchdogTimer);
+            stallWatchdogTimer = null;
+        }
+        if (onWaitingHandler && videoElement) {
+            videoElement.removeEventListener('waiting', onWaitingHandler);
+            onWaitingHandler = null;
+        }
+        lastPlayheadTime = -1;
+        lastPlayheadCheck = 0;
+
         // Revoke old object URL and clear srcObject so the video element resets
         if (videoElement.src && videoElement.src.startsWith('blob:')) {
             URL.revokeObjectURL(videoElement.src);
@@ -401,6 +413,9 @@ window.onload = function () {
                 }
             }, { once: true });
 
+            // Stall watchdog: detect when playhead is stuck at a gap and jump past it.
+            setupStallRecovery(videoElement, 'video');
+
             // Recover from native video decode errors (bad segments, GPU reset, etc.)
             videoElement.addEventListener('error', () => {
                 if (videoElement.error && playbackMode === 'mse') {
@@ -457,11 +472,17 @@ window.onload = function () {
         const chunk = queue.shift();
         try {
             sb.appendBuffer(chunk);
+            // If the element is playing and paused at a gap, appending this chunk may have created/extended
+            // a future range. Check if we can jump the gap immediately.
+            if (targetEl && !targetEl.paused && !targetEl.seeking) {
+                tryJumpGap(targetEl, trackType);
+            }
         } catch (e) {
             logErrorTerm(`[MSE][${trackType}] appendBuffer error: ${e}`);
-            // On quota exceeded, clear old buffered range
+            // On quota exceeded, trim buffered data behind the playhead.
+            // Keep a 30-second window behind currentTime so seek-back still works.
             if (e.name === 'QuotaExceededError' && sb.buffered.length > 0) {
-                const removeEnd = sb.buffered.end(0) - 30; // keep last 30s
+                const removeEnd = targetEl.currentTime - 30;
                 if (removeEnd > sb.buffered.start(0)) {
                     try { sb.remove(sb.buffered.start(0), removeEnd); } catch (_) {}
                 }
@@ -469,6 +490,91 @@ window.onload = function () {
                 queue.unshift(chunk);
             }
         }
+    }
+
+    // ── Stall Watchdog + Gap Jump ─────────────────────────────────────────────
+    // Detects when the playhead is stuck at a gap in the SourceBuffer (caused by
+    // a dropped segment) and jumps to the next buffered range. Without this, MSE
+    // hard-stalls indefinitely because Chrome only auto-jumps sub-second gaps.
+
+    let stallWatchdogTimer = null;
+    let onWaitingHandler = null;
+    let lastPlayheadTime = -1;
+    let lastPlayheadCheck = 0;
+
+    /**
+     * Scan the video SourceBuffer for a gap at the current playhead position
+     * and jump past it. Returns true if a gap was found and jumped.
+     */
+    function tryJumpGap(el, trackType) {
+        const sb = sourceBuffers[trackType];
+        if (!sb || !sb.buffered || sb.buffered.length < 2) return false;
+
+        const current = el.currentTime;
+        for (let i = 0; i < sb.buffered.length - 1; i++) {
+            const rangeEnd = sb.buffered.end(i);
+            const nextRangeStart = sb.buffered.start(i + 1);
+            // Playhead is in the gap between range i and range i+1 (or near rangeEnd)
+            if (current >= rangeEnd - 0.5 && current < nextRangeStart) {
+                const gapSize = nextRangeStart - rangeEnd;
+                logTerminal(`[MSE][${trackType}] Gap detected: ${rangeEnd.toFixed(2)}s → ${nextRangeStart.toFixed(2)}s (${gapSize.toFixed(2)}s) — jumping playhead`);
+                el.currentTime = nextRangeStart + 0.01;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Set up stall recovery for a media element:
+     *   1. 'waiting' event handler — fires when the browser stalls at a gap.
+     *   2. 3-second periodic watchdog — catches "soft stalls" where timeupdate
+     *      stops firing but no waiting event is emitted.
+     */
+    function setupStallRecovery(el, trackType) {
+        // Clean up any previous watchdog and listener (e.g. from a prior MSE session)
+        if (stallWatchdogTimer) {
+            clearInterval(stallWatchdogTimer);
+            stallWatchdogTimer = null;
+        }
+        if (onWaitingHandler && el) {
+            el.removeEventListener('waiting', onWaitingHandler);
+            onWaitingHandler = null;
+        }
+        lastPlayheadTime = -1;
+        lastPlayheadCheck = 0;
+
+        onWaitingHandler = () => {
+            if (playbackMode !== 'mse') return;
+            logTerminal(`[MSE][${trackType}] 'waiting' event fired at ${el.currentTime.toFixed(2)}s — checking for gap`);
+            tryJumpGap(el, trackType);
+        };
+        el.addEventListener('waiting', onWaitingHandler);
+
+        // Periodic soft-stall watchdog: if the playhead hasn't moved for 3s
+        // while the element thinks it's playing, attempt a gap jump.
+        stallWatchdogTimer = setInterval(() => {
+            if (playbackMode !== 'mse') return;
+            if (el.paused || el.ended || el.seeking) return;
+
+            const now = performance.now();
+            const current = el.currentTime;
+
+            if (lastPlayheadTime >= 0 && Math.abs(current - lastPlayheadTime) < 0.05) {
+                // Playhead hasn't moved in ~3s while playing — stalled.
+                if (now - lastPlayheadCheck >= 2900) {
+                    logTerminal(`[MSE][${trackType}] Soft stall detected at ${current.toFixed(2)}s — attempting gap jump`);
+                    if (!tryJumpGap(el, trackType)) {
+                        // No gap found — try nudging forward slightly to unstick the decoder.
+                        logTerminal(`[MSE][${trackType}] No gap found — nudging playhead +0.1s`);
+                        el.currentTime = current + 0.1;
+                    }
+                }
+            } else {
+                lastPlayheadTime = current;
+                lastPlayheadCheck = now;
+            }
+        }, 3000);
     }
 
     /**
