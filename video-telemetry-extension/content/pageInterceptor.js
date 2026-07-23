@@ -200,6 +200,8 @@
     const pausedDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'paused');
     const durationDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'duration');
     const playbackRateDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate');
+    const readyStateDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'readyState');
+    const HAVE_ENOUGH_DATA = 4;
 
     // ─── Virtual Playback Clock ──────────────────────────────────────────────
     // PROBLEM: suppressVideo() pauses the primary <video> so it never decodes on
@@ -218,12 +220,23 @@
     const PUMP_INTERVAL_MS = 250;
     const virtualClock = {
         video: null,
-        active: false,
+        active: false,        // armed (clock owns this element) — set on suppression
+        started: false,       // advancing — set on the FIRST real media chunk
         baseTime: 0,          // media-time (s) anchored at anchorWall
         anchorWall: 0,        // performance.now() when baseTime was set
         rate: 1,
         timer: null,
+        reads: 0,             // diag: times YouTube has read our synthetic currentTime
+        lastLog: 0,           // diag: throttle for the periodic state log
     };
+
+    // diag: how many suppressed media chunks we've forwarded, and when the last one
+    // flowed. If `chunks` keeps climbing past the stall point, YouTube is still
+    // fetching and the loss is downstream (transport); if it plateaus, YouTube
+    // stopped feeding and the fetch lever needs more work.
+    let fwdVideoChunks = 0;
+    let fwdAudioChunks = 0;
+    let lastChunkWall = 0;
 
     function nativeCurrentTime(el) {
         try { return currentTimeDesc && currentTimeDesc.get ? currentTimeDesc.get.call(el) : 0; }
@@ -240,9 +253,14 @@
         } catch (_) { return 1; }
     }
 
-    // Current virtual media-time for the active clock (null if inactive).
+    // Current virtual media-time for the active clock (null if inactive). While the
+    // clock is armed but not yet started (no media flowing), it stays FROZEN at
+    // baseTime so currentTime can never run ahead of what YouTube has actually
+    // fetched — running ahead makes YouTube think the playhead overtook its buffer
+    // and it stops filling normally.
     function getVirtualTime() {
         if (!virtualClock.active || !virtualClock.video) return null;
+        if (!virtualClock.started) return virtualClock.baseTime;
         const elapsed = (performance.now() - virtualClock.anchorWall) / 1000;
         let t = virtualClock.baseTime + elapsed * virtualClock.rate;
         if (t < 0) t = 0;
@@ -263,7 +281,24 @@
             virtualClock.timer = null;
         }
         virtualClock.active = false;
+        virtualClock.started = false;
         virtualClock.video = null;
+    }
+
+    // Begin advancing. Called from patchedAppendBuffer on the FIRST real (non-init)
+    // media chunk for the primary — i.e. once YouTube is genuinely streaming — so the
+    // synthetic currentTime starts from 0 in lock-step with real playback, never ahead.
+    function markPlaybackStarted(video) {
+        if (!virtualClock.active || virtualClock.video !== video || virtualClock.started) return;
+        virtualClock.started = true;
+        virtualClock.rate = nativePlaybackRate(video);
+        anchorVirtualTime(nativeCurrentTime(video));
+
+        // suppressVideo() fired a real 'pause'; flip YouTube back to a playing state so
+        // its streaming engine leaves "paused" and keeps requesting segments.
+        try { video.dispatchEvent(new Event('play')); } catch (_) {}
+        try { video.dispatchEvent(new Event('playing')); } catch (_) {}
+        BCR_LOG('[BCR] Virtual clock: first media chunk seen — playback simulation ON, advancing currentTime from ' + virtualClock.baseTime.toFixed(2) + 's');
     }
 
     function pumpTick() {
@@ -277,6 +312,8 @@
             return;
         }
 
+        if (!virtualClock.started) return; // armed but YouTube hasn't started streaming yet
+
         // Track live playback-rate changes so fast-forward / slow-mo stay honest.
         const r = nativePlaybackRate(v);
         if (r !== virtualClock.rate) {
@@ -287,29 +324,42 @@
         const vt = getVirtualTime();
         const dur = nativeDuration(v);
         if (Number.isFinite(dur) && dur > 0 && vt !== null && vt >= dur) {
-            // Reached the end of a finite video — idle rather than pumping past duration.
-            return;
+            return; // reached end of a finite video — idle
         }
 
         // Drive YouTube's streaming loop: a 'timeupdate' with an advanced currentTime
         // makes it recompute buffer-ahead and fetch the next segments in order.
         try { v.dispatchEvent(new Event('timeupdate')); } catch (_) {}
+
+        // Periodic diagnostic (VDI Chrome console). ytReads climbing = YouTube is
+        // reading our synthetic currentTime; if it stays 0, YouTube isn't using
+        // video.currentTime for its fetch decisions and we need a different lever.
+        const now = performance.now();
+        if (now - virtualClock.lastLog >= 2000) {
+            virtualClock.lastLog = now;
+            const sinceChunk = lastChunkWall ? Math.round(now - lastChunkWall) : -1;
+            BCR_LOG('[BCR] Virtual clock: t=' + (vt != null ? vt.toFixed(2) : '?') +
+                's rate=' + virtualClock.rate + ' ytReads=' + virtualClock.reads +
+                ' fwdChunks(v/a)=' + fwdVideoChunks + '/' + fwdAudioChunks +
+                ' sinceLastChunk=' + sinceChunk + 'ms');
+        }
     }
 
+    // Arm the clock for a newly-suppressed primary. It does NOT advance yet — it waits
+    // for the first real media chunk (markPlaybackStarted) before simulating playback.
     function startVirtualClock(video) {
         if (!video) return;
         stopVirtualClock();
         virtualClock.video = video;
         virtualClock.active = true;
+        virtualClock.started = false;
         virtualClock.rate = nativePlaybackRate(video);
-        anchorVirtualTime(nativeCurrentTime(video)); // honor a start-at offset (e.g. ?t=30)
+        virtualClock.baseTime = nativeCurrentTime(video); // honors a start-at offset (?t=)
+        virtualClock.anchorWall = performance.now();
+        virtualClock.reads = 0;
+        virtualClock.lastLog = performance.now();
         virtualClock.timer = setInterval(pumpTick, PUMP_INTERVAL_MS);
-
-        // suppressVideo() just fired a real 'pause'; tell YouTube we're playing again
-        // so its streaming engine leaves the paused state and resumes fetching.
-        try { video.dispatchEvent(new Event('play')); } catch (_) {}
-        try { video.dispatchEvent(new Event('playing')); } catch (_) {}
-        BCR_LOG('[BCR] Virtual playback clock started — YouTube will keep fetching beyond the initial buffer');
+        BCR_LOG('[BCR] Virtual playback clock armed for primary video — waiting for first media chunk');
     }
 
     // ─── Blob URL → MediaSource Registry ─────────────────────────────────────
@@ -1849,9 +1899,12 @@
     if (currentTimeDesc && currentTimeDesc.get && currentTimeDesc.set) {
         Object.defineProperty(HTMLMediaElement.prototype, 'currentTime', {
             get() {
-                if (!_bypass && virtualClock.active && virtualClock.video === this) {
+                if (!_bypass && virtualClock.started && virtualClock.video === this) {
                     const vt = getVirtualTime();
-                    if (vt !== null) return vt;
+                    if (vt !== null) {
+                        virtualClock.reads++;
+                        return vt;
+                    }
                 }
                 return currentTimeDesc.get.call(this);
             },
@@ -1871,10 +1924,28 @@
     if (pausedDesc && pausedDesc.get) {
         Object.defineProperty(HTMLMediaElement.prototype, 'paused', {
             get() {
-                if (!_bypass && virtualClock.active && virtualClock.video === this) {
+                if (!_bypass && virtualClock.started && virtualClock.video === this) {
                     return false;
                 }
                 return pausedDesc.get.call(this);
+            },
+            configurable: true,
+            enumerable: true,
+        });
+    }
+
+    // readyState → HAVE_ENOUGH_DATA while the clock runs. The real SourceBuffers are
+    // empty (we gate the native appendBuffer), so the element's native readyState stays
+    // low — which tells YouTube the element can't actually be playing, so it drops back
+    // to its small "buffer-ahead while paused" target and stops fetching. Reporting
+    // HAVE_ENOUGH_DATA keeps YouTube in its full playing-state streaming loop.
+    if (readyStateDesc && readyStateDesc.get) {
+        Object.defineProperty(HTMLMediaElement.prototype, 'readyState', {
+            get() {
+                if (!_bypass && virtualClock.started && virtualClock.video === this) {
+                    return HAVE_ENOUGH_DATA;
+                }
+                return readyStateDesc.get.call(this);
             },
             configurable: true,
             enumerable: true,
@@ -2152,6 +2223,21 @@
                         '*',
                         [copied.buffer]  // transfer ownership to content script
                     );
+
+                    // diag: track chunk throughput so we can tell whether YouTube keeps
+                    // feeding past the stall point (see fwdVideoChunks/fwdAudioChunks log).
+                    if (meta.trackType === 'audio') fwdAudioChunks++;
+                    else fwdVideoChunks++;
+                    lastChunkWall = performance.now();
+
+                    // First real (non-init) media chunk for the primary → begin
+                    // advancing the virtual clock, in lock-step with actual streaming.
+                    // A suppressed SourceBuffer always belongs to the primary, so fall
+                    // back to the armed primary when the ms→video lookup misses (that
+                    // lookup is why some chunks log videoId=unknown).
+                    if (!isInitSegment) {
+                        markPlaybackStarted(video || virtualClock.video);
+                    }
                 }
             } catch (_) { }
 
