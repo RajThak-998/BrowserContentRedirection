@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check \"c:/Development/BrowserContentRedirection/video-telemetry-extension/content/pageInterceptor.js\")"
+    ]
+  }
+}

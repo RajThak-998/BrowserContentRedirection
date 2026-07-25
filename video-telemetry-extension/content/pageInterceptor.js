@@ -252,6 +252,38 @@
     const SEEK_BEHIND_S   = 10;    // seek this far BEHIND the frontier (stays inside buffer → no gap)
     const SEEK_MIN_GAP_MS = 2000;  // minimum wall-clock between seeks
 
+    // ── Pulse-decode config ───────────────────────────────────────────────────
+    // NEW default mode (supersedes the paused seek-only pulse). Media is un-gated so the
+    // VDI element REALLY decodes; YouTube then front-loads a full ~120s buffer in-order.
+    // To keep it cheap the element only decodes in brief PULSES: when bcr_client's buffer
+    // (reverse channel) runs below SEEK_LEAD_S we seek the element to just behind its OWN
+    // native buffered frontier and play; when the buffer is topped up to HIGH_WATER (or
+    // MAX_PULSE_MS elapses) we pause again. The video region is occluded (BCR_OCCLUDE) so
+    // the decode costs no RDP bandwidth. Set BCR_PULSE_DECODE=false to fall back to the
+    // old seek-only pulse (BCR_SEEK_PULSE_ENABLED) or the control-test passthrough.
+    const BCR_PULSE_DECODE   = true;
+    const BCR_OCCLUDE        = true;   // cover the VDI video with an opaque layer (RDP saving)
+    const HIGH_WATER_S       = 90;     // end a pulse once buffer is this far ahead of playback
+    const MAX_PULSE_MS       = 12000;  // safety cap on a single pulse's decode time
+    const PULSE_MIN_GAP_MS   = 1500;   // minimum idle (paused) time between pulses
+    const pulseState = { playing: false, startWall: 0, lastEndWall: 0 };
+
+    // YouTube ads play through the SAME element + MSE pipeline as the content, so every
+    // ad break costs a re-init cycle and splices ad media into bcr_client's timeline.
+    // Skipping them as early as possible is a pipeline fix, not just a UX one.
+    const BCR_AD_AUTOSKIP    = true;   // click "Skip Ad" as soon as YouTube renders it
+    const BCR_AD_UNCOVER     = true;   // lift the occluder while an ad shows (keeps it visible)
+    const BCR_AD_FASTFORWARD = true;   // seek unskippable ads to their end (no button exists)
+    const AD_MAX_DURATION_S  = 180;    // sanity bound — never fast-forward longer media
+    let adActive = false;              // true while an ad break is in progress
+    let contentDuration = NaN;         // element duration observed OUTSIDE an ad
+
+    // The user watches on bcr_client, so a scrub THERE must move the VDI element too:
+    // YouTube only fetches around its own playhead, so without this the external player
+    // seeks into a region the downloader will never be asked to request.
+    const BCR_SEEK_FOLLOW    = true;
+    const SEEK_FOLLOW_JUMP_S = 3;      // playhead delta (beyond normal drift) that means "seek"
+
     const virtualClock = {
         video: null,
         active: false,        // armed (clock owns this element) — set on suppression
@@ -283,6 +315,45 @@
         return NaN;
     }
 
+    // YouTube's OWN video id for the page. This is the identity bcr_client keys its
+    // session on, and it must be STABLE: the per-element `data-bcr-video-id` UUID is
+    // regenerated on every src/srcObject assignment, so YouTube's startup element churn
+    // produced a fresh id (or 'unknown') several times per load — while a real SPA
+    // navigation to a different video sometimes produced none at all, so the client never
+    // tore the old session down and kept playing the previous video's buffer.
+    //
+    // The URL is checked FIRST on purpose: getVideoData().video_id switches to the AD's
+    // id during an ad break, which would read as a video change and tear down the session
+    // at every ad. location.href does not change for ads.
+    let _ytIdHref = '';
+    let _ytIdCached = null;
+    function currentYouTubeVideoId() {
+        const href = location.href; // appendBuffer is hot — only recompute on navigation
+        if (href === _ytIdHref) return _ytIdCached;
+        _ytIdHref = href;
+        _ytIdCached = null;
+        try {
+            const u = new URL(href);
+            const v = u.searchParams.get('v');
+            if (v) {
+                _ytIdCached = v;
+            } else {
+                const m = u.pathname.match(/^\/(?:shorts|embed|live)\/([^/?#]+)/);
+                if (m) _ytIdCached = m[1];
+            }
+        } catch (_) {}
+        if (!_ytIdCached) {
+            try {
+                const mp = document.getElementById('movie_player');
+                if (mp && typeof mp.getVideoData === 'function') {
+                    const vd = mp.getVideoData();
+                    if (vd && typeof vd.video_id === 'string' && vd.video_id) _ytIdCached = vd.video_id;
+                }
+            } catch (_) {}
+        }
+        return _ytIdCached;
+    }
+
     // diag: how many suppressed media chunks we've forwarded, and when the last one
     // flowed. If `chunks` keeps climbing past the stall point, YouTube is still
     // fetching and the loss is downstream (transport); if it plateaus, YouTube
@@ -297,6 +368,33 @@
     let bcrBufferedEnd = NaN;
     let bcrPlayhead = NaN;
     let bcrReportWall = 0;
+
+    // Seek-follow: reports arrive ~1×/sec, so during normal playback the playhead
+    // advances by roughly the elapsed wall time. A delta that departs from that by more
+    // than SEEK_FOLLOW_JUMP_S is a user scrub on bcr_client, which the VDI element must
+    // mirror. Latched here and consumed by pulseTick (the pump owns all element writes).
+    let lastBcrPlayhead = NaN;
+    let lastBcrPlayheadWall = 0;
+    let pendingFollowSeek = NaN;
+
+    function noteBcrPlayhead(ph) {
+        if (!BCR_SEEK_FOLLOW || typeof ph !== 'number' || !Number.isFinite(ph)) return;
+        const now = performance.now();
+        if (Number.isFinite(lastBcrPlayhead) && lastBcrPlayheadWall > 0) {
+            const elapsed = (now - lastBcrPlayheadWall) / 1000;
+            const delta = ph - lastBcrPlayhead;
+            // Both tests matter: the first catches a jump, the second stops a long
+            // report gap on a PAUSED client (delta 0, elapsed 10s) from looking like one.
+            if (Math.abs(delta - elapsed) > SEEK_FOLLOW_JUMP_S &&
+                Math.abs(delta) > SEEK_FOLLOW_JUMP_S) {
+                pendingFollowSeek = ph;
+                BCR_LOG('[BCR] seek-follow armed → ' + ph.toFixed(1) + 's (was ' +
+                    lastBcrPlayhead.toFixed(1) + 's, ' + elapsed.toFixed(1) + 's ago)');
+            }
+        }
+        lastBcrPlayhead = ph;
+        lastBcrPlayheadWall = now;
+    }
 
     // Seek the hidden VDI element to `target`. Prefer YouTube's own seekTo (exactly
     // what the working manual scrubber drag uses); fall back to a raw currentTime set.
@@ -314,6 +412,250 @@
             try { v.currentTime = target; } catch (_) {}
         }
         anchorVirtualTime(target);
+    }
+
+    // ── Pulse-decode driver ───────────────────────────────────────────────────
+    // The VDI element's OWN native buffered frontier (media un-gated, so this is
+    // YouTube's real buffer). `buffered` is not overridden, so this reads native.
+    function nativeBufferedEnd(v) {
+        try {
+            const b = v.buffered;
+            if (b && b.length > 0) return b.end(b.length - 1);
+        } catch (_) {}
+        return NaN;
+    }
+
+    function startPulse(v, opts) {
+        const nb = nativeBufferedEnd(v);
+        const ct = nativeCurrentTime(v);
+        // Only re-sync forward when the element has DRIFTED well behind its own frontier.
+        // Seeking at startup / when already near the frontier disrupts YouTube's initial
+        // load (it churned video elements and left bcr_client on an init-less session).
+        // noSeek: a follow-seek just positioned the element — don't drag it back.
+        if (!(opts && opts.noSeek) &&
+            Number.isFinite(nb) && nb > SEEK_BEHIND_S && ct < nb - SEEK_LEAD_S) {
+            seekVDI(v, nb - SEEK_BEHIND_S);
+        }
+        try { v.muted = true; v.volume = 0; } catch (_) {}
+        try { const p = origPlay.call(v); if (p && typeof p.catch === 'function') p.catch(() => {}); } catch (_) {}
+        pulseState.playing = true;
+        pulseState.startWall = performance.now();
+        BCR_LOG('[BCR] pulse START nativeBufEnd=' + (Number.isFinite(nb) ? nb.toFixed(1) : '?') + 's ct=' + ct.toFixed(1) + 's');
+    }
+
+    function endPulse(v, reason) {
+        try { v.pause(); } catch (_) {}
+        pulseState.playing = false;
+        pulseState.lastEndWall = performance.now();
+        BCR_LOG('[BCR] pulse END reason=' + reason);
+    }
+
+    function pulseTick(v) {
+        updateOccluder(v);
+        // Keep the VDI element silent (audio plays only on bcr_client). YouTube re-unmutes
+        // during load / on play, so enforce it every tick.
+        try { if (!v.muted || v.volume !== 0) { v.muted = true; v.volume = 0; } } catch (_) {}
+
+        const now = performance.now();
+
+        // ── Ad break ──────────────────────────────────────────────────────────
+        // Ads run on a different timeline, so the content buffer math below is
+        // meaningless here and a frontier seek would fight the ad. Suspend the pulse
+        // and let the ad handler drive the element until the break is over.
+        if (isAdShowing()) {
+            if (!adActive) {
+                adActive = true;
+                BCR_LOG('[BCR] ad break started — pulse suspended, element forced to play');
+            }
+            handleAdBreak(v);
+            return;
+        }
+        if (adActive) {
+            adActive = false;
+            // The ad handler left the element playing; hand it back paused so the
+            // normal low-buffer logic restarts a pulse from a known state.
+            endPulse(v, 'ad-end');
+            BCR_LOG('[BCR] ad break ended — pulse resumed');
+            return;
+        }
+
+        // Mirror an external-player scrub before any buffer math: the element must be
+        // sitting at the new position for YouTube to start fetching around it, and the
+        // stale bcrBufferedEnd from the old position would otherwise skew `bufferAhead`.
+        if (Number.isFinite(pendingFollowSeek)) {
+            const target = Math.max(0, pendingFollowSeek);
+            pendingFollowSeek = NaN;
+            seekVDI(v, target);
+            BCR_LOG('[BCR] seek-follow → VDI element seeked to ' + target.toFixed(1) + 's');
+            if (pulseState.playing) {
+                // Already decoding — give the pulse a full budget to fetch at the new spot.
+                pulseState.startWall = now;
+            } else {
+                // Fetch from the new position immediately; ignore PULSE_MIN_GAP_MS.
+                startPulse(v, { noSeek: true });
+            }
+            return;
+        }
+        const nb = nativeBufferedEnd(v);
+        const dur = nativeDuration(v);
+        // Remember the content duration while we're NOT in a break — tryFastForwardAd
+        // refuses to seek anything that still matches it.
+        if (Number.isFinite(dur) && dur > 0) contentDuration = dur;
+        const reportFresh = bcrReportWall > 0 && (now - bcrReportWall) < 8000;
+        const bufferAhead = (reportFresh && Number.isFinite(bcrBufferedEnd) && Number.isFinite(bcrPlayhead))
+            ? (bcrBufferedEnd - bcrPlayhead) : NaN;
+        const atEnd = Number.isFinite(dur) && dur > 0 && Number.isFinite(bcrBufferedEnd) && bcrBufferedEnd >= dur - 1;
+
+        if (!pulseState.playing) {
+            // Idle (paused). Start a pulse when the buffer is low — or when we have no
+            // reports yet (bootstrap) — but only once the element actually holds data
+            // (never play an empty element) and not at end of video.
+            const low = !Number.isFinite(bufferAhead) || bufferAhead < SEEK_LEAD_S;
+            const dueByTime = now - pulseState.lastEndWall >= PULSE_MIN_GAP_MS;
+            const haveData = Number.isFinite(nb);
+            if (low && !atEnd && dueByTime && haveData) startPulse(v);
+        } else {
+            // Pulsing (playing). End it when topped up, safety-capped, faulted, or ended.
+            const topped = Number.isFinite(bufferAhead) && bufferAhead >= HIGH_WATER_S;
+            const timedOut = now - pulseState.startWall >= MAX_PULSE_MS;
+            const faulted = !!v.error;
+            if (topped || timedOut || faulted || atEnd) {
+                endPulse(v, faulted ? 'fault' : (topped ? 'topped' : (atEnd ? 'end' : 'timeout')));
+            }
+        }
+
+        // Periodic diagnostic (VDI console + bcr_client.log via BCR_YT_DIAG).
+        if (now - virtualClock.lastLog >= 2000) {
+            virtualClock.lastLog = now;
+            const sinceChunk = lastChunkWall ? Math.round(now - lastChunkWall) : -1;
+            const line = 'Pulse: ' + (pulseState.playing ? 'PLAY' : 'idle') +
+                ' bcrBufEnd=' + (Number.isFinite(bcrBufferedEnd) ? bcrBufferedEnd.toFixed(1) : '?') +
+                's bcrPlay=' + (Number.isFinite(bcrPlayhead) ? bcrPlayhead.toFixed(1) : '?') +
+                's ahead=' + (Number.isFinite(bufferAhead) ? bufferAhead.toFixed(1) : '?') +
+                's nativeBufEnd=' + (Number.isFinite(nb) ? nb.toFixed(1) : '?') +
+                's fwdChunks(v/a)=' + fwdVideoChunks + '/' + fwdAudioChunks +
+                ' sinceLastChunk=' + sinceChunk + 'ms';
+            BCR_LOG('[BCR] ' + line);
+            try { window.postMessage({ type: 'BCR_YT_DIAG', payload: { message: line } }, '*'); } catch (_) {}
+        }
+    }
+
+    // ── Ad handling ───────────────────────────────────────────────────────────
+    // There is no player-API method to skip an ad — YouTube never shipped one — so the
+    // button click IS the mechanism. `ad-showing` / `ad-interrupting` on #movie_player is
+    // YouTube's own ad-state flag and is what its stylesheets key off, so it is a far
+    // more stable signal than the button selectors themselves.
+    function isAdShowing() {
+        try {
+            const mp = document.getElementById('movie_player');
+            if (!mp) return false;
+            return mp.classList.contains('ad-showing') || mp.classList.contains('ad-interrupting');
+        } catch (_) { return false; }
+    }
+
+    // Ordered most-current first. These are YouTube-internal class names and DO get
+    // renamed; a miss is harmless (the occluder lifts, so the button stays clickable).
+    const AD_SKIP_SELECTORS = [
+        '.ytp-skip-ad-button',
+        '.ytp-ad-skip-button-modern',
+        '.ytp-ad-skip-button',
+    ];
+    let lastAdSkipWall = 0;
+
+    function trySkipAd() {
+        if (!BCR_AD_AUTOSKIP || !isAdShowing()) return;
+        const now = performance.now();
+        // The button only appears ~5s in; re-checking every tick is fine but clicking
+        // repeatedly is not (YouTube treats a click storm as a mis-click).
+        if (now - lastAdSkipWall < 600) return;
+        lastAdSkipWall = now;
+        for (const sel of AD_SKIP_SELECTORS) {
+            let btn = null;
+            try { btn = document.querySelector(sel); } catch (_) { continue; }
+            if (!btn) continue;
+            // offsetParent is unreliable for the fixed/absolutely-positioned ad chrome,
+            // so measure instead — a rendered button always has a non-zero box.
+            let visible = false;
+            try {
+                const r = btn.getBoundingClientRect();
+                visible = r.width > 0 && r.height > 0;
+            } catch (_) {}
+            if (!visible) continue;
+            try {
+                btn.click();
+                BCR_LOG('[BCR] ad: clicked skip button (' + sel + ')');
+            } catch (_) {}
+            return;
+        }
+    }
+
+    // Unskippable ads (bumpers, non-skippable pre-rolls) render NO skip button at all,
+    // so clicking can never work — seek the ad to its end instead. Guarded twice against
+    // ever doing this to the real video: the duration must be ad-length AND must differ
+    // from the content duration we recorded outside the break.
+    let lastAdFfWall = 0;
+    function tryFastForwardAd(v) {
+        if (!BCR_AD_FASTFORWARD || !v) return;
+        const now = performance.now();
+        if (now - lastAdFfWall < 800) return;
+        const d = nativeDuration(v);
+        if (!Number.isFinite(d) || d <= 0 || d > AD_MAX_DURATION_S) return;
+        if (Number.isFinite(contentDuration) && Math.abs(d - contentDuration) < 1) return;
+        const ct = nativeCurrentTime(v);
+        if (ct >= d - 0.5) return; // already at the end
+        lastAdFfWall = now;
+        // Raw currentTime, not seekVDI: movie_player.seekTo is scoped to the content
+        // timeline and YouTube blocks scrubbing during an ad.
+        try { v.currentTime = Math.max(0, d - 0.1); } catch (_) {}
+        BCR_LOG('[BCR] ad: fast-forwarded ' + ct.toFixed(1) + 's → ' + d.toFixed(1) + 's (no skip button)');
+    }
+
+    function handleAdBreak(v) {
+        // THE important part: the ad plays on the SAME element the pulse machinery
+        // pauses. If the break starts while we're idle between pulses, the ad never
+        // advances — so YouTube never renders the skip button (it appears ~5s IN) and
+        // the break never ends. Keep the element running for the whole ad.
+        try {
+            if (v.paused) {
+                const p = origPlay.call(v);
+                if (p && typeof p.catch === 'function') p.catch(() => {});
+            }
+        } catch (_) {}
+        trySkipAd();
+        tryFastForwardAd(v);
+    }
+
+    // ── Occlusion layer ───────────────────────────────────────────────────────
+    // An opaque element pinned over the primary video so the VDI framebuffer shows a
+    // static region (cheap over RDP) while the video decodes behind it. pointer-events
+    // are disabled so clicks still reach YouTube's controls underneath.
+    let _occluder = null;
+    function ensureOccluder() {
+        if (_occluder && _occluder.isConnected) return _occluder;
+        const d = document.createElement('div');
+        d.setAttribute('data-bcr-occluder', '1');
+        d.style.cssText = 'position:fixed; left:0; top:0; width:0; height:0; background:#000; ' +
+            'pointer-events:none; z-index:2147483646; display:none;';
+        (document.body || document.documentElement).appendChild(d);
+        _occluder = d;
+        return d;
+    }
+    function updateOccluder(video) {
+        if (!BCR_OCCLUDE) return;
+        const d = ensureOccluder();
+        try {
+            // Uncover during an ad: auto-skip needs ~5s before the button exists, and the
+            // selectors above can go stale, so the ad must stay visible/clickable.
+            if (BCR_AD_UNCOVER && isAdShowing()) { d.style.display = 'none'; return; }
+            if (!video || video.isConnected === false) { d.style.display = 'none'; return; }
+            const r = video.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2 || r.bottom < 0 || r.right < 0) { d.style.display = 'none'; return; }
+            d.style.left = r.left + 'px';
+            d.style.top = r.top + 'px';
+            d.style.width = r.width + 'px';
+            d.style.height = r.height + 'px';
+            d.style.display = 'block';
+        } catch (_) { d.style.display = 'none'; }
     }
 
     function nativeCurrentTime(el) {
@@ -361,6 +703,17 @@
         virtualClock.active = false;
         virtualClock.started = false;
         virtualClock.video = null;
+        pulseState.playing = false;
+        pulseState.startWall = 0;
+        pulseState.lastEndWall = 0;
+        // Drop the seek baseline too — the next session's first report must not be
+        // diffed against the previous video's playhead (that reads as a huge scrub).
+        lastBcrPlayhead = NaN;
+        lastBcrPlayheadWall = 0;
+        pendingFollowSeek = NaN;
+        adActive = false;
+        contentDuration = NaN;
+        if (_occluder) _occluder.style.display = 'none';
         stopSyntheticRVFC();
     }
 
@@ -431,6 +784,7 @@
     // media chunk for the primary — i.e. once YouTube is genuinely streaming — so the
     // synthetic currentTime starts from 0 in lock-step with real playback, never ahead.
     function markPlaybackStarted(video) {
+        if (BCR_PULSE_DECODE) return; // real playback drives the clock; no synthetic spoof
         if (!virtualClock.active || virtualClock.video !== video || virtualClock.started) return;
         virtualClock.started = true;
         virtualClock.rate = nativePlaybackRate(video);
@@ -451,7 +805,16 @@
         // Primary video left the DOM — nothing to drive anymore.
         if (v.isConnected === false) {
             BCR_LOG('[BCR] Virtual clock: primary video detached — stopping');
+            if (_occluder) _occluder.style.display = 'none';
             stopVirtualClock();
+            return;
+        }
+
+        // Pulse-decode mode: real decode in brief pulses drives YouTube's fetching. Runs
+        // regardless of virtualClock.started (kept false so the paused-element spoofs
+        // stay inert — the element plays for real, native currentTime is authoritative).
+        if (BCR_PULSE_DECODE) {
+            pulseTick(v);
             return;
         }
 
@@ -558,6 +921,22 @@
         return url;
     };
 
+    // Stamp the element with the SAME identity the media chunks carry. VideoRegistry
+    // reads this attribute for VIDEO_ADDED/VIDEO_REMOVED, and bcr_client compares those
+    // ids against the id on its media chunks — so if the two disagree, lifecycle events
+    // silently stop matching the active session. On YouTube both are the video id;
+    // elsewhere both fall back to the same generated UUID.
+    function assignVideoIdentity(video) {
+        try {
+            const id = currentYouTubeVideoId() ||
+                video.getAttribute('data-bcr-video-id') ||
+                ((typeof crypto !== 'undefined' && crypto.randomUUID)
+                    ? crypto.randomUUID()
+                    : `video-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`);
+            video.setAttribute('data-bcr-video-id', id);
+        } catch (_) {}
+    }
+
     // ─── MediaSource Suppression ───────────────────────────────────────────────
     /**
      * Mark a MediaSource (and all its current SourceBuffers) as suppressed.
@@ -600,15 +979,8 @@
         state.suppressedVideos.add(video);
         state.primaryVideo = video;
 
-        try {
-            if (!video.hasAttribute('data-bcr-video-id')) {
-                const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
-                    ? crypto.randomUUID()
-                    : `video-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-                video.setAttribute('data-bcr-video-id', id);
-            }
-            video.setAttribute('data-bcr-primary', '1');
-        } catch (_) {}
+        assignVideoIdentity(video);
+        try { video.setAttribute('data-bcr-primary', '1'); } catch (_) {}
 
         // Immediately pause and silence — no GPU decode from this point.
         // In the append-gating control test we deliberately do NOT pause, so the real
@@ -1544,7 +1916,10 @@
         if (data.type === 'BCR_YT_PLAYBACK') {
             const p = data.payload || {};
             if (typeof p.bufferedEnd === 'number') bcrBufferedEnd = p.bufferedEnd;
-            if (typeof p.playhead === 'number') bcrPlayhead = p.playhead;
+            if (typeof p.playhead === 'number') {
+                bcrPlayhead = p.playhead;
+                noteBcrPlayhead(p.playhead); // detects a user scrub on bcr_client
+            }
             bcrReportWall = performance.now();
             return;
         }
@@ -2181,13 +2556,11 @@
                 }
                 if (!_bypass && state.suppressedVideos.has(this)) {
                     if (value) {
-                        try {
-                            const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
-                                ? crypto.randomUUID()
-                                : `video-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-                            this.setAttribute('data-bcr-video-id', id);
-                            this.setAttribute('data-bcr-primary', '1');
-                        } catch (_) {}
+                        // Re-stamp rather than mint a fresh UUID: YouTube reassigns
+                        // srcObject several times during startup, and a new id each time
+                        // read downstream as a new video.
+                        assignVideoIdentity(this);
+                        try { this.setAttribute('data-bcr-primary', '1'); } catch (_) {}
                     }
                     if (value instanceof MediaSource) {
                         // Pre-mark so addSourceBuffer sees it immediately
@@ -2215,13 +2588,8 @@
                 }
                 if (!_bypass && state.suppressedVideos.has(this)) {
                     if (value) {
-                        try {
-                            const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
-                                ? crypto.randomUUID()
-                                : `video-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-                            this.setAttribute('data-bcr-video-id', id);
-                            this.setAttribute('data-bcr-primary', '1');
-                        } catch (_) {}
+                        assignVideoIdentity(this);
+                        try { this.setAttribute('data-bcr-primary', '1'); } catch (_) {}
                     }
                     if (value && blobUrlToMediaSource.has(value)) {
                         state.suppressedMediaSources.add(blobUrlToMediaSource.get(value));
@@ -2402,7 +2770,10 @@
 
                     const ms = sourceBufferToMediaSource.get(this);
                     const video = ms ? mediaSourceToVideo.get(ms) : null;
-                    const videoId = video ? video.getAttribute('data-bcr-video-id') : null;
+                    // Prefer YouTube's stable video id; the per-element UUID is only a
+                    // fallback for non-YouTube pages (see currentYouTubeVideoId).
+                    const videoId = currentYouTubeVideoId() ||
+                        (video ? video.getAttribute('data-bcr-video-id') : null);
 
                     const meta = sourceBufferMeta.get(this) ?? {
                         trackType: 'unknown',
@@ -2455,10 +2826,10 @@
                 }
             } catch (_) { }
 
-            // Control test: let the real decoder receive the data so the element
-            // actually plays and its native currentTime advances. The native append
-            // fires the real 'updateend', so we must NOT also fire the synthetic one.
-            if (BCR_DISABLE_APPEND_GATING) {
+            // Pulse-decode (and the control test) let the real decoder receive the data so
+            // the element actually plays and YouTube front-loads a full buffer. The native
+            // append fires the real 'updateend', so we must NOT fire the synthetic one.
+            if (BCR_PULSE_DECODE || BCR_DISABLE_APPEND_GATING) {
                 return origAppendBuffer.call(this, data);
             }
 
