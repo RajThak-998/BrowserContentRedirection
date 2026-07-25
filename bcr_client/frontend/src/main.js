@@ -291,6 +291,10 @@ window.onload = function () {
         mseReady = { video: false, audio: false };
         mseInitCount = 0;
         activeVideoID = null;
+        // The cached init belongs to the video we are tearing down. Leaving it would let
+        // resetTrack() rebuild the NEXT video's track with the previous video's init.
+        lastInitSegment = { video: null, audio: null };
+        trackResetCount = { video: 0, audio: 0 };
 
         // Stop stall watchdog so it doesn't fire against a destroyed pipeline.
         if (stallWatchdogTimer) {
@@ -311,6 +315,9 @@ window.onload = function () {
         videoElement.src = '';
         videoElement.removeAttribute('src');
         videoElement.srcObject = null;
+        // Clearing src normally rewinds the element, but if the old media is still
+        // resolving the scrubber can keep the previous video's position. Force it.
+        try { videoElement.currentTime = 0; } catch (_) {}
 
         if (audioElement.src && audioElement.src.startsWith('blob:')) {
             URL.revokeObjectURL(audioElement.src);
@@ -318,6 +325,7 @@ window.onload = function () {
         audioElement.src = '';
         audioElement.removeAttribute('src');
         audioElement.srcObject = null;
+        try { audioElement.currentTime = 0; } catch (_) {}
 
         setMode('idle');
         if (window.go && window.go.main && window.go.main.App) {
