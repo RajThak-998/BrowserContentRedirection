@@ -203,6 +203,24 @@
     const readyStateDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'readyState');
     const HAVE_ENOUGH_DATA = 4;
 
+    // requestVideoFrameCallback originals (HTMLVideoElement only). Used by the rVFC
+    // lever below to feed YouTube's downloader a synthetic "frame rendered" signal —
+    // the one thing a paused, empty-buffer element never emits, and the suspected
+    // real driver of its segment fetching (which ignores our currentTime spoof).
+    const origRVFC = (typeof HTMLVideoElement !== 'undefined' && HTMLVideoElement.prototype.requestVideoFrameCallback)
+        ? HTMLVideoElement.prototype.requestVideoFrameCallback : null;
+    const origCVFC = (typeof HTMLVideoElement !== 'undefined' && HTMLVideoElement.prototype.cancelVideoFrameCallback)
+        ? HTMLVideoElement.prototype.cancelVideoFrameCallback : null;
+
+    // ── DIAGNOSTIC TOGGLE: disable append-gating ──────────────────────────────
+    // When true, suppressed videos are NOT gated: the native appendBuffer runs so the
+    // real VDI <video> actually decodes and plays (currentTime advances for real), and
+    // the virtual clock stays OFF. Chunks are still forwarded to bcr_client. This is a
+    // CONTROL TEST — if YouTube keeps fetching in this mode, its downloader requires
+    // real playback progression (decode), which no JS spoof can replace. There is a
+    // GPU-decode cost on the VDI in this mode, so leave it false for normal offload.
+    const BCR_DISABLE_APPEND_GATING = false;
+
     // ─── Virtual Playback Clock ──────────────────────────────────────────────
     // PROBLEM: suppressVideo() pauses the primary <video> so it never decodes on
     // the VDI. But YouTube's streaming engine only fetches media while it believes
@@ -218,6 +236,22 @@
     // segments progressively and in order — exactly as during real playback. The real
     // element stays paused and muted underneath, so no GPU decode ever happens.
     const PUMP_INTERVAL_MS = 250;
+
+    // ── Seek-pulse config ─────────────────────────────────────────────────────
+    // Property spoofs (currentTime/paused/readyState/rVFC) drive YouTube's UI but NOT
+    // its downloader. A SEEK (assigning video.currentTime), however, moves the native
+    // media clock the downloader reads — CONFIRMED by manual scrubber jumps forcing
+    // fetches. The trick for CONTINUITY: seek to just BEHIND YouTube's own buffered
+    // frontier (getProgressState().loaded), so it fetches the NEXT contiguous region
+    // (bcr_client's stream extends smoothly, no jump), instead of jumping past the
+    // buffer into unbuffered territory (which gaps). Paced to keep the frontier
+    // ~SEEK_LEAD_S ahead of real playback (wall-clock proxy), so we don't front-load
+    // the whole video. Requires a seekable element → the INIT segment is un-gated below.
+    const BCR_SEEK_PULSE_ENABLED = true;
+    const SEEK_LEAD_S     = 60;    // keep YouTube's frontier at least this far ahead of playback
+    const SEEK_BEHIND_S   = 10;    // seek this far BEHIND the frontier (stays inside buffer → no gap)
+    const SEEK_MIN_GAP_MS = 2000;  // minimum wall-clock between seeks
+
     const virtualClock = {
         video: null,
         active: false,        // armed (clock owns this element) — set on suppression
@@ -228,7 +262,26 @@
         timer: null,
         reads: 0,             // diag: times YouTube has read our synthetic currentTime
         lastLog: 0,           // diag: throttle for the periodic state log
+        seekTarget: 0,        // seek-pulse: last native-clock seek target
+        lastSeekWall: 0,      // seek-pulse: performance.now() of the last seek (0 = none yet)
+        playbackStartWall: 0, // wall-clock when playback began — the real-playback pacing proxy
     };
+
+    // Read YouTube's OWN buffered frontier (seconds) via its player API. This is the
+    // model buffered_end — the exact edge past which a seek creates a fetch deficit.
+    // Returns NaN if the player API isn't available.
+    function getYouTubeLoaded() {
+        try {
+            const mp = document.getElementById('movie_player');
+            if (mp && typeof mp.getProgressState === 'function') {
+                const st = mp.getProgressState();
+                if (st && typeof st.loaded === 'number' && isFinite(st.loaded)) {
+                    return st.loaded;
+                }
+            }
+        } catch (_) {}
+        return NaN;
+    }
 
     // diag: how many suppressed media chunks we've forwarded, and when the last one
     // flowed. If `chunks` keeps climbing past the stall point, YouTube is still
@@ -237,6 +290,31 @@
     let fwdVideoChunks = 0;
     let fwdAudioChunks = 0;
     let lastChunkWall = 0;
+
+    // Playback state reported BACK by bcr_client (its real MSE buffer is the ground
+    // truth for the frontier — the VDI element's buffer is empty because we gate it).
+    // Fed by BCR_YT_PLAYBACK messages; drives the seek pulse's target + pacing.
+    let bcrBufferedEnd = NaN;
+    let bcrPlayhead = NaN;
+    let bcrReportWall = 0;
+
+    // Seek the hidden VDI element to `target`. Prefer YouTube's own seekTo (exactly
+    // what the working manual scrubber drag uses); fall back to a raw currentTime set.
+    // Either way, re-anchor the virtual clock so getter/UI stay consistent.
+    function seekVDI(v, target) {
+        let done = false;
+        try {
+            const mp = document.getElementById('movie_player');
+            if (mp && typeof mp.seekTo === 'function') {
+                mp.seekTo(target, true);
+                done = true;
+            }
+        } catch (_) {}
+        if (!done) {
+            try { v.currentTime = target; } catch (_) {}
+        }
+        anchorVirtualTime(target);
+    }
 
     function nativeCurrentTime(el) {
         try { return currentTimeDesc && currentTimeDesc.get ? currentTimeDesc.get.call(el) : 0; }
@@ -283,6 +361,70 @@
         virtualClock.active = false;
         virtualClock.started = false;
         virtualClock.video = null;
+        stopSyntheticRVFC();
+    }
+
+    // ── requestVideoFrameCallback (rVFC) lever ────────────────────────────────
+    // YouTube's segment downloader appears to track playback progress via rendered
+    // video frames, NOT via video.currentTime (which we already spoof — see ytReads).
+    // A suppressed element never decodes a frame, so rVFC never fires and the
+    // downloader's playhead stays frozen at 0. We synthesize rVFC callbacks driven by
+    // requestAnimationFrame, each carrying an advancing mediaTime (= the virtual clock)
+    // and an incrementing presentedFrames — mimicking real frame presentation without
+    // decoding. Synthetic handles are offset by RVFC_BASE so they never collide with
+    // native handles (previews / non-clock videos keep 100% native rVFC behavior).
+    const RVFC_BASE = 0x40000000;
+    let rvfcSeq = 0;
+    const rvfcCallbacks = new Map(); // synthetic handle -> callback
+    let rvfcRafId = null;
+    let rvfcPresentedFrames = 0;
+
+    function fireSyntheticRVFC() {
+        rvfcRafId = null;
+        if (!virtualClock.started || !virtualClock.video || rvfcCallbacks.size === 0) return;
+
+        const v = virtualClock.video;
+        const now = performance.now();
+        const vt = getVirtualTime();
+        rvfcPresentedFrames++;
+
+        const metadata = {
+            presentationTime: now,
+            expectedDisplayTime: now + 16,
+            width: v.videoWidth || 1280,
+            height: v.videoHeight || 720,
+            mediaTime: vt != null ? vt : 0,
+            presentedFrames: rvfcPresentedFrames,
+            processingDuration: 0,
+        };
+
+        // rVFC is one-shot: fire every currently-registered callback once, then clear.
+        // Callbacks that re-register (the normal per-frame pattern) refill the map and
+        // keep the rAF loop alive via requestVideoFrameCallback below.
+        const pending = Array.from(rvfcCallbacks.values());
+        rvfcCallbacks.clear();
+        for (const cb of pending) {
+            try { cb(now, metadata); } catch (_) {}
+        }
+
+        if (rvfcCallbacks.size > 0 && rvfcRafId === null) {
+            rvfcRafId = requestAnimationFrame(fireSyntheticRVFC);
+        }
+    }
+
+    function ensureSyntheticRVFCLoop() {
+        if (rvfcRafId === null && rvfcCallbacks.size > 0) {
+            rvfcRafId = requestAnimationFrame(fireSyntheticRVFC);
+        }
+    }
+
+    function stopSyntheticRVFC() {
+        if (rvfcRafId !== null) {
+            try { cancelAnimationFrame(rvfcRafId); } catch (_) {}
+            rvfcRafId = null;
+        }
+        rvfcCallbacks.clear();
+        rvfcPresentedFrames = 0;
     }
 
     // Begin advancing. Called from patchedAppendBuffer on the FIRST real (non-init)
@@ -292,6 +434,7 @@
         if (!virtualClock.active || virtualClock.video !== video || virtualClock.started) return;
         virtualClock.started = true;
         virtualClock.rate = nativePlaybackRate(video);
+        virtualClock.playbackStartWall = performance.now(); // pacing anchor for the seek pulse
         anchorVirtualTime(nativeCurrentTime(video));
 
         // suppressVideo() fired a real 'pause'; flip YouTube back to a playing state so
@@ -331,17 +474,46 @@
         // makes it recompute buffer-ahead and fetch the next segments in order.
         try { v.dispatchEvent(new Event('timeupdate')); } catch (_) {}
 
-        // Periodic diagnostic (VDI Chrome console). ytReads climbing = YouTube is
-        // reading our synthetic currentTime; if it stays 0, YouTube isn't using
-        // video.currentTime for its fetch decisions and we need a different lever.
         const now = performance.now();
+
+        // ── Seek pulse ────────────────────────────────────────────────────────
+        // Move the native media clock to just BEHIND bcr_client's REAL buffered frontier
+        // (reported via BCR_YT_PLAYBACK — the VDI element's own buffer is empty because we
+        // gate it, so the client's MSE buffer is the only ground truth). This creates a
+        // fetch deficit that extends the buffer CONTIGUOUSLY — bcr_client's stream never
+        // jumps. Paced against the client's real playhead so it stays ~SEEK_LEAD_S ahead
+        // without front-loading. Reports are fresh only if received within ~5s.
+        const reportFresh = bcrReportWall > 0 && (now - bcrReportWall) < 5000;
+        if (BCR_SEEK_PULSE_ENABLED && reportFresh && Number.isFinite(bcrBufferedEnd) && Number.isFinite(bcrPlayhead)) {
+            const bufferAhead = bcrBufferedEnd - bcrPlayhead;
+            const dueByTime = now - virtualClock.lastSeekWall >= SEEK_MIN_GAP_MS;
+            const notAtEnd = !(Number.isFinite(dur) && dur > 0 && bcrBufferedEnd >= dur - 1);
+            if (bufferAhead < SEEK_LEAD_S && dueByTime && notAtEnd) {
+                const target = Math.max(0, bcrBufferedEnd - SEEK_BEHIND_S);
+                virtualClock.seekTarget = target;
+                virtualClock.lastSeekWall = now;
+                seekVDI(v, target);
+                BCR_LOG('[BCR] Seek pulse → ' + target.toFixed(1) + 's (bcrBufEnd=' + bcrBufferedEnd.toFixed(1) +
+                    ' playhead=' + bcrPlayhead.toFixed(1) + ' ahead=' + bufferAhead.toFixed(1) + ')');
+            }
+        }
+
+        // Periodic diagnostic (VDI Chrome console + bcr_client.log). fwdChunks climbing
+        // past the old ~120s cap after seeks start = the seek pulse is working.
         if (now - virtualClock.lastLog >= 2000) {
             virtualClock.lastLog = now;
             const sinceChunk = lastChunkWall ? Math.round(now - lastChunkWall) : -1;
-            BCR_LOG('[BCR] Virtual clock: t=' + (vt != null ? vt.toFixed(2) : '?') +
-                's rate=' + virtualClock.rate + ' ytReads=' + virtualClock.reads +
+            const line = 'Virtual clock: t=' + (vt != null ? vt.toFixed(2) : '?') +
+                's bcrBufEnd=' + (Number.isFinite(bcrBufferedEnd) ? bcrBufferedEnd.toFixed(1) : '?') +
+                's bcrPlay=' + (Number.isFinite(bcrPlayhead) ? bcrPlayhead.toFixed(1) : '?') +
+                's seekTarget=' + virtualClock.seekTarget.toFixed(1) +
+                's ytReads=' + virtualClock.reads +
                 ' fwdChunks(v/a)=' + fwdVideoChunks + '/' + fwdAudioChunks +
-                ' sinceLastChunk=' + sinceChunk + 'ms');
+                ' sinceLastChunk=' + sinceChunk + 'ms';
+            BCR_LOG('[BCR] ' + line);
+            // Mirror the YT diagnostic into bcr_client.log via the telemetry path
+            // (BCR_YT_DIAG → bootstrap → emitter → background → bcr_host → bcr_client).
+            try { window.postMessage({ type: 'BCR_YT_DIAG', payload: { message: line } }, '*'); } catch (_) {}
         }
     }
 
@@ -358,6 +530,9 @@
         virtualClock.anchorWall = performance.now();
         virtualClock.reads = 0;
         virtualClock.lastLog = performance.now();
+        virtualClock.seekTarget = 0;
+        virtualClock.lastSeekWall = 0;
+        virtualClock.playbackStartWall = 0;
         virtualClock.timer = setInterval(pumpTick, PUMP_INTERVAL_MS);
         BCR_LOG('[BCR] Virtual playback clock armed for primary video — waiting for first media chunk');
     }
@@ -436,7 +611,11 @@
         } catch (_) {}
 
         // Immediately pause and silence — no GPU decode from this point.
-        video.pause();
+        // In the append-gating control test we deliberately do NOT pause, so the real
+        // element decodes and plays (its native currentTime then advances on its own).
+        if (!BCR_DISABLE_APPEND_GATING) {
+            video.pause();
+        }
         video.muted = true;
         video.preload = 'none';
 
@@ -463,13 +642,16 @@
         // Calling load() detaches the MediaSource, causing YouTube to immediately
         // reattach it and flood the pipeline with fresh init segments — which was
         // crashing the thin-client MSE session repeatedly.
-        BCR_LOG('[BCR] suppressVideo: video suppressed, GPU decode gated');
-
-        // Keep YouTube's streaming engine requesting new segments by simulating
-        // playback progress on this (paused, non-decoding) element. Without this it
-        // buffers only ~120s ahead of a frozen currentTime and then stops fetching,
-        // starving the external bcr_client player ~2 minutes in.
-        startVirtualClock(video);
+        if (BCR_DISABLE_APPEND_GATING) {
+            BCR_LOG('[BCR] suppressVideo: APPEND-GATING DISABLED (control test) — real decode/playback ON, virtual clock OFF');
+        } else {
+            BCR_LOG('[BCR] suppressVideo: video suppressed, GPU decode gated');
+            // Keep YouTube's streaming engine requesting new segments by simulating
+            // playback progress on this (paused, non-decoding) element. Without this it
+            // buffers only ~120s ahead of a frozen currentTime and then stops fetching,
+            // starving the external bcr_client player ~2 minutes in.
+            startVirtualClock(video);
+        }
     }
 
     function isMainVideoCandidate(video) {
@@ -1359,6 +1541,14 @@
             return;
         }
 
+        if (data.type === 'BCR_YT_PLAYBACK') {
+            const p = data.payload || {};
+            if (typeof p.bufferedEnd === 'number') bcrBufferedEnd = p.bufferedEnd;
+            if (typeof p.playhead === 'number') bcrPlayhead = p.playhead;
+            bcrReportWall = performance.now();
+            return;
+        }
+
         if (data.type === 'BCR_RTC_SHADOW_READY') {
             const payload = data.payload;
             const bridgeId = payload?.bridgeId;
@@ -1874,7 +2064,7 @@
     // many sites chain .then()/.catch() on the return value).
     Object.defineProperty(HTMLMediaElement.prototype, 'play', {
         value: function patchedPlay() {
-            if (!_bypass && state.suppressedVideos.has(this)) {
+            if (!_bypass && !BCR_DISABLE_APPEND_GATING && state.suppressedVideos.has(this)) {
                 return Promise.resolve();
             }
             return origPlay.call(this);
@@ -1950,6 +2140,29 @@
             configurable: true,
             enumerable: true,
         });
+    }
+
+    // requestVideoFrameCallback / cancelVideoFrameCallback — synthesize frame callbacks
+    // for the clock-driven primary; pass straight through for every other element.
+    if (origRVFC) {
+        HTMLVideoElement.prototype.requestVideoFrameCallback = function patchedRVFC(cb) {
+            if (!_bypass && virtualClock.started && virtualClock.video === this && typeof cb === 'function') {
+                const handle = RVFC_BASE + (++rvfcSeq);
+                rvfcCallbacks.set(handle, cb);
+                ensureSyntheticRVFCLoop();
+                return handle;
+            }
+            return origRVFC.call(this, cb);
+        };
+        if (origCVFC) {
+            HTMLVideoElement.prototype.cancelVideoFrameCallback = function patchedCVFC(handle) {
+                if (typeof handle === 'number' && handle >= RVFC_BASE) {
+                    rvfcCallbacks.delete(handle);
+                    return;
+                }
+                return origCVFC.call(this, handle);
+            };
+        }
     }
 
     // srcObject setter → when a suppressed video gets a new MediaSource,
@@ -2181,6 +2394,7 @@
         const isSuppressed = state.suppressedSourceBuffers.has(this);
 
         if (isSuppressed) {
+            let isInitSegment = false;
             try {
                 const view = toByteView(data);
                 if (view) {
@@ -2203,7 +2417,7 @@
                         loggedFormats.add(formatKey);
                     }
 
-                    const isInitSegment = detectInitSegment(copied);
+                    isInitSegment = detectInitSegment(copied);
 
                     // Forward only suppressed/redirected media chunks to the BCR pipeline.
                     // copied.buffer is transferred (zero-copy) to the content script.
@@ -2240,6 +2454,27 @@
                     }
                 }
             } catch (_) { }
+
+            // Control test: let the real decoder receive the data so the element
+            // actually plays and its native currentTime advances. The native append
+            // fires the real 'updateend', so we must NOT also fire the synthetic one.
+            if (BCR_DISABLE_APPEND_GATING) {
+                return origAppendBuffer.call(this, data);
+            }
+
+            // Seek-pulse support: let the REAL SourceBuffer receive the (tiny) INIT
+            // segment so the element gains metadata → duration → becomes SEEKABLE (the
+            // seek pulse needs a seekable element to move the native clock). MEDIA
+            // segments stay gated below, so no frames ever decode. The native append
+            // fires its own 'updateend', so we do NOT add the synthetic one here.
+            if (BCR_SEEK_PULSE_ENABLED && isInitSegment) {
+                try {
+                    origAppendBuffer.call(this, data);
+                    return;
+                } catch (_) {
+                    // Real append rejected (e.g. SB busy) — fall through to the gated path.
+                }
+            }
 
             // Gate the native call — decoder never receives this data.
             // Fire synthetic updateend so page.js streaming loop continues.

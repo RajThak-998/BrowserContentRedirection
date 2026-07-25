@@ -168,7 +168,7 @@ func handleExtensionMessage(msgType int, data []byte, registry *Registry) {
 		// Existing telemetry path unchanged.
 		registry.Broadcast(msgType, data)
 
-		if isVideoUpdatePacket(data) || isRTCShadowUpstreamPacket(data) || isVideoLifecyclePacket(data) {
+		if isVideoUpdatePacket(data) || isRTCShadowUpstreamPacket(data) || isVideoLifecyclePacket(data) || isYTDiagPacket(data) {
 			mediaBridge.tryForwardText(data)
 		}
 
@@ -238,6 +238,22 @@ func isVideoLifecyclePacket(data []byte) bool {
 		return false
 	}
 	return pkt.Type == "VIDEO_ADDED" || pkt.Type == "VIDEO_REMOVED"
+}
+
+func isYTDiagPacket(data []byte) bool {
+	var pkt Packet
+	if err := json.Unmarshal(data, &pkt); err != nil {
+		return false
+	}
+	return pkt.Type == "YT_DIAG"
+}
+
+func isYTPlaybackPacket(data []byte) bool {
+	var pkt Packet
+	if err := json.Unmarshal(data, &pkt); err != nil {
+		return false
+	}
+	return pkt.Type == "YT_PLAYBACK"
 }
 
 func handleMediaBinaryFrame(data []byte, registry *Registry) {
@@ -540,6 +556,15 @@ func (b *bridgeForwarder) runBridgeLoop() {
 				}
 
 				if msgType != 1 {
+					continue
+				}
+
+				// YouTube playback state from bcr_client → forward to the extension
+				// interceptor (drives the seek pulse). Not a shadow packet.
+				if isYTPlaybackPacket(data) {
+					if _bridgeRegistry != nil {
+						_bridgeRegistry.SendToExtension(websocket.TextMessage, data)
+					}
 					continue
 				}
 

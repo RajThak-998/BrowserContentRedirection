@@ -23,6 +23,10 @@ type Callbacks struct {
 	OnMediaChunk      func(header MediaChunkHeader, chunkData []byte)
 	OnLog             func(message string)
 
+	// OnYTDiag receives the extension's YouTube virtual-clock diagnostic lines so
+	// they can be logged into bcr_client.log. If nil, they are dropped.
+	OnYTDiag func(message string)
+
 	// OnVerboseLog receives high-volume diagnostics (full SDP dumps, etc.).
 	// It is intended to be wired to the log file only, so the terminal stays
 	// readable. If nil, verbose messages are dropped entirely.

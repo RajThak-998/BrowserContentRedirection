@@ -12,10 +12,35 @@ import (
 	"time"
 
 	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/logger"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 )
+
+// fileLogger implements the Wails logger.Logger interface so that frontend logs
+// (runtime.LogInfo/LogError → the [MSE]/[Video]/[Loopback] lines) are written into
+// bcr_client.log, not just stdout. Without a Logger set on options.App, Wails routes
+// those frontend logs to stdout only and the file misses all of them.
+type fileLogger struct{}
+
+func (fileLogger) write(level, message string) {
+	line := fmt.Sprintf("%s %s | %s", time.Now().Format("2006/01/02 15:04:05.000000"), level, message)
+	fmt.Println(line)
+	logFileMu.Lock()
+	if logFile != nil {
+		fmt.Fprintln(logFile, line)
+	}
+	logFileMu.Unlock()
+}
+
+func (l fileLogger) Print(m string)   { l.write("PRT", m) }
+func (l fileLogger) Trace(m string)   { l.write("TRC", m) }
+func (l fileLogger) Debug(m string)   { l.write("DBG", m) }
+func (l fileLogger) Info(m string)    { l.write("INF", m) }
+func (l fileLogger) Warning(m string) { l.write("WRN", m) }
+func (l fileLogger) Error(m string)   { l.write("ERR", m) }
+func (l fileLogger) Fatal(m string)   { l.write("FTL", m) }
 
 // defaultLogPath returns "bcr_client.log" resolved against the current working
 // directory. CWD is used rather than the executable directory because `wails dev`
@@ -99,6 +124,9 @@ func main() {
 			Assets: assets,
 		},
 		OnStartup: app.startup,
+		// Route frontend logs (runtime.LogInfo/LogError) into bcr_client.log too.
+		Logger:   fileLogger{},
+		LogLevel: logger.INFO,
 		Bind: []interface{}{
 			app,
 		},

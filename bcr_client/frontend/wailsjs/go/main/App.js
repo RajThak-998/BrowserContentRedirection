@@ -10,6 +10,10 @@ export function NotifyMSEActive(arg1) {
   return window['go']['main']['App']['NotifyMSEActive'](arg1);
 }
 
+export function ReportPlayback(arg1, arg2) {
+  return window['go']['main']['App']['ReportPlayback'](arg1, arg2);
+}
+
 export function RequestLoopbackOffer() {
   return window['go']['main']['App']['RequestLoopbackOffer']();
 }

@@ -70,6 +70,11 @@
                 return;
             }
 
+            if (data.type === "BCR_YT_DIAG") {
+                Emitter.getInstance().emitYTDiag(data.payload ?? {});
+                return;
+            }
+
             if (data.type !== "BCR_MEDIA_CHUNK") return;
 
             const now = performance.now();
@@ -133,6 +138,14 @@
             if (message.type === "RTC_SHADOW_PRE_WARM_READY") {
                 window.postMessage({
                     type: "BCR_RTC_SHADOW_PRE_WARM_READY",
+                    payload: message.payload ?? {},
+                }, "*");
+                return;
+            }
+
+            if (message.type === "YT_PLAYBACK") {
+                window.postMessage({
+                    type: "BCR_YT_PLAYBACK",
                     payload: message.payload ?? {},
                 }, "*");
                 return;

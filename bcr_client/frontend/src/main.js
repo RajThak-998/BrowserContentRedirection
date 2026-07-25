@@ -206,6 +206,14 @@ window.onload = function () {
     let mseReady = { video: false, audio: false };
     let mseInitCount = 0;          // how many init segments received — used for first-chunk logging
     let activeVideoID = null;      // the unique ID of the video currently playing/redirecting
+    // Cache of the most recent init segment per track ({data, fullMime}). YouTube sends
+    // an init segment only once per quality, so after a mid-stream decode error we must
+    // re-inject the cached one to rebuild the SourceBuffer — otherwise the track stays
+    // dead (e.g. audio keeps playing while video is frozen).
+    let lastInitSegment = { video: null, audio: null };
+    // Guards against a reset→error→reset loop: after too many resets we fall back to a
+    // full teardown. Cleared once a track appends media cleanly again.
+    let trackResetCount = { video: 0, audio: 0 };
 
     /**
      * Base64 → Uint8Array (no extra dependencies)
@@ -319,6 +327,67 @@ window.onload = function () {
     }
 
     /**
+     * Reset a SINGLE track (video or audio) in place — used to recover from a decode
+     * error WITHOUT tearing down the whole pipeline (which hides the overlay window).
+     * A bad Opus segment poisons only the <audio> element; resetting just that track
+     * lets video (and the overlay) keep playing, and the next chunk rebuilds the track.
+     * Deliberately does NOT touch playbackMode, activeVideoID, the other track, or
+     * overlay visibility.
+     */
+    function resetTrack(trackType) {
+        trackResetCount[trackType]++;
+        if (trackResetCount[trackType] > 3) {
+            logErrorTerm(`[MSE][${trackType}] too many resets (${trackResetCount[trackType]}) — full teardown`);
+            trackResetCount[trackType] = 0;
+            teardownMSE();
+            return;
+        }
+        logTerminal(`[MSE][${trackType}] resetting track in place (error recovery) — overlay/other track untouched`);
+        const targetEl = (trackType === 'video') ? videoElement : audioElement;
+        const ms = mediaSources[trackType];
+        try {
+            const sb = sourceBuffers[trackType];
+            if (sb && ms) {
+                try { sb.abort(); } catch (_) {}
+                try { ms.removeSourceBuffer(sb); } catch (_) {}
+            }
+            if (ms && ms.readyState === 'open') {
+                try { ms.endOfStream(); } catch (_) {}
+            }
+        } catch (_) {}
+
+        if (targetEl.src && targetEl.src.startsWith('blob:')) {
+            try { URL.revokeObjectURL(targetEl.src); } catch (_) {}
+        }
+        targetEl.src = '';
+        targetEl.removeAttribute('src');
+
+        // Clear only this track's state.
+        mediaSources[trackType] = null;
+        sourceBuffers[trackType] = null;
+        chunkQueues[trackType] = [];
+        configuredMimeTypes[trackType] = null;
+        pendingSourceBuffers[trackType] = null;
+        mseReady[trackType] = false;
+
+        // Rebuild immediately by re-injecting the cached init segment. YouTube won't
+        // resend an init after a mid-stream error, so without this the SourceBuffer is
+        // never recreated and the track stays dead. setupTrackMSE re-attaches a fresh
+        // MediaSource (which also clears the element's error state); on 'sourceopen' it
+        // creates the SourceBuffer from pendingSourceBuffers and drains the queued init,
+        // after which normal media segments append and the track recovers.
+        const cachedInit = lastInitSegment[trackType];
+        if (cachedInit) {
+            setupTrackMSE(trackType);
+            pendingSourceBuffers[trackType] = cachedInit.fullMime;
+            chunkQueues[trackType] = [cachedInit.data.slice()];
+            logTerminal(`[MSE][${trackType}] re-injecting cached init segment to rebuild track`);
+        } else {
+            logTerminal(`[MSE][${trackType}] no cached init segment — track will rebuild on next init`);
+        }
+    }
+
+    /**
      * Create and attach a fresh MediaSource to the target element. Called on
      * the first MEDIA_CHUNK that arrives while in idle or MSE mode.
      */
@@ -417,10 +486,11 @@ window.onload = function () {
             setupStallRecovery(videoElement, 'video');
 
             // Recover from native video decode errors (bad segments, GPU reset, etc.)
+            // Reset only the video track — keep the overlay visible so it doesn't vanish.
             videoElement.addEventListener('error', () => {
                 if (videoElement.error && playbackMode === 'mse') {
-                    logErrorTerm(`[MSE] Video element error (code=${videoElement.error.code}) — resetting pipeline`);
-                    teardownMSE();
+                    logTerminal(`[MSE] Video element error (code=${videoElement.error.code}) — resetting video track (overlay kept)`);
+                    resetTrack('video');
                 }
             }, { once: true });
         } else {
@@ -439,8 +509,8 @@ window.onload = function () {
             // dead for the rest of the session while video keeps playing.
             audioElement.addEventListener('error', () => {
                 if (audioElement.error && playbackMode === 'mse') {
-                    logErrorTerm(`[MSE] Audio element error (code=${audioElement.error.code}) — resetting pipeline`);
-                    teardownMSE();
+                    logTerminal(`[MSE] Audio element error (code=${audioElement.error.code}) — resetting audio track only (video/overlay keep playing)`);
+                    resetTrack('audio');
                 }
             }, { once: true });
         }
@@ -472,9 +542,12 @@ window.onload = function () {
         const chunk = queue.shift();
         try {
             sb.appendBuffer(chunk);
-            // If the element is playing and paused at a gap, appending this chunk may have created/extended
-            // a future range. Check if we can jump the gap immediately.
-            if (targetEl && !targetEl.paused && !targetEl.seeking) {
+            trackResetCount[trackType] = 0; // healthy append — clear the reset-loop guard
+            // Appending may have created/extended a future range. Check for a gap to
+            // jump. NOT gated on !paused: after an error reset the element is paused at
+            // currentTime 0 with data only far ahead, and it can only resume once we
+            // seek it into the buffer (which then lets 'canplay' fire and play()).
+            if (targetEl && !targetEl.seeking) {
                 tryJumpGap(targetEl, trackType);
             }
         } catch (e) {
@@ -508,9 +581,23 @@ window.onload = function () {
      */
     function tryJumpGap(el, trackType) {
         const sb = sourceBuffers[trackType];
-        if (!sb || !sb.buffered || sb.buffered.length < 2) return false;
+        if (!sb || !sb.buffered || sb.buffered.length < 1) return false;
 
         const current = el.currentTime;
+
+        // Playhead stranded BEFORE the first buffered range. Happens after an error
+        // reset rebuilds the track: currentTime snaps back to 0 but the re-fed segments
+        // begin at the current media time (~140s+), so there is no data at 0 and the
+        // element can't even fire 'canplay'. Seek forward into the buffer so playback
+        // (and the canplay→play path) can resume. The audio drift-sync then follows.
+        const firstStart = sb.buffered.start(0);
+        if (current < firstStart - 0.5) {
+            logTerminal(`[MSE][${trackType}] playhead ${current.toFixed(2)}s before buffered start ${firstStart.toFixed(2)}s — seeking into buffer`);
+            el.currentTime = firstStart + 0.01;
+            return true;
+        }
+
+        if (sb.buffered.length < 2) return false;
         for (let i = 0; i < sb.buffered.length - 1; i++) {
             const rangeEnd = sb.buffered.end(i);
             const nextRangeStart = sb.buffered.start(i + 1);
@@ -612,6 +699,10 @@ window.onload = function () {
         if (isInitSegment) {
             mseInitCount++;
             logTerminal(`[MSE][${trackType}][${sourceBufferID}] Init segment #${mseInitCount} mimeType=${mimeType} codec=${codec} size=${data.length} videoId=${videoID}`);
+
+            // Cache this init so resetTrack() can rebuild the track after a decode error
+            // even though YouTube won't resend an init segment mid-stream.
+            lastInitSegment[trackType] = { data: data.slice(), fullMime };
 
             // Flush prior queue for this track type
             chunkQueues[trackType] = [];
@@ -837,6 +928,42 @@ window.onload = function () {
             });
         }
     }, 0);
+
+    // ── Playback reporter (drives the VDI-side YouTube seek pulse) ───────────
+    // The VDI page can't see how much media is really buffered (its <video> is gated
+    // and empty). OUR MSE buffer is the ground truth, so report bufferedEnd + playhead
+    // back to the interceptor ~1×/sec; it seeks YouTube just behind bufferedEnd to keep
+    // fetching the next contiguous region. Only meaningful while MSE (YouTube) is active.
+    setInterval(() => {
+        if (playbackMode !== 'mse') return;
+        try {
+            const b = videoElement.buffered;
+            if (!b || b.length === 0) return;
+            const playhead = videoElement.currentTime || 0;
+
+            // Report the end of the CONTIGUOUS buffered region at/ahead of the playhead —
+            // NOT b.end(last). With a fragmented buffer (e.g. after a seek that leaves a
+            // gap), the last range's end overstates the real playable frontier, so the
+            // seek pulse thinks there's plenty buffered and stops fetching — starving
+            // playback at the gap. Walk from the first range ending after the playhead and
+            // extend across near-adjacent ranges (sub-1s gaps the watchdog auto-jumps).
+            let contiguousEnd = playhead;
+            for (let i = 0; i < b.length; i++) {
+                if (b.end(i) <= playhead) continue; // range entirely behind the playhead
+                contiguousEnd = b.end(i);
+                let j = i;
+                while (j + 1 < b.length && b.start(j + 1) - b.end(j) < 1.0) {
+                    contiguousEnd = b.end(j + 1);
+                    j++;
+                }
+                break;
+            }
+
+            if (window.go && window.go.main && window.go.main.App && window.go.main.App.ReportPlayback) {
+                window.go.main.App.ReportPlayback(contiguousEnd, playhead).catch(() => {});
+            }
+        } catch (_) {}
+    }, 1000);
 
     logTerminal("BCR Player UI ready (MSE + WebRTC loopback, codec-pinned: H264+Opus). Waiting for media...");
 };

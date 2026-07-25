@@ -27,11 +27,23 @@ type App struct {
 	// the WebRTC overlay and the YouTube overlay do not interfere with each other.
 	mseActiveMu sync.Mutex
 	mseActive   bool
+	hideTimer   *time.Timer // debounces overlay HIDE so brief teardown churn doesn't flash the window
 
 	mediaEngine *engine.Engine
 }
 
 const telemetryWindowThrottle = 33 * time.Millisecond
+
+// overlayHideGrace defers hiding the overlay after MSE goes inactive, so brief
+// teardown→rebuild churn (ad boundaries, hover previews, videoID swaps) doesn't
+// flash the window. A show within this window cancels the pending hide.
+const overlayHideGrace = 2 * time.Second
+
+// minOverlayVisiblePx is the minimum on-screen extent (per axis) a telemetry
+// position must leave visible to be applied. Transient layout jumps report the
+// tracked <video> rect far off-screen (e.g. y=-510); those are ignored so the
+// overlay keeps its last valid position instead of sliding out of view.
+const minOverlayVisiblePx = 60
 
 // NewApp creates a new App application struct
 func NewApp() *App {
@@ -86,6 +98,9 @@ func (a *App) startup(ctx context.Context) {
 			},
 			OnLog: func(message string) {
 				log.Println(message)
+			},
+			OnYTDiag: func(message string) {
+				log.Printf("[YT] %s", message)
 			},
 			// Verbose diagnostics (full SDP dumps) go to the log file only.
 			OnVerboseLog: verboseLog,
@@ -176,6 +191,14 @@ func (a *App) RequestLoopbackOffer() {
 	}
 }
 
+// ReportPlayback relays the frontend MSE buffer state (bufferedEnd + playhead, in
+// seconds) back to the extension interceptor so it can drive the YouTube seek pulse.
+func (a *App) ReportPlayback(bufferedEnd float64, playhead float64) {
+	if a.mediaEngine != nil {
+		a.mediaEngine.SendYTPlayback(bufferedEnd, playhead)
+	}
+}
+
 // -------------------------------------------------------------
 // UI Window Controls (Exposed to Javascript or called from Go)
 // -------------------------------------------------------------
@@ -208,6 +231,14 @@ func (a *App) applyWindowFromTelemetry(x, y, w, h float64) {
 	ih := int(math.Round(h))
 
 	if iw < 1 || ih < 1 {
+		return
+	}
+
+	// Ignore near-/fully-off-screen positions (keep the last valid one). During
+	// scroll/layout transitions the tracked <video> rect briefly reports far above
+	// or left of the viewport (seen as y=-510); applying it slides the overlay out
+	// of view and it looks deleted. A real on-screen update follows shortly after.
+	if iy+ih < minOverlayVisiblePx || ix+iw < minOverlayVisiblePx {
 		return
 	}
 
@@ -257,16 +288,51 @@ func (a *App) hideIfMSEMode() {
 // NotifyMSEActive is called by the frontend when the MSE pipeline becomes live
 // (canplay event fired) or is torn down. It drives the overlay window visibility
 // so the window only shows when the thin client is actually rendering video.
+//
+// Shows are immediate; hides are debounced by overlayHideGrace so the brief
+// teardown→rebuild churn YouTube produces (ad boundaries, hover previews, videoID
+// swaps) doesn't flash the overlay in and out. A show during the grace cancels the
+// pending hide.
 func (a *App) NotifyMSEActive(active bool) {
+	var doShow bool
+
 	a.mseActiveMu.Lock()
-	prev := a.mseActive
-	a.mseActive = active
+	if active {
+		if a.hideTimer != nil {
+			a.hideTimer.Stop()
+			a.hideTimer = nil
+		}
+		if !a.mseActive {
+			a.mseActive = true
+			doShow = true
+		}
+	} else if a.mseActive && a.hideTimer == nil {
+		// Defer the hide; a rebuild within the grace window cancels it above.
+		a.hideTimer = time.AfterFunc(overlayHideGrace, a.hideOverlayAfterGrace)
+	}
 	a.mseActiveMu.Unlock()
-	if active && !prev {
+
+	if doShow {
 		log.Println("[bcr_client][video] MSE active — showing overlay window")
 		runtime.WindowShow(a.ctx)
-	} else if !active && prev {
-		log.Println("[bcr_client][video] MSE inactive — hiding overlay window")
+	}
+}
+
+// hideOverlayAfterGrace fires when the overlay has been inactive for overlayHideGrace
+// with no rebuild — the video really stopped, so hide the window.
+func (a *App) hideOverlayAfterGrace() {
+	var doHide bool
+
+	a.mseActiveMu.Lock()
+	a.hideTimer = nil
+	if a.mseActive {
+		a.mseActive = false
+		doHide = true
+	}
+	a.mseActiveMu.Unlock()
+
+	if doHide {
+		log.Println("[bcr_client][video] MSE inactive (grace elapsed) — hiding overlay window")
 		runtime.WindowHide(a.ctx)
 	}
 }

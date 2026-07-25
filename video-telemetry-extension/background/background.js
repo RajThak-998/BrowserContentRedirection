@@ -35,6 +35,10 @@ const RTC_DOWNSTREAM_TYPES = new Set([
 let _mediaSeen = 0;
 const _rtcBridgeRoutes = new Map();
 
+// Last tab/frame that forwarded a media chunk — the YouTube tab. Downstream
+// YT_PLAYBACK messages (buffer state from bcr_client) are routed back to it.
+let _mediaTabRoute = null;
+
 // ─── Transport ─────────────────────────────────────────────────────────────
 
 class Transport {
@@ -258,6 +262,10 @@ class Transport {
                 _routeRtcShadowToContent(packet);
                 return;
             }
+            if (packet && packet.type === "YT_PLAYBACK") {
+                _routeYTPlaybackToContent(packet);
+                return;
+            }
         } catch (_) {
             // Not JSON, keep as compact transport log.
         }
@@ -310,6 +318,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case "VIDEO_UPDATE":
         case "VIDEO_ADDED":
         case "VIDEO_REMOVED":
+        case "YT_DIAG":
             _handleTelemetry(message, sender, sendResponse);
             break;
 
@@ -399,6 +408,20 @@ function _handleRtcShadow(message, sender, sendResponse) {
         console.error("[Background] Failed to send RTC shadow message:", err);
         sendResponse({status: "error", reason: err.message});
     }
+}
+
+function _routeYTPlaybackToContent(packet) {
+    if (!_mediaTabRoute || typeof _mediaTabRoute.tabId !== "number") return;
+    chrome.tabs.sendMessage(
+        _mediaTabRoute.tabId,
+        { type: packet.type, payload: packet.payload ?? {} },
+        { frameId: _mediaTabRoute.frameId ?? 0 },
+        () => {
+            if (chrome.runtime.lastError) {
+                _mediaTabRoute = null; // tab/frame gone
+            }
+        }
+    );
 }
 
 function _routeRtcShadowToContent(packet) {
@@ -557,6 +580,12 @@ function _handleMediaChunk(message, sender, sendResponse) {
     if (!ENABLE_MEDIA_CHUNK_ROUTE) {
         sendResponse({status: "ok", skipped: true});
         return;
+    }
+
+    // Remember which tab/frame is the YouTube source so downstream YT_PLAYBACK
+    // (buffer state from bcr_client) can be routed back to it.
+    if (sender.tab && typeof sender.tab.id === "number") {
+        _mediaTabRoute = { tabId: sender.tab.id, frameId: sender.frameId ?? 0 };
     }
 
     const normalized = _normalizeMediaPayload(message.payload);

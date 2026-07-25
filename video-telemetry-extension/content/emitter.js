@@ -179,6 +179,18 @@ class Emitter {
         );
     }
 
+    // YouTube diagnostic line (virtual-clock / chunk-throughput state) — routed as
+    // plain telemetry so it lands in bcr_client.log via the host bridge.
+    emitYTDiag(payload) {
+        this._send({
+            type: "YT_DIAG",
+            payload: {
+                message: payload.message ?? "",
+                timestamp: Date.now(),
+            },
+        });
+    }
+
     emitRtcShadowPreWarm(payload) {
         this._sendWithRetry(
             {

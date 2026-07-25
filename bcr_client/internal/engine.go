@@ -211,6 +211,10 @@ func (e *Engine) readControlLoop(conn SignalingConn) {
 			continue
 		}
 
+		if e.handleYTDiag(message) {
+			continue
+		}
+
 		e.handleVideoLifecycle(message)
 	}
 }
@@ -225,6 +229,28 @@ func (e *Engine) handleVideoUpdate(message []byte) bool {
 	}
 	if e.cb.OnVideoUpdate != nil {
 		e.cb.OnVideoUpdate(evt)
+	}
+	return true
+}
+
+// handleYTDiag routes the extension's YouTube virtual-clock diagnostic line to the
+// OnYTDiag callback so it can be written into bcr_client.log (the interceptor's own
+// logs only reach the VDI browser console otherwise).
+func (e *Engine) handleYTDiag(message []byte) bool {
+	var pkt struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Message string `json:"message"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(message, &pkt); err != nil {
+		return false
+	}
+	if pkt.Type != "YT_DIAG" {
+		return false
+	}
+	if e.cb.OnYTDiag != nil {
+		e.cb.OnYTDiag(pkt.Payload.Message)
 	}
 	return true
 }
@@ -1285,6 +1311,23 @@ func (e *Engine) logf(format string, args ...any) {
 		return
 	}
 	fmt.Println(msg)
+}
+
+// SendYTPlayback forwards the frontend's MSE buffer state (bufferedEnd + playhead)
+// upstream to bcr_host over the control connection, so it can be relayed to the
+// extension interceptor to drive the YouTube seek pulse. Best-effort (dropped if no
+// control connection is currently attached).
+func (e *Engine) SendYTPlayback(bufferedEnd, playhead float64) {
+	e.bridgeMu.RLock()
+	conn := e.controlConn
+	e.bridgeMu.RUnlock()
+	if conn == nil {
+		return
+	}
+	_ = writeJSONPacket(conn, "YT_PLAYBACK", map[string]float64{
+		"bufferedEnd": bufferedEnd,
+		"playhead":    playhead,
+	})
 }
 
 // SetLoopbackAnswer applies the frontend's answer to the local loopback PC
