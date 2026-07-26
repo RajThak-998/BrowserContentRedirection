@@ -151,6 +151,14 @@
                 return;
             }
 
+            if (message.type === "BCR_STATUS") {
+                window.postMessage({
+                    type: "BCR_STATUS",
+                    payload: message.payload ?? {},
+                }, "*");
+                return;
+            }
+
             if (message.type === "RTC_SHADOW_READY") {
                 window.postMessage({
                     type: "BCR_RTC_SHADOW_READY",
@@ -204,10 +212,30 @@
         VideoRegistry.getInstance().destroy();
     }
 
+    // Ask whether the local player is reachable, and hand the answer to the page
+    // world. pageInterceptor holds off on redirecting media until this arrives —
+    // with no bcr_client there is nothing to redirect to, so the video must be
+    // left to play normally inside the VDI.
+    function _requestClientStatus() {
+        try {
+            chrome.runtime.sendMessage({type: "GET_BCR_STATUS", payload: {}}, (response) => {
+                if (chrome.runtime.lastError || !response) return;
+                window.postMessage({
+                    type: "BCR_STATUS",
+                    payload: {clientConnected: response.clientConnected},
+                }, "*");
+            });
+        } catch (_) {
+            // Extension context invalidated (reload) — the page world's own
+            // timeout will fall back to redirecting, same as before.
+        }
+    }
+
     // pageInterceptor.js (world: MAIN) is already active via the manifest.
     // We only need to attach the postMessage listener on the isolated-world side.
     _attachMediaChunkListener();
     _attachRuntimeListener();
+    _requestClientStatus();
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
         start();

@@ -641,7 +641,7 @@
         return d;
     }
     function updateOccluder(video) {
-        if (!BCR_OCCLUDE) return;
+        if (!BCR_OCCLUDE || !bcrRedirectEnabled) return;
         const d = ensureOccluder();
         try {
             // Uncover during an ad: auto-skip needs ~5s before the button exists, and the
@@ -715,6 +715,89 @@
         contentDuration = NaN;
         if (_occluder) _occluder.style.display = 'none';
         stopSyntheticRVFC();
+    }
+
+    // ─── bcr_client availability / fallback ───────────────────────────────────
+    //
+    // Redirection only makes sense when there is a local player to redirect TO.
+    // With bcr_client gone the old behaviour left the user staring at the opaque
+    // occluder with no audio, because nothing ever reconsidered the decision to
+    // suppress. bcr_host now reports the real bridge state (BCR_STATUS), and
+    // this flag gates the whole redirect path on it.
+    //
+    // Starts true deliberately. If the status has not arrived by the time
+    // YouTube's first appendBuffer fires we redirect anyway: guessing
+    // "disconnected" wrongly disables BCR silently and completely, while
+    // guessing "connected" wrongly costs a brief occluder that
+    // restoreNativePlayback() then clears. Fail toward the recoverable error.
+    let bcrRedirectEnabled = true;
+
+    // Element state captured before suppressVideo() mutated it, so it can be put
+    // back exactly as it was.
+    const _preSuppressState = new WeakMap();
+
+    /**
+     * Hand the video back to the VDI: stop redirecting, uncover the element,
+     * restore audio, and resume playing at wherever the external player had got
+     * to. Safe to call when nothing was suppressed yet.
+     *
+     * This is cheap because BCR_PULSE_DECODE mode never fakes anything
+     * structural — media is passed to the real decoder (see patchedAppendBuffer)
+     * and markPlaybackStarted() early-returns, so virtualClock.started stays
+     * false and every property spoof (currentTime/paused/readyState/rVFC) is
+     * already inert. There are no prototype patches to unwind, only element
+     * state to put back.
+     */
+    function restoreNativePlayback(reason) {
+        if (!bcrRedirectEnabled) return;
+        bcrRedirectEnabled = false;
+
+        BCR_LOG('[BCR] falling back to VDI playback — ' + reason);
+
+        const v = state.primaryVideo;
+
+        // Stops the pump interval, clears pulse state, hides the occluder, and
+        // (for non-pulse modes) disarms every property spoof.
+        stopVirtualClock();
+
+        if (_occluder) {
+            try { _occluder.remove(); } catch (_) {}
+            _occluder = null;
+        }
+
+        stopSilentAudioKeepalive();
+
+        if (!v) return; // nothing was ever suppressed — gate alone is enough
+
+        try { state.suppressedVideos.delete(v); } catch (_) {}
+
+        const prev = _preSuppressState.get(v);
+        try {
+            v.muted = prev ? prev.muted : false;
+            v.volume = prev ? prev.volume : 1;
+            v.preload = prev ? prev.preload : 'auto';
+        } catch (_) {}
+
+        // YouTube re-applies its own stored volume through the player API, which
+        // is more reliable than poking the element when the two disagree.
+        try {
+            const mp = document.getElementById('movie_player');
+            if (mp && typeof mp.unMute === 'function') mp.unMute();
+        } catch (_) {}
+
+        // The element has been pulsed around its own buffer, so it is not where
+        // the user was watching. bcrPlayhead is the external player's last
+        // reported position — the only record of what the user actually saw.
+        if (Number.isFinite(bcrPlayhead) && bcrPlayhead > 0) {
+            try { seekVDI(v, bcrPlayhead); } catch (_) {}
+        }
+
+        try {
+            const p = origPlay.call(v);
+            if (p && typeof p.catch === 'function') p.catch(() => {});
+        } catch (_) {}
+
+        try { showToast('BCR player unavailable — playing in session'); } catch (_) {}
     }
 
     // ── requestVideoFrameCallback (rVFC) lever ────────────────────────────────
@@ -969,6 +1052,22 @@
      */
     function suppressVideo(video) {
         if (state.suppressedVideos.has(video)) return;
+
+        // No local player to redirect to — leave the element completely alone so
+        // the VDI renders the video normally.
+        if (!bcrRedirectEnabled) return;
+
+        // Remember what we're about to change, so restoreNativePlayback() can put
+        // it back exactly rather than guessing.
+        if (!_preSuppressState.has(video)) {
+            try {
+                _preSuppressState.set(video, {
+                    muted: video.muted,
+                    volume: video.volume,
+                    preload: video.preload,
+                });
+            } catch (_) {}
+        }
 
         if (state.primaryVideo && state.primaryVideo !== video) {
             try {
@@ -1913,6 +2012,22 @@
             return;
         }
 
+        if (data.type === 'BCR_STATUS') {
+            const connected = data.payload?.clientConnected;
+            if (connected === false) {
+                // Covers both cases: the client was never there (answer to the
+                // startup query), and the client died mid-playback (pushed on
+                // the bridge transition).
+                restoreNativePlayback('bcr_client not reachable');
+            } else if (connected === true) {
+                BCR_LOG('[BCR] bcr_client reachable — media redirection active');
+            }
+            // Deliberately no auto re-enable: if the client comes back, resuming
+            // redirection mid-playback would silence the page and jump the
+            // picture to the overlay with no warning. A reload picks it up.
+            return;
+        }
+
         if (data.type === 'BCR_YT_PLAYBACK') {
             const p = data.payload || {};
             if (typeof p.bufferedEnd === 'number') bcrBufferedEnd = p.bufferedEnd;
@@ -2759,7 +2874,10 @@
             electPrimaryVideo();
         }
 
-        const isSuppressed = state.suppressedSourceBuffers.has(this);
+        // After a fallback the SourceBuffers stay in the suppressed set (WeakSet
+        // has no clear()), so gate on the master switch as well. This makes the
+        // append a plain pass-through: no chunks forwarded, no BCR bookkeeping.
+        const isSuppressed = bcrRedirectEnabled && state.suppressedSourceBuffers.has(this);
 
         if (isSuppressed) {
             let isInitSegment = false;

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -14,6 +15,51 @@ import (
 )
 
 var _bridgeRegistry *Registry
+
+// ─── bcr_client reachability ─────────────────────────────────────────────────
+//
+// Published to the extension as BCR_STATUS so the page can fall back to plain
+// in-VDI playback when the local player isn't there. This is reported from the
+// bridge's own connect/disconnect transitions rather than inferred from traffic
+// staleness: media only flows while a video is playing, so a traffic-based guess
+// cannot tell "client is dead" from "nothing is playing yet".
+var (
+	clientStatusMu  sync.Mutex
+	clientConnected bool
+)
+
+func setClientConnected(connected bool) {
+	clientStatusMu.Lock()
+	changed := clientConnected != connected
+	clientConnected = connected
+	clientStatusMu.Unlock()
+
+	if !changed {
+		return
+	}
+	if connected {
+		log.Println("[Bridge] bcr_client reachable — extension may redirect media")
+	} else {
+		log.Println("[Bridge] bcr_client unreachable — extension should fall back to VDI playback")
+	}
+	publishClientStatus()
+}
+
+// publishClientStatus pushes the current reachability to the extension. Also
+// called when an extension connects, so a page refresh learns the state
+// immediately instead of waiting for the next transition.
+func publishClientStatus() {
+	if _bridgeRegistry == nil {
+		return
+	}
+
+	clientStatusMu.Lock()
+	connected := clientConnected
+	clientStatusMu.Unlock()
+
+	data := []byte(fmt.Sprintf(`{"type":"BCR_STATUS","payload":{"clientConnected":%t}}`, connected))
+	_bridgeRegistry.SendToExtension(websocket.TextMessage, data)
+}
 
 // ReadLoop blocks on reading messages from a single connection.
 // It routes messages based on the connection's role:
@@ -35,6 +81,11 @@ func ReadLoop(conn *Connection, registry *Registry) {
 	}()
 
 	if conn.Role == "extension" {
+		// Start the bridge eagerly rather than lazily on first media, so the
+		// reachability answer below is meaningful before any video plays.
+		mediaBridge.start()
+		publishClientStatus()
+
 		handleExtensionIngressLoop(conn, registry)
 		return
 	}
@@ -567,12 +618,15 @@ func (b *bridgeForwarder) runBridgeLoop() {
 			tcpConn, tcpErr := net.Dial("tcp", "127.0.0.1:8081")
 			if tcpErr != nil {
 				log.Printf("[Bridge] TCP fallback dial failed: %v. Retrying in %v...", tcpErr, bridgeReconnectDelay)
+				setClientConnected(false)
 				time.Sleep(bridgeReconnectDelay)
 				continue
 			}
 			log.Println("[Bridge] ✅ TCP transport active — signaling via TCP loopback 127.0.0.1:8081")
 			conn = &TCPSignalingConn{Conn: tcpConn}
 		}
+
+		setClientConnected(true)
 
 		stopCh := make(chan struct{})
 		var stopOnce sync.Once
@@ -731,6 +785,8 @@ func (b *bridgeForwarder) runBridgeLoop() {
 		// Wait for both read and write loops to fully exit
 		<-stopCh
 		wg.Wait()
+
+		setClientConnected(false)
 
 		log.Println("[Bridge] Reconnecting bridge path...")
 		time.Sleep(bridgeReconnectDelay)

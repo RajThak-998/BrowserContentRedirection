@@ -39,6 +39,40 @@ const _rtcBridgeRoutes = new Map();
 // YT_PLAYBACK messages (buffer state from bcr_client) are routed back to it.
 let _mediaTabRoute = null;
 
+// ─── bcr_client reachability ────────────────────────────────────────────────
+// null = not yet known. bcr_host reports this as BCR_STATUS from its own bridge
+// connect/disconnect transitions, and it is also forced false whenever our own
+// socket to bcr_host drops (if the host is gone, the whole chain is down).
+//
+// Content scripts use it to decide whether to redirect media at all: with no
+// local player there is nothing to redirect TO, so the page must be left to play
+// the video normally inside the VDI.
+let _clientConnected = null;
+
+function _setClientConnected(connected) {
+    if (_clientConnected === connected) return;
+    _clientConnected = connected;
+    console.log(`[Transport] bcr_client ${connected ? "connected" : "unavailable"}`);
+    _broadcastClientStatus();
+}
+
+// Broadcast rather than using _mediaTabRoute: that route is only set once a tab
+// has sent a media chunk, so it is null in exactly the case that matters most —
+// a page that loaded while the client was already down.
+function _broadcastClientStatus() {
+    chrome.tabs.query({url: ["*://*.youtube.com/*"]}, (tabs) => {
+        if (chrome.runtime.lastError || !tabs) return;
+        for (const tab of tabs) {
+            if (typeof tab.id !== "number") continue;
+            chrome.tabs.sendMessage(
+                tab.id,
+                {type: "BCR_STATUS", payload: {clientConnected: _clientConnected}},
+                () => void chrome.runtime.lastError // tab without our content script
+            );
+        }
+    });
+}
+
 // ─── Transport ─────────────────────────────────────────────────────────────
 
 class Transport {
@@ -236,6 +270,10 @@ class Transport {
         console.warn(`[Transport] Connection closed. Code: ${code}`);
         this._socket = null;
 
+        // bcr_host is gone, so the whole redirection chain is down regardless of
+        // what the last BCR_STATUS said.
+        _setClientConnected(false);
+
         if (this._intentionalClose) {
             return;
         }
@@ -264,6 +302,10 @@ class Transport {
             }
             if (packet && packet.type === "YT_PLAYBACK") {
                 _routeYTPlaybackToContent(packet);
+                return;
+            }
+            if (packet && packet.type === "BCR_STATUS") {
+                _setClientConnected(packet.payload?.clientConnected === true);
                 return;
             }
         } catch (_) {
@@ -315,6 +357,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     switch (message.type) {
+        // Asked by a content script at page load, before any push can arrive.
+        // clientConnected may be null (not yet known) — the caller decides what
+        // to assume in that case.
+        case "GET_BCR_STATUS":
+            sendResponse({status: "ok", clientConnected: _clientConnected});
+            break;
+
         case "VIDEO_UPDATE":
         case "VIDEO_ADDED":
         case "VIDEO_REMOVED":
