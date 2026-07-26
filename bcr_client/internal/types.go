@@ -17,11 +17,11 @@ type PreferredCodecs struct {
 }
 
 type Callbacks struct {
-	OnLoopbackOffer   func(bridgeID string, sdp string)
-	OnVideoUpdate     func(update VideoUpdate)
-	OnVideoLifecycle  func(evtType string, videoID string)
-	OnMediaChunk      func(header MediaChunkHeader, chunkData []byte)
-	OnLog             func(message string)
+	OnLoopbackOffer  func(bridgeID string, sdp string)
+	OnVideoUpdate    func(update VideoUpdate)
+	OnVideoLifecycle func(evtType string, videoID string)
+	OnMediaChunk     func(header MediaChunkHeader, chunkData []byte)
+	OnLog            func(message string)
 
 	// OnYTDiag receives the extension's YouTube virtual-clock diagnostic lines so
 	// they can be logged into bcr_client.log. If nil, they are dropped.
@@ -46,15 +46,48 @@ type Bounds struct {
 	Height float64 `json:"height"`
 }
 
+// Clip describes how the <video> inside the overlay must be scaled and offset
+// when the overlay window has been clipped to the browser viewport (i.e. the
+// player is partially scrolled off screen). Values are ratios of the clipped
+// box, so the client applies them as CSS percentages. The zero value is
+// deliberately NOT the identity — use ClipOrIdentity().
+type Clip struct {
+	ScaleX  float64 `json:"scaleX"`
+	ScaleY  float64 `json:"scaleY"`
+	OffsetX float64 `json:"offsetX"`
+	OffsetY float64 `json:"offsetY"`
+}
+
 type VideoUpdate struct {
 	Type    string `json:"type"`
 	Payload struct {
 		ID           string `json:"id"`
 		ScreenBounds Bounds `json:"screenBounds"`
-		Playback     struct {
+		Clip         *Clip  `json:"clip"`
+		// OnScreen is false when the video is not actually being displayed —
+		// tab backgrounded, window minimized/occluded, or the player scrolled
+		// out of the viewport. Pointer so that telemetry from an older
+		// extension (field absent) reads as "unknown" and keeps the previous
+		// always-visible behaviour rather than hiding the overlay forever.
+		OnScreen *bool `json:"onScreen"`
+		Playback struct {
 			State string `json:"state"`
 		} `json:"playback"`
 	} `json:"payload"`
+}
+
+// ClipOrIdentity returns the clip transform, or the identity when absent.
+func (v VideoUpdate) ClipOrIdentity() Clip {
+	if v.Payload.Clip == nil {
+		return Clip{ScaleX: 1, ScaleY: 1}
+	}
+	return *v.Payload.Clip
+}
+
+// IsOnScreen reports whether the overlay should be displayed. Absent field
+// (older extension) is treated as on-screen.
+func (v VideoUpdate) IsOnScreen() bool {
+	return v.Payload.OnScreen == nil || *v.Payload.OnScreen
 }
 
 // VideoLifecycle carries VIDEO_ADDED / VIDEO_REMOVED events.

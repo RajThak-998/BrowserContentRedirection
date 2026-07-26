@@ -194,6 +194,24 @@ window.onload = function () {
         }
     });
 
+    // ── Clip transform ─────────────────────────────────────────────────────
+    // When the YouTube player is partially scrolled out of the browser viewport
+    // in the VDI, the overlay window is clipped to the part that is actually
+    // visible (otherwise it spills over Chrome's toolbar). The <video> then has
+    // to be scaled up and shifted by the clipped-away amount so the picture
+    // still lines up with the real player underneath.
+    //
+    // Values arrive as ratios of the clipped box, so they apply as CSS
+    // percentages and are independent of this window's own pixel density.
+    window.runtime.EventsOn("onVideoClip", (scaleX, scaleY, offsetX, offsetY) => {
+        const s = videoElement.style;
+        s.position = 'absolute';
+        s.width  = `${scaleX * 100}%`;
+        s.height = `${scaleY * 100}%`;
+        s.left   = `${-offsetX * 100}%`;
+        s.top    = `${-offsetY * 100}%`;
+    });
+
     // ==========================================
     // MSE Player (YouTube video redirection)
     // ==========================================

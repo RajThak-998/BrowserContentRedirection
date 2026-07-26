@@ -39,12 +39,18 @@ class StateManager {
         const playbackChanged = prev.playback.state !== newState.playback.state;
         const fullscreenChanged = prev.fullscreen !== newState.fullscreen;
 
+        // onScreen drives overlay show/hide on the client, so a flip must always
+        // be emitted even when the geometry is byte-identical — which is exactly
+        // the case when the window is minimized or the tab is backgrounded.
+        const onScreenChanged = prev.onScreen !== newState.onScreen;
+
         // Fix: only treat as visibility change when ratio also agrees
         const visibilityChanged =
             prev.visibility.inViewport !== newState.visibility.inViewport &&
             (newState.visibility.intersectionRatio > 0 || !newState.visibility.inViewport);
 
-        const shouldEmit = positionChanged || playbackChanged || fullscreenChanged || visibilityChanged;
+        const shouldEmit = positionChanged || playbackChanged || fullscreenChanged ||
+            visibilityChanged || onScreenChanged;
 
         if (!shouldEmit) return null;
 

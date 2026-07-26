@@ -11,6 +11,7 @@ build/
 coverage/
 .cache/
 .parcel-cache/
+.claude
 
 # Env
 .env

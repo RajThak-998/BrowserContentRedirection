@@ -49,6 +49,8 @@ class Emitter {
                 timestamp:    Date.now(),
                 bounds:       stateWithDelta.bounds,
                 screenBounds: stateWithDelta.screenBounds,
+                clip:         stateWithDelta.clip,
+                onScreen:     stateWithDelta.onScreen,
                 visibility:   stateWithDelta.visibility,
                 playback:     stateWithDelta.playback,
                 fullscreen:   stateWithDelta.fullscreen,

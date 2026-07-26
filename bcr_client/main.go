@@ -134,6 +134,11 @@ func main() {
 			WebviewIsTransparent: false,
 			WindowIsTranslucent:  false,
 			DisableWindowIcon:    true,
+			// Naming the window class lets placer.go find this window's HWND
+			// deterministically (EnumWindows filtered by our PID + this class).
+			// Wails v2 exposes no HWND of its own. Must stay in sync with
+			// overlayWindowClass in winplace_windows.go.
+			WindowClassName: overlayWindowClass,
 		},
 	})
 

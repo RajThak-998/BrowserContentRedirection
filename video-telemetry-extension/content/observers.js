@@ -72,6 +72,36 @@ const Observers = (() => {
         return () => window.removeEventListener("scroll", handler);
     }
 
+    /**
+     * Watch whether the page is being displayed at all.
+     *
+     * visibilitychange covers the browser window being minimized, the tab being
+     * switched away from, and Chrome's native window-occlusion detection. None of
+     * this was observed before, so the overlay stayed on screen (showing a stale
+     * or black frame) over a YouTube window the user had already put away.
+     *
+     * @param {Function} callback
+     * @returns {Function} cleanup
+     */
+    function watchPageVisibility(callback) {
+        const handler = () => {
+            callback({
+                reason: "pagevisibility",
+                visible: document.visibilityState === "visible",
+            });
+        };
+
+        document.addEventListener("visibilitychange", handler);
+        // pagehide fires on navigation away / bfcache entry, where
+        // visibilitychange is not guaranteed to arrive first.
+        window.addEventListener("pagehide", handler);
+
+        return () => {
+            document.removeEventListener("visibilitychange", handler);
+            window.removeEventListener("pagehide", handler);
+        };
+    }
+
     // ─── Fullscreen Listener ──────────────────────────────────────────────────
 
     /**
@@ -177,6 +207,105 @@ const Observers = (() => {
         };
     }
 
+    /**
+     * Watch for YouTube player layout-mode changes: theater, miniplayer,
+     * fullscreen, and SPA navigation.
+     *
+     * Without this, a theater or miniplayer toggle was only noticed indirectly —
+     * by the ResizeObserver on the <video>, or by the 500ms fullscreen poll — so
+     * the overlay lagged behind the transition and appeared to cut off. These are
+     * the signals YouTube actually emits when the mode changes.
+     *
+     * @param {HTMLVideoElement} videoEl
+     * @param {Function} callback - receives {reason:"layout", mode}
+     * @returns {Function} cleanup
+     */
+    function watchLayoutMode(videoEl, callback) {
+        const cleanups = [];
+
+        // The observed attributes are noisy — #movie_player's class flips for
+        // things like ytp-autohide every time the mouse idles over the player.
+        // So we don't report every mutation; we derive a mode signature and only
+        // report when THAT changes.
+        let lastMode = _layoutModeSignature(videoEl);
+
+        const check = () => {
+            const mode = _layoutModeSignature(videoEl);
+            if (mode === lastMode) return;
+            lastMode = mode;
+            callback({reason: "layout", mode});
+        };
+
+        // ── ytd-watch-flexy carries the theater/fullscreen flags as attributes ──
+        // These live on the page container, not on the <video>, so nothing else
+        // in the pipeline was observing them — theater toggles were previously
+        // only noticed via the ResizeObserver or the 500ms fullscreen poll.
+        const flexy = document.querySelector("ytd-watch-flexy");
+        if (flexy) {
+            const flexyObserver = new MutationObserver(check);
+            flexyObserver.observe(flexy, {
+                attributes: true,
+                attributeFilter: [
+                    "theater",
+                    "fullscreen",
+                    "is-two-columns_",
+                    "player-fullscreen",
+                    "hidden",
+                ],
+            });
+            cleanups.push(() => flexyObserver.disconnect());
+        }
+
+        // ── #movie_player class flips on miniplayer / fullscreen enter+exit ──
+        const player = videoEl.closest("#movie_player") ||
+            document.querySelector("#movie_player");
+        if (player) {
+            const playerObserver = new MutationObserver(check);
+            playerObserver.observe(player, {
+                attributes: true,
+                attributeFilter: ["class"],
+            });
+            cleanups.push(() => playerObserver.disconnect());
+        }
+
+        // ── SPA navigation ──
+        // Forced (not signature-gated): the whole page layout is rebuilt, so the
+        // rect moves even when the mode name is unchanged.
+        const navHandler = () => {
+            lastMode = _layoutModeSignature(videoEl);
+            callback({reason: "layout", mode: "navigate"});
+        };
+        document.addEventListener("yt-navigate-finish", navHandler);
+        cleanups.push(() => {
+            document.removeEventListener("yt-navigate-finish", navHandler);
+        });
+
+        return () => cleanups.forEach((fn) => fn());
+    }
+
+    /**
+     * A compact string describing the player's current layout mode. Used to tell
+     * a real mode change from incidental class churn on the same elements.
+     *
+     * @param {HTMLVideoElement} videoEl
+     * @returns {string}
+     */
+    function _layoutModeSignature(videoEl) {
+        const flexy = document.querySelector("ytd-watch-flexy");
+        const theater = flexy ? flexy.hasAttribute("theater") : false;
+        const flexyFs = flexy ? flexy.hasAttribute("fullscreen") : false;
+
+        const mini = !!videoEl.closest(
+            ".ytp-miniplayer-ui, .ytp-miniplayer-view, .ytp-miniplayer-scrim"
+        );
+
+        const player = videoEl.closest("#movie_player") ||
+            document.querySelector("#movie_player");
+        const playerFs = player ? player.classList.contains("ytp-fullscreen") : false;
+
+        return `t${+theater}|f${+(flexyFs || playerFs)}|m${+mini}`;
+    }
+
     // ─── Fullscreen Detection Logic ───────────────────────────────────────────
 
     /**
@@ -240,6 +369,8 @@ const Observers = (() => {
         watchScroll,
         watchFullscreen,
         watchPlayback,
+        watchLayoutMode,
+        watchPageVisibility,
         _checkFullscreen,
     };
 })();

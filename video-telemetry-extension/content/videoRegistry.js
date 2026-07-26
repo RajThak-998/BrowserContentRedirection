@@ -80,6 +80,27 @@ class VideoRegistry {
         Emitter.getInstance().emitRemoved(entry.id);
     }
 
+    /**
+     * Unregister a video only if it really left the document.
+     *
+     * Moving a node in the DOM shows up in a MutationObserver as a removal from
+     * the old parent plus an addition to the new one. YouTube does exactly that
+     * when it relocates #movie_player into the miniplayer container, so treating
+     * every removedNode as gone emitted a spurious VIDEO_REMOVED — which the
+     * client turned into a scheduled MSE teardown, destroying the SourceBuffers
+     * and rebuilding the pipeline. That was the "rendering cuts off when
+     * switching to miniplayer" bug.
+     *
+     * MutationObserver callbacks run after all mutations in the task have been
+     * applied, so a relocated element already reports isConnected === true here.
+     *
+     * @param {HTMLVideoElement} videoEl
+     */
+    _unregisterIfDetached(videoEl) {
+        if (videoEl.isConnected) return; // moved, not removed
+        this._unregisterVideo(videoEl);
+    }
+
     _startMutationObserver() {
         this._mutationObserver = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
@@ -115,10 +136,10 @@ class VideoRegistry {
                     if (node.nodeType !== Node.ELEMENT_NODE) return;
 
                     if (node.tagName === "VIDEO") {
-                        this._unregisterVideo(node);
+                        this._unregisterIfDetached(node);
                     }
 
-                    node.querySelectorAll?.("video").forEach((videoEl) => this._unregisterVideo(videoEl));
+                    node.querySelectorAll?.("video").forEach((videoEl) => this._unregisterIfDetached(videoEl));
                 });
             }
         });

@@ -19,31 +19,37 @@ type App struct {
 	ctx        context.Context
 	signalConn net.Conn
 
-	windowMu        sync.Mutex
-	lastWindowApply time.Time
+	// placer owns the overlay window's geometry. Telemetry is fed to it and it
+	// applies the latest rect on its own cadence — see placer.go.
+	placer *placer
 
-	// mseActive is set to true once MSE (YouTube) media chunks start arriving,
-	// and false when the video is removed. It gates window show/hide so that
-	// the WebRTC overlay and the YouTube overlay do not interfere with each other.
-	mseActiveMu sync.Mutex
-	mseActive   bool
-	hideTimer   *time.Timer // debounces overlay HIDE so brief teardown churn doesn't flash the window
+	// Overlay visibility state, all guarded by mseActiveMu.
+	//
+	// The overlay is shown only when BOTH conditions hold:
+	//   mseActive — the frontend is actually rendering frames (canplay fired and
+	//               the pipeline has not been torn down)
+	//   onScreen  — the remote video is really being displayed: the tab is
+	//               visible, the window isn't minimized/occluded, and the player
+	//               hasn't been scrolled out of the viewport
+	// Tracking them separately matters because they change for different reasons
+	// and need different debouncing — see NotifyMSEActive and setOnScreen.
+	mseActiveMu  sync.Mutex
+	mseActive    bool
+	onScreen     bool        // starts false; first VIDEO_UPDATE sets the real value
+	overlayShown bool        // what we last told the window to do
+	hideTimer    *time.Timer // debounces the MSE hide so teardown churn doesn't flash the window
+
+	// lastClip dedupes the video-within-overlay transform sent to the frontend.
+	clipMu   sync.Mutex
+	lastClip engine.Clip
 
 	mediaEngine *engine.Engine
 }
-
-const telemetryWindowThrottle = 33 * time.Millisecond
 
 // overlayHideGrace defers hiding the overlay after MSE goes inactive, so brief
 // teardown→rebuild churn (ad boundaries, hover previews, videoID swaps) doesn't
 // flash the window. A show within this window cancels the pending hide.
 const overlayHideGrace = 2 * time.Second
-
-// minOverlayVisiblePx is the minimum on-screen extent (per axis) a telemetry
-// position must leave visible to be applied. Transient layout jumps report the
-// tracked <video> rect far off-screen (e.g. y=-510); those are ignored so the
-// overlay keeps its last valid position instead of sliding out of view.
-const minOverlayVisiblePx = 60
 
 // NewApp creates a new App application struct
 func NewApp() *App {
@@ -55,7 +61,10 @@ func NewApp() *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 
-	
+	// The window exists by now (Wails creates it before invoking OnStartup), but
+	// the placer resolves its HWND lazily and retries, so ordering is not critical.
+	a.placer = newPlacer()
+	go a.placer.run(ctx)
 
 	a.mediaEngine = engine.New(
 		engine.Config{ListenAddr: ":8081"},
@@ -67,9 +76,13 @@ func (a *App) startup(ctx context.Context) {
 			OnVideoUpdate: func(update engine.VideoUpdate) {
 				b := update.Payload.ScreenBounds
 				a.applyWindowFromTelemetry(b.X, b.Y, b.Width, b.Height)
-				// Window visibility is managed exclusively by NotifyMSEActive() called
-				// from the frontend — not by VDI playback state, which flaps rapidly
-				// during quality switches and causes window oscillation.
+				a.applyClip(update.ClipOrIdentity())
+				// Overlay visibility is driven by MSE liveness (NotifyMSEActive,
+				// from the frontend) combined with whether the remote video is
+				// actually on screen. It is deliberately NOT driven by VDI
+				// playback state, which flaps during quality switches and makes
+				// the window oscillate.
+				a.setOnScreen(update.IsOnScreen())
 			},
 			OnVideoLifecycle: func(evtType string, videoID string) {
 				log.Printf("[bcr_client][video] lifecycle evtType=%s videoId=%s", evtType, videoID)
@@ -213,76 +226,54 @@ func (a *App) HideWindow() {
 	runtime.WindowHide(a.ctx)
 }
 
-// SetWindowPosition moves the frameless window on the desktop
-func (a *App) SetWindowPosition(x int, y int) {
-	runtime.WindowSetPosition(a.ctx, x, y)
-}
-
-// SetWindowSize changes the size of the frameless window
-func (a *App) SetWindowSize(width int, height int) {
-	runtime.WindowSetSize(a.ctx, width, height)
-}
-
-
+// applyWindowFromTelemetry hands the latest video rect to the placer.
+//
+// The incoming values are absolute physical (device) pixels in the desktop's
+// virtual-screen coordinate space, as measured by the extension. Left/Top may be
+// negative when the video sits on a monitor left of / above the primary one.
+//
+// This used to call runtime.WindowSetPosition + runtime.WindowSetSize directly,
+// behind a 33ms leading-edge throttle. Both parts were wrong: Wails' SetPos
+// treats coordinates as relative to the current monitor's work area (so the
+// overlay could never stay on a second monitor), and the throttle discarded the
+// final rect of every burst. See winplace_windows.go and placer.go.
 func (a *App) applyWindowFromTelemetry(x, y, w, h float64) {
-	ix := int(math.Round(x))
-	iy := int(math.Round(y))
-	iw := int(math.Round(w))
-	ih := int(math.Round(h))
-
+	iw := int32(math.Round(w))
+	ih := int32(math.Round(h))
 	if iw < 1 || ih < 1 {
 		return
 	}
 
-	// Ignore near-/fully-off-screen positions (keep the last valid one). During
-	// scroll/layout transitions the tracked <video> rect briefly reports far above
-	// or left of the viewport (seen as y=-510); applying it slides the overlay out
-	// of view and it looks deleted. A real on-screen update follows shortly after.
-	if iy+ih < minOverlayVisiblePx || ix+iw < minOverlayVisiblePx {
-		return
-	}
+	ix := int32(math.Round(x))
+	iy := int32(math.Round(y))
 
-	now := time.Now()
-
-	a.windowMu.Lock()
-	if !a.lastWindowApply.IsZero() && now.Sub(a.lastWindowApply) < telemetryWindowThrottle {
-		a.windowMu.Unlock()
-		return
-	}
-
-	a.lastWindowApply = now
-	a.windowMu.Unlock()
-
-	a.SetWindowPosition(ix, iy)
-	a.SetWindowSize(iw, ih)
-
-	log.Printf("[Telemetry] VIDEO_UPDATE applied pos=(%d, %d) size=(%d, %d)", ix, iy, iw, ih)
+	a.placer.Update(winRect{
+		Left:   ix,
+		Top:    iy,
+		Right:  ix + iw,
+		Bottom: iy + ih,
+	})
 }
 
-// showIfNeeded shows the window and marks MSE as active. Safe to call on every
-// VIDEO_UPDATE with state=playing — it is idempotent.
-func (a *App) showIfNeeded() {
-	a.mseActiveMu.Lock()
-	if !a.mseActive {
-		a.mseActive = true
-		a.mseActiveMu.Unlock()
-		log.Println("[bcr_client][video] MSE active — showing overlay window")
-		runtime.WindowShow(a.ctx)
+// applyClip forwards the video-within-overlay transform to the frontend.
+//
+// When the player is partially scrolled out of the browser viewport the overlay
+// window is clipped to the visible part, so the <video> inside it has to be
+// scaled up and shifted by the clipped-away amount to keep the picture lined up
+// with the real player. Identity (1,1,0,0) for the normal unclipped case.
+//
+// Deduplicated: telemetry arrives ~30/s but the clip only changes while the user
+// is actually scrolling the player off screen.
+func (a *App) applyClip(c engine.Clip) {
+	a.clipMu.Lock()
+	if a.lastClip == c {
+		a.clipMu.Unlock()
 		return
 	}
-	a.mseActiveMu.Unlock()
-}
+	a.lastClip = c
+	a.clipMu.Unlock()
 
-// hideIfMSEMode hides the window only when MSE (YouTube) is the active mode.
-// It does NOT hide during WebRTC sessions, preventing cross-feature interference.
-func (a *App) hideIfMSEMode() {
-	a.mseActiveMu.Lock()
-	defer a.mseActiveMu.Unlock()
-	if a.mseActive {
-		a.mseActive = false
-		log.Println("[bcr_client][video] MSE inactive — hiding overlay window")
-		runtime.WindowHide(a.ctx)
-	}
+	runtime.EventsEmit(a.ctx, "onVideoClip", c.ScaleX, c.ScaleY, c.OffsetX, c.OffsetY)
 }
 
 // NotifyMSEActive is called by the frontend when the MSE pipeline becomes live
@@ -294,45 +285,86 @@ func (a *App) hideIfMSEMode() {
 // swaps) doesn't flash the overlay in and out. A show during the grace cancels the
 // pending hide.
 func (a *App) NotifyMSEActive(active bool) {
-	var doShow bool
-
 	a.mseActiveMu.Lock()
 	if active {
+		// A rebuild within the grace window cancels a pending hide.
 		if a.hideTimer != nil {
 			a.hideTimer.Stop()
 			a.hideTimer = nil
 		}
-		if !a.mseActive {
-			a.mseActive = true
-			doShow = true
-		}
-	} else if a.mseActive && a.hideTimer == nil {
-		// Defer the hide; a rebuild within the grace window cancels it above.
+		a.mseActive = true
+		a.mseActiveMu.Unlock()
+		a.syncOverlayVisibility("mse active")
+		return
+	}
+
+	if a.mseActive && a.hideTimer == nil {
+		// Defer the hide; MSE teardown/rebuild churn is common and transient.
 		a.hideTimer = time.AfterFunc(overlayHideGrace, a.hideOverlayAfterGrace)
 	}
 	a.mseActiveMu.Unlock()
-
-	if doShow {
-		log.Println("[bcr_client][video] MSE active — showing overlay window")
-		runtime.WindowShow(a.ctx)
-	}
 }
 
 // hideOverlayAfterGrace fires when the overlay has been inactive for overlayHideGrace
 // with no rebuild — the video really stopped, so hide the window.
 func (a *App) hideOverlayAfterGrace() {
-	var doHide bool
-
 	a.mseActiveMu.Lock()
 	a.hideTimer = nil
-	if a.mseActive {
-		a.mseActive = false
-		doHide = true
-	}
+	a.mseActive = false
 	a.mseActiveMu.Unlock()
 
-	if doHide {
-		log.Println("[bcr_client][video] MSE inactive (grace elapsed) — hiding overlay window")
-		runtime.WindowHide(a.ctx)
+	a.syncOverlayVisibility("mse inactive (grace elapsed)")
+}
+
+// setOnScreen records whether the remote video is actually being displayed.
+//
+// Unlike the MSE signal this is NOT debounced: it reflects a deliberate user
+// action (minimizing the window, switching tab, scrolling the player out of
+// view), so there is no churn to ride out and any delay just leaves a stale
+// overlay floating over whatever the user switched to.
+func (a *App) setOnScreen(onScreen bool) {
+	a.mseActiveMu.Lock()
+	if a.onScreen == onScreen {
+		a.mseActiveMu.Unlock()
+		return
 	}
+	a.onScreen = onScreen
+	a.mseActiveMu.Unlock()
+
+	if onScreen {
+		a.syncOverlayVisibility("video back on screen")
+	} else {
+		a.syncOverlayVisibility("video off screen")
+	}
+}
+
+// syncOverlayVisibility drives the window to match the desired state:
+// visible only when MSE is producing frames AND the remote video is on screen.
+func (a *App) syncOverlayVisibility(reason string) {
+	a.mseActiveMu.Lock()
+	want := a.mseActive && a.onScreen
+	if want == a.overlayShown {
+		a.mseActiveMu.Unlock()
+		return
+	}
+	a.overlayShown = want
+	a.mseActiveMu.Unlock()
+
+	if want {
+		log.Printf("[bcr_client][video] showing overlay window (%s)", reason)
+		// Place the window before revealing it, so it never flashes at the
+		// position it happened to be left at when it was last hidden.
+		if r, ok := a.placer.Pending(); ok {
+			if hwnd, found := a.placer.resolveHWND(); found {
+				_ = applyRectPhysical(hwnd, r)
+			}
+		}
+		a.placer.SetVisible(true)
+		runtime.WindowShow(a.ctx)
+		return
+	}
+
+	log.Printf("[bcr_client][video] hiding overlay window (%s)", reason)
+	a.placer.SetVisible(false)
+	runtime.WindowHide(a.ctx)
 }

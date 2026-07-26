@@ -13,8 +13,4 @@ export function SendSdpAnswer(arg1:string):Promise<void>;
 
 export function SetLoopbackAnswer(arg1:string,arg2:string):Promise<void>;
 
-export function SetWindowPosition(arg1:number,arg2:number):Promise<void>;
-
-export function SetWindowSize(arg1:number,arg2:number):Promise<void>;
-
 export function ShowWindow():Promise<void>;

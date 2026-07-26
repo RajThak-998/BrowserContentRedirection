@@ -78,9 +78,14 @@ func handleExtensionIngressLoop(conn *Connection, registry *Registry) {
 	highPriorityCh := make(chan extensionIngressMessage, highPriorityQueueSize)
 	lowPriorityCh := make(chan extensionIngressMessage, lowPriorityQueueSize)
 	mediaCh := make(chan extensionIngressMessage, mediaQueueSize)
+	// Overlay geometry is state, not events — only the newest rect matters, so
+	// this lane holds exactly one and replaces it rather than queueing. That
+	// keeps the overlay tracking under media load, where VIDEO_UPDATE used to
+	// share (and get dropped from) the low-priority queue.
+	geometryCh := make(chan extensionIngressMessage, 1)
 
 	var workers sync.WaitGroup
-	workers.Add(3)
+	workers.Add(4)
 
 	go func() {
 		defer workers.Done()
@@ -101,6 +106,14 @@ func handleExtensionIngressLoop(conn *Connection, registry *Registry) {
 	go func() {
 		defer workers.Done()
 		for msg := range mediaCh {
+			handleExtensionMessage(msg.msgType, msg.data, registry)
+		}
+	}()
+
+	// Dedicated geometry worker, for the same reason.
+	go func() {
+		defer workers.Done()
+		for msg := range geometryCh {
 			handleExtensionMessage(msg.msgType, msg.data, registry)
 		}
 	}()
@@ -136,6 +149,23 @@ func handleExtensionIngressLoop(conn *Connection, registry *Registry) {
 				continue
 			}
 
+			if isVideoUpdatePacket(data) {
+				// Replace-on-full: the newest rect supersedes any unread one.
+				for {
+					select {
+					case geometryCh <- msg:
+					default:
+						select {
+						case <-geometryCh:
+						default:
+						}
+						continue
+					}
+					break
+				}
+				continue
+			}
+
 			select {
 			case lowPriorityCh <- msg:
 			default:
@@ -159,6 +189,7 @@ func handleExtensionIngressLoop(conn *Connection, registry *Registry) {
 	close(highPriorityCh)
 	close(lowPriorityCh)
 	close(mediaCh)
+	close(geometryCh)
 	workers.Wait()
 }
 
@@ -478,6 +509,12 @@ type bridgeForwarder struct {
 	startOnce   sync.Once
 	sendCh      chan bridgeMessage // signaling / telemetry (text)
 	mediaSendCh chan bridgeMessage // dedicated media egress (binary) — never shares with signaling
+	// geometryCh carries VIDEO_UPDATE only, with replace-on-full semantics.
+	// Overlay geometry is state, not an event stream: only the newest rect
+	// matters, so a "drop" here means a superseded value, never lost
+	// information. That is what makes it safe to give geometry its own
+	// non-starved lane in the write loop — see offerGeometry().
+	geometryCh chan bridgeMessage
 }
 
 var mediaBridge = newBridgeForwarder()
@@ -486,6 +523,26 @@ func newBridgeForwarder() *bridgeForwarder {
 	return &bridgeForwarder{
 		sendCh:      make(chan bridgeMessage, bridgeControlQueue),
 		mediaSendCh: make(chan bridgeMessage, bridgeMediaQueue),
+		geometryCh:  make(chan bridgeMessage, 1),
+	}
+}
+
+// offerGeometry queues the newest geometry packet, replacing any older one that
+// has not been written yet. Never blocks, never leaves a stale rect ahead of a
+// fresh one in the queue.
+func (b *bridgeForwarder) offerGeometry(msg bridgeMessage) {
+	for {
+		select {
+		case b.geometryCh <- msg:
+			return
+		default:
+		}
+		// Full: discard the superseded packet and retry. The retry loop handles
+		// the (benign) race where the writer drains between the two operations.
+		select {
+		case <-b.geometryCh:
+		default:
+		}
 	}
 }
 
@@ -626,7 +683,22 @@ func (b *bridgeForwarder) runBridgeLoop() {
 			}
 
 			for {
-				// Priority: drain all pending media before checking signaling.
+				// Geometry first. It is at most one small packet (~300 bytes)
+				// and it is what keeps the overlay glued to the video, so it
+				// must not queue behind a burst of media segments. Previously
+				// this loop drained ALL pending media before looking at the
+				// text channel, which meant that under MSE load the overlay
+				// froze at its last position while media flowed fine.
+				select {
+				case msg := <-b.geometryCh:
+					if !writeMsg(msg) {
+						return
+					}
+					continue
+				default:
+				}
+
+				// Then drain pending media before other signaling.
 				select {
 				case msg := <-b.mediaSendCh:
 					if !writeMsg(msg) {
@@ -636,8 +708,12 @@ func (b *bridgeForwarder) runBridgeLoop() {
 				default:
 				}
 
-				// No pending media — wait for either channel or stop.
+				// Nothing pending — wait for any channel or stop.
 				select {
+				case msg := <-b.geometryCh:
+					if !writeMsg(msg) {
+						return
+					}
 				case msg := <-b.mediaSendCh:
 					if !writeMsg(msg) {
 						return
@@ -694,6 +770,18 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 		packetType == PacketTypeRTCShadowPreWarm
 	// Video lifecycle events forwarded so bcr_client can manage overlay window.
 	isVideoLifecycle := packetType == "VIDEO_ADDED" || packetType == "VIDEO_REMOVED"
+
+	// Overlay geometry gets its own coalescing lane so it is never starved by
+	// media and never hits the control-queue watermark drop below.
+	if packetType == "VIDEO_UPDATE" {
+		b.offerGeometry(bridgeMessage{
+			msgType:    1,
+			data:       append([]byte(nil), data...),
+			packetType: packetType,
+			bridgeID:   bridgeID,
+		})
+		return
+	}
 
 	if len(b.sendCh) > (bridgeControlQueue*3)/4 {
 		if isShadow {

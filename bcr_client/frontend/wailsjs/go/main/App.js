@@ -26,14 +26,6 @@ export function SetLoopbackAnswer(arg1, arg2) {
   return window['go']['main']['App']['SetLoopbackAnswer'](arg1, arg2);
 }
 
-export function SetWindowPosition(arg1, arg2) {
-  return window['go']['main']['App']['SetWindowPosition'](arg1, arg2);
-}
-
-export function SetWindowSize(arg1, arg2) {
-  return window['go']['main']['App']['SetWindowSize'](arg1, arg2);
-}
-
 export function ShowWindow() {
   return window['go']['main']['App']['ShowWindow']();
 }

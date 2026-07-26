@@ -14,11 +14,23 @@
             height: 100vh;
             background-color: black;
             overflow: hidden;
-            /* Prevent scrolling */
+            /* Clips the video when the overlay is cropped to the viewport */
         }
 
-        /* Make the video fill the entire screen structure */
+        body {
+            position: relative;
+            /* Containing block for the absolutely-positioned video */
+        }
+
+        /* Make the video fill the entire screen structure.
+           When the overlay window is clipped (player partially scrolled out of
+           view in the VDI), main.js overrides width/height/left/top with
+           percentages so the picture stays aligned — see the onVideoClip
+           handler. Hence position:absolute rather than static. */
         video {
+            position: absolute;
+            left: 0;
+            top: 0;
             width: 100%;
             height: 100%;
             object-fit: cover;
