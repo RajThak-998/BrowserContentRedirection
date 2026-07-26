@@ -599,6 +599,20 @@ window.onload = function () {
     let stallWatchdogTimer = null;
     let onWaitingHandler = null;
     let lastPlayheadTime = -1;
+
+    // Wall-clock of the last media chunk received, for the starvation watchdog in
+    // the 1Hz reporting loop below. 0 = nothing received yet.
+    let lastChunkAt = 0;
+
+    // How long the pipeline may sit with an exhausted buffer and no incoming
+    // chunks before we conclude the source is dead.
+    //
+    // This must tolerate normal pulse-decode gaps: the interceptor tops the
+    // buffer up to HIGH_WATER_S (90s) and does not pulse again until it drops
+    // below SEEK_LEAD_S (60s), so ~30s of playback with zero chunks is expected.
+    // That is why the check also requires the buffer to be EXHAUSTED — during a
+    // normal gap there are tens of seconds buffered, so it cannot false-fire.
+    const MEDIA_STARVATION_MS = 8000;
     let lastPlayheadCheck = 0;
 
     /**
@@ -699,6 +713,7 @@ window.onload = function () {
         // it. If this chunk belongs to a genuinely different video, the videoID
         // change check below tears the stale session down explicitly instead.
         cancelScheduledTeardown("media still flowing");
+        lastChunkAt = performance.now();
 
         // If the video ID changes, tear down the stale session to prevent QuotaExceededError
         if ((mediaSources.video || mediaSources.audio) && videoID && videoID !== 'unknown' && activeVideoID && activeVideoID !== 'unknown' && videoID !== activeVideoID) {
@@ -809,6 +824,16 @@ window.onload = function () {
             cancelScheduledTeardown("VIDEO_ADDED");
             return;
         }
+        if (evtType === "VIDEO_SOURCE_GONE") {
+            // The tab is closed or has navigated away — nothing will ever feed
+            // this pipeline again. Unlike VIDEO_REMOVED (which fires spuriously
+            // at ad boundaries and DOM reshuffles) this is definitive, so tear
+            // down immediately instead of through the debounce.
+            logTerminal(`[Video] source gone (${videoID}) — tearing down immediately`);
+            teardownMSE();
+            return;
+        }
+
         if (evtType === "VIDEO_REMOVED" && (!activeVideoID || videoID === activeVideoID)) {
             // Teardown ONLY if the active main video is removed, or if no active video was set yet.
             // This prevents hover/preview videos from tearing down the active main session.
@@ -987,6 +1012,29 @@ window.onload = function () {
 
             if (window.go && window.go.main && window.go.main.App && window.go.main.App.ReportPlayback) {
                 window.go.main.App.ReportPlayback(contiguousEnd, playhead).catch(() => {});
+            }
+
+            // ── Starvation watchdog ────────────────────────────────────────
+            // Backstop for a source that dies without any clean signal: the VDI
+            // browser crashing, the extension being unloaded, or the bridge
+            // dropping. In those cases we play out whatever is buffered and then
+            // sit frozen forever, holding a stale overlay over the session.
+            //
+            // Requires BOTH an exhausted buffer and no recent chunks, so normal
+            // pulse-decode gaps (which leave tens of seconds buffered) cannot
+            // trigger it. Also covers reaching the natural end of the video.
+            if (lastChunkAt > 0 &&
+                (contiguousEnd - playhead) < 0.5 &&
+                (performance.now() - lastChunkAt) > MEDIA_STARVATION_MS) {
+                logTerminal(
+                    `[MSE] media starved — buffer exhausted at ${playhead.toFixed(2)}s and ` +
+                    `no chunks for ${Math.round((performance.now() - lastChunkAt) / 1000)}s; tearing down`
+                );
+                lastChunkAt = 0; // don't re-fire while teardown runs
+                teardownMSE();
+                if (window.go && window.go.main && window.go.main.App && window.go.main.App.NotifyMediaStarved) {
+                    window.go.main.App.NotifyMediaStarved().catch(() => {});
+                }
             }
         } catch (_) {}
     }, 1000);

@@ -10,6 +10,10 @@ export function NotifyMSEActive(arg1) {
   return window['go']['main']['App']['NotifyMSEActive'](arg1);
 }
 
+export function NotifyMediaStarved() {
+  return window['go']['main']['App']['NotifyMediaStarved']();
+}
+
 export function ReportPlayback(arg1, arg2) {
   return window['go']['main']['App']['ReportPlayback'](arg1, arg2);
 }

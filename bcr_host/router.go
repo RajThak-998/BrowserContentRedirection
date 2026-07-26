@@ -319,7 +319,10 @@ func isVideoLifecyclePacket(data []byte) bool {
 	if err := json.Unmarshal(data, &pkt); err != nil {
 		return false
 	}
-	return pkt.Type == "VIDEO_ADDED" || pkt.Type == "VIDEO_REMOVED"
+	// VIDEO_SOURCE_GONE reports the media tab closing or navigating away. Like
+	// the other lifecycle events it must survive backpressure, since dropping it
+	// leaves the client's overlay up with no source feeding it.
+	return pkt.Type == "VIDEO_ADDED" || pkt.Type == "VIDEO_REMOVED" || pkt.Type == "VIDEO_SOURCE_GONE"
 }
 
 func isYTDiagPacket(data []byte) bool {
@@ -825,7 +828,8 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 		packetType == PacketTypeRTCShadowIceServers ||
 		packetType == PacketTypeRTCShadowPreWarm
 	// Video lifecycle events forwarded so bcr_client can manage overlay window.
-	isVideoLifecycle := packetType == "VIDEO_ADDED" || packetType == "VIDEO_REMOVED"
+	isVideoLifecycle := packetType == "VIDEO_ADDED" || packetType == "VIDEO_REMOVED" ||
+		packetType == "VIDEO_SOURCE_GONE"
 
 	// Overlay geometry gets its own coalescing lane so it is never starved by
 	// media and never hits the control-queue watermark drop below.

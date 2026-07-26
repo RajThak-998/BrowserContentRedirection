@@ -87,6 +87,14 @@ func (a *App) startup(ctx context.Context) {
 			OnVideoLifecycle: func(evtType string, videoID string) {
 				log.Printf("[bcr_client][video] lifecycle evtType=%s videoId=%s", evtType, videoID)
 				runtime.EventsEmit(a.ctx, "onVideoLifecycle", evtType, videoID)
+
+				// VIDEO_SOURCE_GONE means the tab is closed or navigated away —
+				// definitive, unlike VIDEO_REMOVED. Hide now rather than waiting
+				// out overlayHideGrace, and don't let a pending grace timer
+				// resurrect the state afterwards.
+				if evtType == "VIDEO_SOURCE_GONE" {
+					a.forceOverlayHidden("media source gone")
+				}
 				// NOTE: window visibility is intentionally NOT hidden here.
 				// A VIDEO_REMOVED fires for hover-preview thumbnails and for the
 				// brief element swap YouTube does at ad boundaries — hiding on it
@@ -314,6 +322,30 @@ func (a *App) hideOverlayAfterGrace() {
 	a.mseActiveMu.Unlock()
 
 	a.syncOverlayVisibility("mse inactive (grace elapsed)")
+}
+
+// NotifyMediaStarved is called by the frontend when the MSE pipeline has run out
+// of buffer with no new chunks arriving — the source stopped feeding without a
+// clean signal (VDI browser crash, extension unloaded, bridge dropped). Hides the
+// overlay immediately instead of waiting out overlayHideGrace, since the frontend
+// already spent MEDIA_STARVATION_MS confirming it.
+func (a *App) NotifyMediaStarved() {
+	a.forceOverlayHidden("media starved — source stopped feeding")
+}
+
+// forceOverlayHidden hides the overlay right away and cancels any pending
+// grace-period hide, for events that are definitive rather than transient (the
+// media tab closing, navigating away, or the media stream drying up).
+func (a *App) forceOverlayHidden(reason string) {
+	a.mseActiveMu.Lock()
+	if a.hideTimer != nil {
+		a.hideTimer.Stop()
+		a.hideTimer = nil
+	}
+	a.mseActive = false
+	a.mseActiveMu.Unlock()
+
+	a.syncOverlayVisibility(reason)
 }
 
 // setOnScreen records whether the remote video is actually being displayed.

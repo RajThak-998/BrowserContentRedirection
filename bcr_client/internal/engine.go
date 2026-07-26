@@ -260,7 +260,7 @@ func (e *Engine) handleVideoLifecycle(message []byte) bool {
 	if err := json.Unmarshal(message, &evt); err != nil {
 		return false
 	}
-	if evt.Type != "VIDEO_ADDED" && evt.Type != "VIDEO_REMOVED" {
+	if evt.Type != "VIDEO_ADDED" && evt.Type != "VIDEO_REMOVED" && evt.Type != "VIDEO_SOURCE_GONE" {
 		return false
 	}
 	if e.cb.OnVideoLifecycle != nil {

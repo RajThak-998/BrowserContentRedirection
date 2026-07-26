@@ -28,7 +28,15 @@ class VideoRegistry {
             this._mutationObserver = null;
         }
 
-        this._registry.forEach(({tracker}) => tracker.destroy());
+        // Go through _unregisterVideo so VIDEO_REMOVED is actually emitted.
+        // Destroying the trackers directly (as this used to do) tore everything
+        // down silently, so closing the tab never told the client the source was
+        // gone — the overlay kept playing out its buffer and then hung.
+        //
+        // Snapshot the keys first: _unregisterVideo mutates this._registry.
+        for (const videoEl of Array.from(this._registry.keys())) {
+            this._unregisterVideo(videoEl);
+        }
         this._registry.clear();
     }
 

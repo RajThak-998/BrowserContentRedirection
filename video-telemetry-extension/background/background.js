@@ -49,6 +49,54 @@ let _mediaTabRoute = null;
 // the video normally inside the VDI.
 let _clientConnected = null;
 
+// Last videoId seen on a media chunk from _mediaTabRoute, so VIDEO_SOURCE_GONE
+// can name the session that just died.
+let _mediaTabVideoId = null;
+
+// ─── Media source disappearance ─────────────────────────────────────────────
+// Detected here in the service worker rather than in the page, because the page
+// cannot reliably report its own death: chrome.runtime messages sent during
+// pagehide are frequently dropped as the frame is torn down. Without this, the
+// client kept the overlay up and played out its remaining buffer, then hung.
+//
+// VIDEO_SOURCE_GONE is deliberately distinct from VIDEO_REMOVED: the latter is
+// debounced downstream (ad breaks and DOM reshuffles produce false ones), while
+// this is definitive and must tear down immediately.
+function _notifySourceGone(reason) {
+    if (!_mediaTabRoute) return;
+
+    const videoId = _mediaTabVideoId ?? "unknown";
+    _mediaTabRoute = null;
+    _mediaTabVideoId = null;
+
+    console.log(`[Background] media source gone (${reason}) — notifying client`);
+    try {
+        Transport.getInstance().send({
+            type: "VIDEO_SOURCE_GONE",
+            payload: {id: videoId, reason, timestamp: Date.now()},
+        });
+    } catch (err) {
+        console.error("[Background] Failed to send VIDEO_SOURCE_GONE:", err);
+    }
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+    if (_mediaTabRoute && _mediaTabRoute.tabId === tabId) {
+        _notifySourceGone("tab closed");
+    }
+});
+
+// Navigating the media tab away from YouTube (including to about:blank) also ends
+// the session. A same-site navigation to another video is left alone — the normal
+// videoId-change path in the client handles that.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (!_mediaTabRoute || _mediaTabRoute.tabId !== tabId) return;
+    if (typeof changeInfo.url !== "string") return;
+    if (!changeInfo.url.includes("youtube.com")) {
+        _notifySourceGone("navigated away from YouTube");
+    }
+});
+
 function _setClientConnected(connected) {
     if (_clientConnected === connected) return;
     _clientConnected = connected;
@@ -632,9 +680,14 @@ function _handleMediaChunk(message, sender, sendResponse) {
     }
 
     // Remember which tab/frame is the YouTube source so downstream YT_PLAYBACK
-    // (buffer state from bcr_client) can be routed back to it.
+    // (buffer state from bcr_client) can be routed back to it, and so tab
+    // close/navigation can be detected (see _notifySourceGone).
     if (sender.tab && typeof sender.tab.id === "number") {
         _mediaTabRoute = { tabId: sender.tab.id, frameId: sender.frameId ?? 0 };
+        const vid = message.payload?.videoId;
+        if (typeof vid === "string" && vid.length > 0) {
+            _mediaTabVideoId = vid;
+        }
     }
 
     const normalized = _normalizeMediaPayload(message.payload);

@@ -5,6 +5,8 @@ export function HideWindow():Promise<void>;
 
 export function NotifyMSEActive(arg1:boolean):Promise<void>;
 
+export function NotifyMediaStarved():Promise<void>;
+
 export function ReportPlayback(arg1:number,arg2:number):Promise<void>;
 
 export function RequestLoopbackOffer():Promise<void>;
