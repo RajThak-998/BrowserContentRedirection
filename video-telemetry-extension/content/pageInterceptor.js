@@ -1563,7 +1563,35 @@
         return line.replace(/(\braddr\s+)[^\s]+(\s+rport\b)/, '$10.0.0.0$2');
     }
 
-    function dispatchShadowTrickleCandidates(pc, candidates) {
+    // Dispatches the synthetic end-of-candidates (null) event that tells Teams
+    // ICE gathering has finished. Kept separate because it must be sendable on
+    // its own — bcr_client signals it independently of any candidate, once
+    // gathering completes or its deadline elapses.
+    function dispatchEndOfCandidates(pc) {
+        queueMicrotask(() => {
+            try {
+                let nullEvent;
+                if (typeof window.RTCPeerConnectionIceEvent === 'function') {
+                    nullEvent = new window.RTCPeerConnectionIceEvent('icecandidate', { candidate: null });
+                } else {
+                    nullEvent = new Event('icecandidate');
+                    nullEvent.candidate = null;
+                }
+                pc.dispatchEvent(nullEvent);
+                BCR_LOG('[BCR] Dispatched end-of-candidates (gathering complete)');
+            } catch (e) {
+                BCR_LOG('[BCR] end-of-candidates dispatch failed:', e);
+            }
+        });
+    }
+
+    // endOfCandidates must only be true when bcr_client has confirmed gathering
+    // is finished. It used to be signalled after EVERY batch, which was harmless
+    // while all candidates were sent as one batch — but now the srflx is sent as
+    // soon as it is gathered and the rest trickle behind it, so signalling early
+    // would tell Teams gathering was over while candidates were still coming,
+    // and anything trickled afterwards could legitimately be ignored.
+    function dispatchShadowTrickleCandidates(pc, candidates, endOfCandidates = false) {
         let candidateLines = [];
         if (Array.isArray(candidates)) {
             candidateLines = candidates.filter(line => {
@@ -1609,6 +1637,11 @@
                 'shadow candidates were dropped by candidate filters.',
                 'Teams will have no ICE candidates. Waiting for srflx/relay...',
                 'Raw dropped candidates:', candidates);
+            // Still close gathering if this was the final batch, otherwise Teams
+            // would wait on an end-of-candidates event that never arrives.
+            if (endOfCandidates) {
+                dispatchEndOfCandidates(pc);
+            }
             return; // nothing to trickle yet — srflx/relay may arrive later
         }
 
@@ -1654,22 +1687,13 @@
             });
         });
 
-        // Finally dispatch end-of-candidates
-        queueMicrotask(() => {
-            try {
-                let nullEvent;
-                if (typeof window.RTCPeerConnectionIceEvent === 'function') {
-                    nullEvent = new window.RTCPeerConnectionIceEvent('icecandidate', { candidate: null });
-                } else {
-                    nullEvent = new Event('icecandidate');
-                    nullEvent.candidate = null;
-                }
-                pc.dispatchEvent(nullEvent);
-                BCR_LOG('[BCR] Synthetic ICE Trickle complete, dispatched', candidateLines.length, 'candidates');
-            } catch (e) {
-                BCR_LOG('[BCR] Synthetic ICE Trickle end dispatch failed:', e);
-            }
-        });
+        // Close gathering only when bcr_client says there is nothing left to come.
+        if (endOfCandidates) {
+            dispatchEndOfCandidates(pc);
+        } else {
+            BCR_LOG('[BCR] Synthetic ICE Trickle dispatched', candidateLines.length,
+                'candidates; gathering still open, awaiting more');
+        }
     }
 
     // ── SDP Codec Pinning ──────────────────────────────────────────────────────
@@ -2075,11 +2099,29 @@
             const payload = data.payload;
             const bridgeId = payload?.bridgeId;
             const candidateStr = payload?.candidate;
-            if (typeof bridgeId === 'string' && typeof candidateStr === 'string' && candidateStr.length > 0) {
+            const isEndOfCandidates = payload?.endOfCandidates === true;
+
+            if (typeof bridgeId !== 'string' || bridgeId.length === 0) {
+                return;
+            }
+
+            // End-of-candidates arrives as its own message with no candidate.
+            if (isEndOfCandidates) {
+                const pc = rtcPcByBridgeId.get(bridgeId);
+                if (pc) {
+                    BCR_LOG('[BCR] End-of-candidates received bridgeId=', bridgeId);
+                    dispatchEndOfCandidates(pc);
+                } else {
+                    BCR_LOG('[BCR] End-of-candidates dropped — no PC for bridgeId=', bridgeId);
+                }
+                return;
+            }
+
+            if (typeof candidateStr === 'string' && candidateStr.length > 0) {
                 const pc = rtcPcByBridgeId.get(bridgeId);
                 if (pc) {
                     BCR_LOG('[BCR] Late ICE candidate received, trickle bridgeId=', bridgeId);
-                    dispatchShadowTrickleCandidates(pc, [candidateStr]);
+                    dispatchShadowTrickleCandidates(pc, [candidateStr], false);
                 } else {
                     BCR_LOG('[BCR] Late ICE candidate dropped — no PC for bridgeId=', bridgeId);
                 }
@@ -2449,7 +2491,14 @@
                     const genId = shadowReady.generatedAt || shadowReady.iceUfrag;
                     if (currentEntry.lastDispatchedTrickleId !== genId) {
                         currentEntry.lastDispatchedTrickleId = genId;
-                        dispatchShadowTrickleCandidates(pc, shadowReady.candidates);
+                        // Only close gathering here if bcr_client had already
+                        // finished it; otherwise it sends an explicit
+                        // end-of-candidates once it does.
+                        dispatchShadowTrickleCandidates(
+                            pc,
+                            shadowReady.candidates,
+                            shadowReady.gatheringComplete === true,
+                        );
                     }
                 }, 1500);
             }

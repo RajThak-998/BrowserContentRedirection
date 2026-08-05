@@ -28,8 +28,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -330,6 +332,14 @@ type rawShadowSession struct {
 	onLateCandidate func(candidate string)
 	readySentCount  int // number of candidates included in SHADOW_READY
 
+	// onGatheringComplete is called once, when no further candidates will be
+	// trickled. The extension turns this into the end-of-candidates event that
+	// tells Teams gathering is finished. Teams' JS may hold the offer until it
+	// sees that event, so this MUST fire even if gathering never completes —
+	// watchGatheringComplete enforces a deadline for exactly that reason.
+	onGatheringComplete func()
+	gatheringDoneOnce   sync.Once
+
 	// localCredentials stores the generated ICE/DTLS transport credentials.
 	// Used to respond to renegotiation SHADOW_LOCAL events.
 	localCredentials *RTCShadowReadyPayload
@@ -481,10 +491,15 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 
 	// ── Step 4: Create ICE agent ──────────────────────────────────────────────
 	gatherDone := make(chan struct{})
+	// srflxReady closes as soon as the first server-reflexive candidate is in
+	// the candidate list. That candidate is the only one the SFU can reach, so
+	// it is the real signal that the offer is ready to send — see Step 8.
+	srflxReady := make(chan struct{})
 	var (
 		candidateMu sync.Mutex
 		candidates  []string
 		seenSrflx   = make(map[string]bool) // dedupe srflx by mapped public IP
+		srflxOnce   sync.Once
 	)
 
 	agentConfig := &ice.AgentConfig{
@@ -534,6 +549,15 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 			}
 			return
 		}
+		// Link-local (APIPA, 169.254.0.0/16) addresses are not routable off the
+		// machine. In the VDI the 169.254.x host candidate produced nothing but
+		// "wsasendto: unreachable network" errors on every connectivity check,
+		// so it only lengthens ICE checking and bloats the offer.
+		if isLinkLocalCandidate(c.Address()) {
+			s.logf("[raw][%s] skipping link-local candidate: %s", s.bridgeID, "a=candidate:"+c.Marshal())
+			return
+		}
+
 		// Dedupe srflx candidates by mapped public IP. Pointing at multiple public
 		// STUN servers (Google/Cloudflare/Twilio) yields several srflx entries with
 		// the SAME public IP but different ports — redundant. Keeping one per IP
@@ -562,6 +586,12 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 		candidateMu.Unlock()
 		s.logf("[raw][%s] gathered: %s", s.bridgeID, line)
 
+		// Signal only after the candidate is in the slice, so a waiter woken by
+		// this always finds the srflx present in the payload it builds.
+		if c.Type() == ice.CandidateTypeServerReflexive {
+			srflxOnce.Do(func() { close(srflxReady) })
+		}
+
 		// Trickle late candidates — those arriving after SHADOW_READY was sent.
 		s.mu.Lock()
 		cb := s.onLateCandidate
@@ -589,20 +619,45 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	}
 	s.logf("[raw][%s] local ufrag=%s sdpType=%s", s.bridgeID, ufrag, sdpType)
 
-	// ── Step 8: Wait (bounded) for ICE gathering to include the srflx ─────────
+	// ── Step 8: Wait (bounded) for the first server-reflexive candidate ───────
 	// bcr_client's host candidates are its local LAN and are UNREACHABLE from the
 	// SFU. Its only routable candidate is the srflx (its public IP), which the SFU
 	// pairs with its own relay (proven working: local=<srflx> remote=<SFU relay>).
-	// The srflx takes ~1s to gather via STUN, so we must NOT return host-only —
-	// wait for gathering to finish (bounded) so the srflx is present in
-	// SHADOW_READY.Candidates and gets inlined into the offer the SFU receives.
-	// Anything still arriving after this is trickled via onLateCandidate.
-	gatherCtx, gatherCancel := context.WithTimeout(ctx, 4*time.Second)
-	select {
-	case <-gatherDone:
-		s.logf("[raw][%s] ICE gathering complete", s.bridgeID)
-	case <-gatherCtx.Done():
-		s.logf("[raw][%s] ICE gather wait timed out — continuing with %d candidate(s)", s.bridgeID, len(candidates))
+	// So the offer MUST carry the srflx — but it need not carry anything else.
+	//
+	// Waiting for gathering to *complete* means waiting on every configured STUN
+	// server, including any the network blackholes. In the VDI that cost a fixed
+	// ~4s on every call (gathering never completed because stun.l.google.com was
+	// unreachable) even though the srflx was in hand after 19ms. That stall sits
+	// directly in the Teams offer path and is a prime suspect for the cpconv
+	// resets, so we leave as soon as the srflx arrives and let the rest trickle
+	// via onLateCandidate.
+	//
+	// BCR_GATHER_MODE=complete restores the old wait-for-completion behaviour.
+	waitBudget := gatherWaitBudget()
+	gatherStart := time.Now()
+	gatherCtx, gatherCancel := context.WithTimeout(ctx, waitBudget)
+
+	if gatherWaitForComplete() {
+		select {
+		case <-gatherDone:
+			s.logf("[raw][%s] ICE gathering complete after %v", s.bridgeID, time.Since(gatherStart).Round(time.Millisecond))
+		case <-gatherCtx.Done():
+			s.logf("[raw][%s] ICE gather wait timed out after %v — continuing with %d candidate(s)",
+				s.bridgeID, time.Since(gatherStart).Round(time.Millisecond), countCandidates(&candidateMu, &candidates))
+		}
+	} else {
+		select {
+		case <-srflxReady:
+			s.logf("[raw][%s] srflx gathered after %v — sending offer now, later candidates will trickle",
+				s.bridgeID, time.Since(gatherStart).Round(time.Millisecond))
+		case <-gatherDone:
+			s.logf("[raw][%s] ICE gathering complete after %v with no srflx — continuing with %d candidate(s)",
+				s.bridgeID, time.Since(gatherStart).Round(time.Millisecond), countCandidates(&candidateMu, &candidates))
+		case <-gatherCtx.Done():
+			s.logf("[raw][%s] gather budget %v elapsed with no srflx — continuing with %d candidate(s); the SFU may have no reachable path",
+				s.bridgeID, waitBudget, countCandidates(&candidateMu, &candidates))
+		}
 	}
 	gatherCancel()
 
@@ -610,21 +665,36 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	candsCopy := append([]string(nil), candidates...)
 	candidateMu.Unlock()
 
+	// Did gathering already finish? If so the JS can signal end-of-candidates
+	// straight away; if not, it must wait for our RTC_SHADOW_ICE_CANDIDATE with
+	// endOfCandidates set, which watchGatheringComplete guarantees will arrive.
+	gatheringComplete := false
+	select {
+	case <-gatherDone:
+		gatheringComplete = true
+	default:
+	}
+
 	s.mu.Lock()
 	s.state = stateReady
 	s.readySentCount = len(candsCopy) // candidates after this index are "late"
 	s.mu.Unlock()
 
+	if !gatheringComplete {
+		go s.watchGatheringComplete(gatherDone)
+	}
+
 	ready := &RTCShadowReadyPayload{
-		BridgeID:        s.bridgeID,
-		SDPType:         sdpType,
-		ICEUfrag:        ufrag,
-		ICEPwd:          pwd,
-		DTLSFingerprint: "sha-256 " + fingerprint,
-		LocalIP:         "0.0.0.0",
-		Candidates:      candsCopy,
-		GeneratedAt:     time.Now().UnixMilli(),
-		ExpiresAt:       time.Now().Add(60 * time.Second).UnixMilli(),
+		BridgeID:          s.bridgeID,
+		SDPType:           sdpType,
+		ICEUfrag:          ufrag,
+		ICEPwd:            pwd,
+		DTLSFingerprint:   "sha-256 " + fingerprint,
+		LocalIP:           "0.0.0.0",
+		Candidates:        candsCopy,
+		GatheringComplete: gatheringComplete,
+		GeneratedAt:       time.Now().UnixMilli(),
+		ExpiresAt:         time.Now().Add(60 * time.Second).UnixMilli(),
 	}
 
 	s.mu.Lock()
@@ -632,6 +702,41 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	s.mu.Unlock()
 
 	return ready, nil
+}
+
+// endOfCandidatesDeadline bounds how long we let ICE gathering stay open before
+// telling the JS that no more candidates are coming. Teams' JS may withhold the
+// offer until it sees end-of-candidates, so this must never be open-ended — a
+// blackholed STUN server would otherwise stall the call indefinitely.
+const endOfCandidatesDeadline = 5 * time.Second
+
+// watchGatheringComplete fires onGatheringComplete when ICE gathering finishes,
+// or when endOfCandidatesDeadline elapses — whichever comes first.
+func (s *rawShadowSession) watchGatheringComplete(gatherDone <-chan struct{}) {
+	timer := time.NewTimer(endOfCandidatesDeadline)
+	defer timer.Stop()
+
+	select {
+	case <-gatherDone:
+		s.logf("[raw][%s] ICE gathering complete — signalling end-of-candidates", s.bridgeID)
+	case <-timer.C:
+		s.logf("[raw][%s] ICE gathering still open after %v — signalling end-of-candidates anyway so Teams does not wait on it",
+			s.bridgeID, endOfCandidatesDeadline)
+	}
+
+	s.signalGatheringComplete()
+}
+
+// signalGatheringComplete invokes onGatheringComplete at most once per session.
+func (s *rawShadowSession) signalGatheringComplete() {
+	s.mu.Lock()
+	cb := s.onGatheringComplete
+	s.mu.Unlock()
+
+	if cb == nil {
+		return
+	}
+	s.gatheringDoneOnce.Do(cb)
 }
 
 // GetTransportCredentials returns a copy of the active ICE/DTLS credentials,
@@ -715,6 +820,16 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	// ── Step 4: Inline SRTP Splitter ─────────────────────────────────────────
 	splitter := newIceConnSplitter(iceConn, s.logf, s.bridgeID)
 	s.splitter = splitter
+
+	// Arm the inbound DTLS trace with the peer fingerprint from the SFU's SDP so
+	// every inbound Certificate can be attributed to our peer or flagged foreign.
+	splitter.SetExpectedPeerFingerprint(remoteFP)
+
+	// Discard anything already queued on the ICE connection before DTLS starts.
+	// ICE spends seconds on connectivity checks, and on the VDI a DTLS server
+	// flight was found waiting in that buffer before we had sent a ClientHello —
+	// pion consumed it and failed the handshake with bad_certificate.
+	s.drainStaleInbound(iceConn)
 
 	// ── Step 5: DTLS handshake ────────────────────────────────────────────────
 	// Role is determined by a=setup: in the remote SDP:
@@ -829,6 +944,10 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	}
 	s.logf("[raw][%s] [DIAG] DTLS HandshakeContext completed successfully", s.bridgeID)
 	s.dtlsConn = dtlsConn
+
+	// Stop filtering: from here records are encrypted (epoch > 0) and cannot be
+	// inspected, and pion must receive everything.
+	splitter.SetHandshakeComplete()
 
 	// Disable deadlines on the splitter/connection post-handshake to prevent
 	// subsequent read timeouts from freezing the media flow.
@@ -945,6 +1064,48 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	}()
 
 	return nil
+}
+
+// drainWindow bounds how long drainStaleInbound waits for queued datagrams.
+// Anything already buffered is returned immediately; the window only covers
+// scheduling jitter, so this is the added latency in the common (empty) case.
+const drainWindow = 25 * time.Millisecond
+
+// drainStaleInbound discards datagrams that arrived on the ICE connection
+// before the DTLS handshake began.
+//
+// Nothing legitimate is lost: DTLS has not started, so there is no handshake
+// traffic for us yet, and no SRTP can exist before keys are derived. What can
+// be sitting there is a DTLS flight belonging to another association — from an
+// endpoint sharing the ICE agent's buffer, or from a previous session on a
+// reused NAT port — which pion would otherwise consume as if it were ours.
+func (s *rawShadowSession) drainStaleInbound(conn *ice.Conn) {
+	buf := make([]byte, 2048)
+	drained := 0
+
+	_ = conn.SetReadDeadline(time.Now().Add(drainWindow))
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			break // deadline reached — nothing (more) was queued
+		}
+		if n < 1 {
+			continue
+		}
+		drained++
+		if buf[0] >= 20 && buf[0] <= 63 {
+			for _, r := range parseDTLSRecords(buf[:n]) {
+				s.logf("[raw][%s] [DTLS-FILTER] drained pre-handshake datagram: %s", s.bridgeID, r.String())
+			}
+		} else {
+			s.logf("[raw][%s] [DTLS-FILTER] drained pre-handshake datagram: %d bytes, first_byte=0x%02x", s.bridgeID, n, buf[0])
+		}
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+
+	if drained > 0 {
+		s.logf("[raw][%s] [DTLS-FILTER] discarded %d datagram(s) queued before the DTLS handshake", s.bridgeID, drained)
+	}
 }
 
 // AddRemoteIceCandidate trickles a single candidate from the SFU into the agent.
@@ -1863,12 +2024,16 @@ func ownIceServers() []IceServer {
 			}
 		}
 	} else {
-		// Diverse public STUN — raises the odds at least one is reachable when a
-		// given provider is blocked by the local network.
+		// Only servers that actually answer on the target networks. The list used
+		// to include stun.l.google.com and global.stun.twilio.com "for diversity",
+		// but in the VDI both blackholed: they never produced a candidate and
+		// never completed, so gathering ran to its full timeout on every call
+		// while cloudflare had already answered in ~19ms. Unreachable STUN
+		// servers cost latency and buy nothing.
+		//
+		// Set BCR_STUN_URLS (comma-separated) to override for a given deployment.
 		stunURLs = []string{
-			"stun:stun.l.google.com:19302",
 			"stun:stun.cloudflare.com:3478",
-			"stun:global.stun.twilio.com:3478",
 		}
 	}
 	if len(stunURLs) > 0 {
@@ -1884,6 +2049,44 @@ func ownIceServers() []IceServer {
 	}
 
 	return servers
+}
+
+// defaultGatherWait bounds how long Init() blocks before returning the offer.
+// The srflx normally arrives in tens of milliseconds; this is the ceiling for
+// the case where STUN is slow or unreachable, not the expected cost.
+const defaultGatherWait = 1200 * time.Millisecond
+
+// gatherWaitBudget returns the maximum time Init() will block waiting for a
+// server-reflexive candidate. Override with BCR_GATHER_WAIT_MS.
+func gatherWaitBudget() time.Duration {
+	if env := strings.TrimSpace(os.Getenv("BCR_GATHER_WAIT_MS")); env != "" {
+		if ms, err := strconv.Atoi(env); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return defaultGatherWait
+}
+
+// gatherWaitForComplete reports whether to wait for ICE gathering to finish
+// entirely rather than leaving as soon as the srflx is in hand. Set
+// BCR_GATHER_MODE=complete to restore the old (slow) behaviour for A/B testing.
+func gatherWaitForComplete() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("BCR_GATHER_MODE")), "complete")
+}
+
+// isLinkLocalCandidate reports whether an ICE candidate address is an APIPA /
+// link-local address, which cannot be reached from off the machine.
+func isLinkLocalCandidate(addr string) bool {
+	ip := net.ParseIP(addr)
+	return ip != nil && ip.IsLinkLocalUnicast()
+}
+
+// countCandidates reads the shared candidate slice under its mutex. Used only
+// for log messages emitted from the gather-wait select.
+func countCandidates(mu *sync.Mutex, candidates *[]string) int {
+	mu.Lock()
+	defer mu.Unlock()
+	return len(*candidates)
 }
 
 func iceServersToStunURIs(servers []IceServer, logf func(string, ...any), bridgeID string) []*stun.URI {

@@ -502,6 +502,18 @@ func (e *Engine) retryBridge(conn SignalingConn, bridgeID string, session *rawSh
 			e.logf("[raw][%s] late ICE candidate trickle failed: %v", bridgeID, err)
 		}
 	}
+	session.onGatheringComplete = func() {
+		payload := RTCShadowCandidatePayload{
+			BridgeID:        bridgeID,
+			EndOfCandidates: true,
+			Timestamp:       time.Now().UnixMilli(),
+		}
+		if err := writeJSONPacket(conn, "RTC_SHADOW_ICE_CANDIDATE", payload); err != nil {
+			e.logf("[raw][%s] end-of-candidates signal failed: %v", bridgeID, err)
+			return
+		}
+		e.logf("[raw][%s] end-of-candidates sent", bridgeID)
+	}
 	session.mu.Unlock()
 
 	ready, err := session.Init(ctx, sdpType)
@@ -698,6 +710,18 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 			if err := writeJSONPacket(conn, "RTC_SHADOW_ICE_CANDIDATE", payload); err != nil {
 				e.logf("[raw][%s] late ICE candidate trickle failed: %v", bridgeID, err)
 			}
+		}
+		session.onGatheringComplete = func() {
+			payload := RTCShadowCandidatePayload{
+				BridgeID:        bridgeID,
+				EndOfCandidates: true,
+				Timestamp:       time.Now().UnixMilli(),
+			}
+			if err := writeJSONPacket(conn, "RTC_SHADOW_ICE_CANDIDATE", payload); err != nil {
+				e.logf("[raw][%s] end-of-candidates signal failed: %v", bridgeID, err)
+				return
+			}
+			e.logf("[raw][%s] end-of-candidates sent", bridgeID)
 		}
 		session.mu.Unlock()
 

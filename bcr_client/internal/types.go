@@ -138,7 +138,11 @@ type RTCShadowCandidatePayload struct {
 	BridgeID  string `json:"bridgeId"`
 	Candidate string `json:"candidate"`
 	SDPMid    string `json:"sdpMid"`
-	Timestamp int64  `json:"timestamp"`
+	// EndOfCandidates marks the final message of the trickle stream. Candidate
+	// is empty when this is set; the JS turns it into the end-of-candidates
+	// event rather than a candidate.
+	EndOfCandidates bool  `json:"endOfCandidates,omitempty"`
+	Timestamp       int64 `json:"timestamp"`
 }
 
 type RTCShadowClosePayload struct {
@@ -153,8 +157,12 @@ type RTCShadowReadyPayload struct {
 	DTLSFingerprint string   `json:"dtlsFingerprint"`
 	LocalIP         string   `json:"localIp"`
 	Candidates      []string `json:"candidates,omitempty"` // a=candidate lines from shadow PC's local description
-	GeneratedAt     int64    `json:"generatedAt"`
-	ExpiresAt       int64    `json:"expiresAt"`
+	// GatheringComplete reports whether ICE gathering had already finished when
+	// this payload was built. When false, more candidates will arrive via
+	// RTC_SHADOW_ICE_CANDIDATE and the JS must NOT signal end-of-candidates yet.
+	GatheringComplete bool  `json:"gatheringComplete"`
+	GeneratedAt       int64 `json:"generatedAt"`
+	ExpiresAt         int64 `json:"expiresAt"`
 }
 
 type PreWarmReadyPayload struct {
