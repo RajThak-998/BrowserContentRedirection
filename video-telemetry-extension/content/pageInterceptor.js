@@ -1210,9 +1210,9 @@
     // with RTC_SHADOW_READY before failing open and letting the native browser
     // connection take over (split-brain fallback).
     //
-    // With pre-warm, Go has already prepared credentials at page load, so
-    // awaitShadowReady() resolves in ~0ms. This timeout is only a safety net
-    // for the rare case where pre-warm is not yet ready when createOffer fires.
+    // Go builds the ICE agent on demand and replies as soon as the first
+    // server-reflexive candidate is gathered, so this normally resolves quickly.
+    // The timeout is a safety net for a network where STUN never answers.
     const RTC_WAIT_TIMEOUT_MS = 60_000;
 
     // Per-PC state stored in a WeakMap (GC-safe) and a bridgeId→PC lookup Map.
@@ -1260,7 +1260,7 @@
     function awaitShadowReady(bridgeId, timeoutMs) {
         if (!bridgeId) return Promise.resolve(null);
 
-        // If already resolved (e.g. pre-warm already sent SHADOW_READY), return immediately.
+        // If SHADOW_READY already arrived for this bridge, return it immediately.
         const cached = rtcReadyByBridgeId.get(bridgeId);
         if (cached) return Promise.resolve(cached);
 
@@ -1300,23 +1300,6 @@
         }
         window.postMessage({ type, payload }, '*');
     }
-
-    // ─── Page-Load Pre-Warm ────────────────────────────────────────────────────
-    let _preWarmedCredentials = null;
-    let _preWarmRequested = false;
-
-    function requestPreWarm() {
-        if (_preWarmRequested) return;
-        const host = window.location.hostname || '';
-        if (!host.includes('teams.microsoft.com') && !host.includes('teams.live.com')) {
-            return;
-        }
-        _preWarmRequested = true;
-        emitShadowEvent('BCR_SHADOW_PRE_WARM', { timestamp: Date.now() });
-        BCR_LOG('[BCR] Pre-warm requested at page load');
-    }
-
-    requestPreWarm();
 
     function captureIceServersFromConnection(pc) {
         const entry = ensureRtcState(pc);
@@ -1906,9 +1889,9 @@
         // carried inline candidates — including PRIVATE host IPs (172.25.0.219),
         // IPv6, and srflx with a private raddr — and connected fine. So private IPs
         // are NOT what the network resets on; an EMPTY/placeholder candidate set is.
-        // Mirror normal Teams: put at least one real candidate inline. bcr_client's
-        // host candidates are ready immediately (pre-warm); the routable relay/srflx
-        // still trickle in afterwards for actual connectivity.
+        // Mirror normal Teams: put at least one real candidate inline. bcr_client
+        // bundles its host candidates plus the first srflx into SHADOW_READY; any
+        // remaining candidates trickle in afterwards.
         if (Array.isArray(shadow.candidates) && shadow.candidates.length > 0) {
             const candBlock = shadow.candidates
                 .map((c) => (typeof c === 'string' ? c.trim() : ''))
@@ -1985,15 +1968,6 @@
             BCR_LOG('[BCR] RTCPeerConnection constructed bridgeId=', entry.bridgeId, 'iceServersCount=', args[0]?.iceServers?.length ?? 0);
             attachPeerLifecycleHooks(pc);
 
-            if (_preWarmedCredentials) {
-                entry.shadowCredentials = _preWarmedCredentials;
-                entry.preWarmId = _preWarmedCredentials.preWarmId;
-                _preWarmedCredentials = null; // consumed, one-time use
-                BCR_LOG('[BCR] Pre-warmed credentials bound to bridgeId=', entry.bridgeId, 'preWarmId=', entry.preWarmId);
-            } else {
-                BCR_LOG('[BCR] WARNING: No pre-warmed credentials available at RTCPeerConnection construction bridgeId=', entry.bridgeId);
-            }
-
             // Capture the ICE server configuration from the VDI app so the shadow PC
             // can use the same STUN/TURN servers for connectivity.
             const config = args[0];
@@ -2028,13 +2002,6 @@
 
         const data = event.data;
         if (!data || typeof data.type !== 'string') return;
-
-        if (data.type === 'BCR_RTC_SHADOW_PRE_WARM_READY') {
-            _preWarmedCredentials = data.payload;
-            BCR_LOG('[BCR] Pre-warmed credentials received, preWarmId=', data.payload?.preWarmId);
-            showToast('BCR Pipeline Ready');
-            return;
-        }
 
         if (data.type === 'BCR_STATUS') {
             const connected = data.payload?.clientConnected;
@@ -2410,19 +2377,19 @@
                 sdpType: origDescription.type ?? actionType,
                 sdp: pinnedSdp,
                 iceServers: entry.iceServers ?? [],
-                preWarmId: entry.preWarmId ?? '',
                 timestamp: Date.now(),
             });
 
             BCR_LOG('[BCR] Emitted SHADOW_LOCAL from', actionType, 'bridgeId=', entry.bridgeId,
-                    '— blocking for SHADOW_READY (pre-warm resolves ~0ms)');
+                    '— blocking for SHADOW_READY');
 
             // ── BLOCKING WAIT ─────────────────────────────────────────────────────────
-            // Awaits the Go SHADOW_READY signal.
-            // With pre-warm: Go has already prepared the ICE agent; SHADOW_READY
-            //   arrives nearly instantly (~0ms) via InitFromPreWarm().
-            // Without pre-warm: Go runs Init() + ICE gathering (~3-8s), bounded by
-            //   RTC_WAIT_TIMEOUT_MS to prevent Teams from hanging indefinitely.
+            // Awaits the Go SHADOW_READY signal. Go builds the ICE agent on demand
+            // here and returns as soon as the first server-reflexive candidate is in
+            // hand (normally tens of ms; capped by BCR_GATHER_WAIT_MS). Everything
+            // gathered after that arrives as trickled RTC_SHADOW_ICE_CANDIDATE
+            // messages, so this wait is short. RTC_WAIT_TIMEOUT_MS bounds it so Teams
+            // can never hang indefinitely.
             const shadowReady = await awaitShadowReady(entry.bridgeId, RTC_WAIT_TIMEOUT_MS);
 
             // Verify the PC hasn't been torn down during the await.

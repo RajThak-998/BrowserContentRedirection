@@ -20,14 +20,12 @@ const RTC_UPSTREAM_TYPES = new Set([
     "RTC_SHADOW_CLOSE",
     "RTC_SHADOW_ICE_CANDIDATE",
     "RTC_SHADOW_ICE_SERVERS",
-    "RTC_SHADOW_PRE_WARM",
 ]);
 
 const RTC_DOWNSTREAM_TYPES = new Set([
     "RTC_SHADOW_READY",
     "RTC_SHADOW_ERROR",
     "RTC_SHADOW_ICE_CANDIDATE",
-    "RTC_SHADOW_PRE_WARM_READY",
 ]);
 
 // ─── Media Counters ─────────────────────────────────────────────────────────
@@ -428,7 +426,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case "RTC_SHADOW_CLOSE":
         case "RTC_SHADOW_ICE_CANDIDATE":
         case "RTC_SHADOW_ICE_SERVERS":
-        case "RTC_SHADOW_PRE_WARM":
             _handleRtcShadow(message, sender, sendResponse);
             break;
 
@@ -481,14 +478,14 @@ function _handleRtcShadow(message, sender, sendResponse) {
         return;
     }
 
-    if (message.type !== "RTC_SHADOW_PRE_WARM") {
-        const bridgeId = message.payload?.bridgeId;
-        if (typeof bridgeId !== "string" || bridgeId.length === 0) {
-            sendResponse({status: "error", reason: "bridgeId required"});
-            return;
-        }
-        _rememberRtcRoute(bridgeId, sender);
+    // Every upstream shadow message is scoped to a bridge. (Pre-warm was the one
+    // exception — it had no bridgeId — and it no longer exists.)
+    const bridgeId = message.payload?.bridgeId;
+    if (typeof bridgeId !== "string" || bridgeId.length === 0) {
+        sendResponse({status: "error", reason: "bridgeId required"});
+        return;
     }
+    _rememberRtcRoute(bridgeId, sender);
 
     const enrichedMessage = _enrichWithSenderMeta(message, sender);
 
@@ -522,49 +519,6 @@ function _routeYTPlaybackToContent(packet) {
 }
 
 function _routeRtcShadowToContent(packet) {
-    if (packet.type === "RTC_SHADOW_PRE_WARM_READY") {
-        const tabId = packet.meta?.tabId;
-        const frameId = packet.meta?.frameId ?? 0;
-        if (typeof tabId === "number") {
-            chrome.tabs.sendMessage(
-                tabId,
-                {
-                    type: packet.type,
-                    payload: packet.payload ?? {},
-                },
-                { frameId: frameId },
-                () => {
-                    if (chrome.runtime.lastError) {
-                        // ignore/discard if tab closed
-                    }
-                }
-            );
-        } else {
-            // Broadcast to all active Teams tabs (e.g. on proactive push when Go reconnects)
-            chrome.tabs.query({ url: "*://*.teams.microsoft.com/*" }, (tabs) => {
-                if (tabs) {
-                    for (const tab of tabs) {
-                        chrome.tabs.sendMessage(tab.id, {
-                            type: packet.type,
-                            payload: packet.payload ?? {},
-                        });
-                    }
-                }
-            });
-            chrome.tabs.query({ url: "*://*.teams.live.com/*" }, (tabs) => {
-                if (tabs) {
-                    for (const tab of tabs) {
-                        chrome.tabs.sendMessage(tab.id, {
-                            type: packet.type,
-                            payload: packet.payload ?? {},
-                        });
-                    }
-                }
-            });
-        }
-        return;
-    }
-
     const bridgeId = packet?.payload?.bridgeId;
     if (typeof bridgeId !== "string" || bridgeId.length === 0) {
         return;

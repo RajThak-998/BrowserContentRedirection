@@ -130,7 +130,6 @@ class Emitter {
                     sdpType: payload.sdpType ?? "unknown",
                     sdp: payload.sdp ?? "",
                     iceServers: payload.iceServers ?? [],
-                    preWarmId: payload.preWarmId ?? "",
                     timestamp: payload.timestamp ?? Date.now(),
                 },
             },
@@ -191,18 +190,6 @@ class Emitter {
                 timestamp: Date.now(),
             },
         });
-    }
-
-    emitRtcShadowPreWarm(payload) {
-        this._sendWithRetry(
-            {
-                type: "RTC_SHADOW_PRE_WARM",
-                payload: {
-                    timestamp: payload.timestamp ?? Date.now(),
-                },
-            },
-            this._MAX_RETRIES
-        );
     }
 
     // ─── Internal ─────────────────────────────────────────────────────────────

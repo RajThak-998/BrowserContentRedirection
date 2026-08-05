@@ -1,17 +1,62 @@
 package main
 
 import (
+	"flag"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 )
 
 const listenAddr = ":8765"
 
+// defaultLogPath returns the log file location, relative to the working
+// directory. It deliberately does NOT use os.Executable(): under `go run` that
+// resolves to a throwaway binary in a temp build directory, so the log would
+// land somewhere different on every run.
+func defaultLogPath() string {
+	return "bcr_host.log"
+}
+
+// initFileLogging mirrors bcr_client: route the standard log package to both
+// stdout and a file truncated on every start, with microsecond timestamps so
+// the bcr_host and bcr_client timelines can be lined up against each other.
+// Standard error is redirected into the same file so that a panic is recorded
+// rather than being lost with the terminal.
+func initFileLogging(path string) *os.File {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		log.Printf("WARNING: could not open log file %q: %v (logging to stdout only)", path, err)
+		return nil
+	}
+
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.SetOutput(io.MultiWriter(os.Stdout, f))
+
+	abs, absErr := filepath.Abs(path)
+	if absErr != nil {
+		abs = path
+	}
+	log.Printf("[bcr_host] file logging started — %s (truncated each run)", abs)
+
+	if err := redirectStderr(f); err != nil {
+		log.Printf("[bcr_host] WARNING: could not redirect stderr to the log file: %v (panics will only appear in the terminal)", err)
+	}
+	return f
+}
+
 func main() {
+	logPath := flag.String("log", defaultLogPath(), "Path to the bcr_host log file (truncated on each start)")
+	flag.Parse()
+
+	if f := initFileLogging(*logPath); f != nil {
+		defer f.Close()
+	}
+
 	log.Println("┌─────────────────────────────────────────┐")
 	log.Println("│           bcr_host starting             │")
 	log.Println("│  WebSocket endpoint: ws://localhost:8765/ws  │")
@@ -39,10 +84,18 @@ func logStartupDiagnostics() {
 	log.Printf("[DIAG] OS/Arch: %s/%s", runtime.GOOS, runtime.GOARCH)
 	log.Printf("[DIAG] PID: %d", os.Getpid())
 
-	if runtime.GOOS == "windows" {
+	log.Printf("[DIAG] Transport: %s", transportSummary())
+
+	// RDP session/elevation checks only mean something when the virtual channel
+	// is in play. In local mode they are noise: logElevationStatus shells out to
+	// `net session` (slow) and warns about mstsc.exe privileges that are
+	// irrelevant when bcr_host and bcr_client share a machine.
+	if runtime.GOOS == "windows" && isVDIMode() {
 		// Log session ID and elevation status
 		LogSessionDiagnostics()
 		logElevationStatus()
+	} else if isLocalMode() {
+		log.Println("[DIAG] local mode — RDP session/elevation checks skipped")
 	}
 
 	log.Println("[DIAG] ─── End Diagnostics ───")

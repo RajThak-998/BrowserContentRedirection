@@ -60,14 +60,11 @@ const (
 // DisableTransportStateReuse is a diagnostic flag to disable DTLS certificate and ICE credential reuse across connections/reconnects.
 var DisableTransportStateReuse = false
 
-// DisablePreWarm forces the reliable, gather-waiting Init() path instead of the
-// pre-warmed agent. The working 53f5bd94 build had NO pre-warm at all and DTLS
-// connected reliably; the pre-warm (new in f845ebb) — especially its
-// recreate-agent path when Teams supplies TURN — has proven flaky in the VDI
-// (ICE never completing, or DTLS aborting). Hardcoded ON in this test env to
-// force the simpler path that matches the known-good behavior.
-var DisablePreWarm = true
-
+// Cached DTLS identity. The self-signed certificate is generated once per
+// process and reused for every session, so its SHA-256 fingerprint — the value
+// munged into the SDP the SFU receives — stays stable across reconnects and
+// renegotiations. Generating a fresh certificate per session would change the
+// advertised fingerprint mid-call and break the peer's verification.
 var (
 	globalCert            tls.Certificate
 	globalCertFingerprint string
@@ -398,32 +395,6 @@ func newRawShadowSession(bridgeID string, logf func(string, ...any)) *rawShadowS
 }
 
 // ─── Phase 1 ─────────────────────────────────────────────────────────────────
-
-// InitFromPreWarm binds a pre-warmed ICE agent and returns the RTCShadowReadyPayload immediately.
-func (s *rawShadowSession) InitFromPreWarm(pw *PreWarm, sdpType string) (*RTCShadowReadyPayload, error) {
-	s.mu.Lock()
-	if s.state != stateNew {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("InitFromPreWarm called in wrong state: %v", s.state)
-	}
-	s.mu.Unlock()
-
-	pw.BindToSession(s, s.bridgeID)
-
-	s.mu.Lock()
-	ready := s.localCredentials
-	s.mu.Unlock()
-
-	if ready == nil {
-		return nil, fmt.Errorf("failed to bind pre-warmed agent: credentials nil")
-	}
-
-	// Make sure the sdpType is correct in the returned payload
-	retReady := *ready
-	retReady.SDPType = sdpType
-
-	return &retReady, nil
-}
 
 // Init generates the local transport identity (DTLS cert + ICE agent), gathers
 // candidates, and returns the RTCShadowReadyPayload that the engine sends back
@@ -825,11 +796,24 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	// every inbound Certificate can be attributed to our peer or flagged foreign.
 	splitter.SetExpectedPeerFingerprint(remoteFP)
 
-	// Discard anything already queued on the ICE connection before DTLS starts.
-	// ICE spends seconds on connectivity checks, and on the VDI a DTLS server
-	// flight was found waiting in that buffer before we had sent a ClientHello —
-	// pion consumed it and failed the handshake with bad_certificate.
-	s.drainStaleInbound(iceConn)
+	// NOTE: do not try to "drain" the ICE connection before starting DTLS.
+	//
+	// An earlier version did exactly that, to discard a stale DTLS flight that
+	// could be sitting in the buffer. It was wrong twice over:
+	//
+	//  1. It bounded the drain with conn.SetReadDeadline, which is a no-op stub
+	//     in pion/ice (transport.go: `func (c *Conn) SetReadDeadline(time.Time)
+	//     error { return nil }`). Read() therefore blocked until the next packet
+	//     instead of timing out, and since the SFU sends RTCP every 1-3s the loop
+	//     never exited — the DTLS handshake was never reached at all.
+	//  2. The premise was false. The SFU starts sending RTCP as soon as ICE
+	//     completes, so the buffer legitimately contains media-plane traffic that
+	//     belongs to iceConnSplitter's srtpCh, not to a discard loop.
+	//
+	// Stale flights are handled where they should be: iceConnSplitter drops any
+	// handshake record that arrives before our ClientHello, or whose certificate
+	// does not match the SFU's a=fingerprint. That needs no deadline and touches
+	// nothing on the media plane.
 
 	// ── Step 5: DTLS handshake ────────────────────────────────────────────────
 	// Role is determined by a=setup: in the remote SDP:
@@ -1066,47 +1050,6 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	return nil
 }
 
-// drainWindow bounds how long drainStaleInbound waits for queued datagrams.
-// Anything already buffered is returned immediately; the window only covers
-// scheduling jitter, so this is the added latency in the common (empty) case.
-const drainWindow = 25 * time.Millisecond
-
-// drainStaleInbound discards datagrams that arrived on the ICE connection
-// before the DTLS handshake began.
-//
-// Nothing legitimate is lost: DTLS has not started, so there is no handshake
-// traffic for us yet, and no SRTP can exist before keys are derived. What can
-// be sitting there is a DTLS flight belonging to another association — from an
-// endpoint sharing the ICE agent's buffer, or from a previous session on a
-// reused NAT port — which pion would otherwise consume as if it were ours.
-func (s *rawShadowSession) drainStaleInbound(conn *ice.Conn) {
-	buf := make([]byte, 2048)
-	drained := 0
-
-	_ = conn.SetReadDeadline(time.Now().Add(drainWindow))
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			break // deadline reached — nothing (more) was queued
-		}
-		if n < 1 {
-			continue
-		}
-		drained++
-		if buf[0] >= 20 && buf[0] <= 63 {
-			for _, r := range parseDTLSRecords(buf[:n]) {
-				s.logf("[raw][%s] [DTLS-FILTER] drained pre-handshake datagram: %s", s.bridgeID, r.String())
-			}
-		} else {
-			s.logf("[raw][%s] [DTLS-FILTER] drained pre-handshake datagram: %d bytes, first_byte=0x%02x", s.bridgeID, n, buf[0])
-		}
-	}
-	_ = conn.SetReadDeadline(time.Time{})
-
-	if drained > 0 {
-		s.logf("[raw][%s] [DTLS-FILTER] discarded %d datagram(s) queued before the DTLS handshake", s.bridgeID, drained)
-	}
-}
 
 // AddRemoteIceCandidate trickles a single candidate from the SFU into the agent.
 // Called by handleShadowICECandidate when RTC_SHADOW_ICE_CANDIDATE arrives.

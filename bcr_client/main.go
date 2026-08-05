@@ -77,6 +77,14 @@ func initFileLogging(path string) *os.File {
 		abs = path
 	}
 	log.Printf("[bcr_client] file logging started — %s (truncated each run)", abs)
+
+	// Route stderr into the same file. The log package only covers log.* calls;
+	// Go runtime panics are written straight to fd 2 and would otherwise be lost
+	// with the terminal — which is exactly what happened when bcr_client
+	// disappeared mid-call and left no trace in this file.
+	if err := redirectStderr(f); err != nil {
+		log.Printf("[bcr_client] WARNING: could not redirect stderr to the log file: %v (panics will only appear in the terminal)", err)
+	}
 	return f
 }
 

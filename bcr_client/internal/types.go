@@ -130,7 +130,6 @@ type RTCShadowLocalPayload struct {
 	SDPType    string      `json:"sdpType"`
 	SDP        string      `json:"sdp"`
 	IceServers []IceServer `json:"iceServers"`
-	PreWarmID  string      `json:"preWarmId,omitempty"`
 	Timestamp  int64       `json:"timestamp"`
 }
 
@@ -165,14 +164,6 @@ type RTCShadowReadyPayload struct {
 	ExpiresAt         int64 `json:"expiresAt"`
 }
 
-type PreWarmReadyPayload struct {
-	PreWarmID       string   `json:"preWarmId"`
-	ICEUfrag        string   `json:"iceUfrag"`
-	ICEPwd          string   `json:"icePwd"`
-	DTLSFingerprint string   `json:"dtlsFingerprint"`
-	Candidates      []string `json:"candidates"`
-	GeneratedAt     int64    `json:"generatedAt"`
-}
 
 type RTCShadowErrorPayload struct {
 	BridgeID  string `json:"bridgeId"`

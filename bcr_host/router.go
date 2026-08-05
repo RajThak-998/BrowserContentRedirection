@@ -293,7 +293,7 @@ func isRTCShadowUpstreamPacket(data []byte) bool {
 	}
 
 	switch pkt.Type {
-	case PacketTypeRTCShadowRemote, PacketTypeRTCShadowLocal, PacketTypeRTCShadowClose, PacketTypeRTCShadowCandidate, PacketTypeRTCShadowIceServers, PacketTypeRTCShadowPreWarm:
+	case PacketTypeRTCShadowRemote, PacketTypeRTCShadowLocal, PacketTypeRTCShadowClose, PacketTypeRTCShadowCandidate, PacketTypeRTCShadowIceServers:
 		return true
 	default:
 		return false
@@ -307,7 +307,7 @@ func isRTCShadowDownstreamPacket(data []byte) bool {
 	}
 
 	switch pkt.Type {
-	case PacketTypeRTCShadowReady, PacketTypeRTCShadowError, PacketTypeRTCShadowCandidate, PacketTypeRTCShadowPreWarmReady:
+	case PacketTypeRTCShadowReady, PacketTypeRTCShadowError, PacketTypeRTCShadowCandidate:
 		return true
 	default:
 		return false
@@ -609,23 +609,35 @@ func (b *bridgeForwarder) start() {
 func (b *bridgeForwarder) runBridgeLoop() {
 	for {
 		var conn SignalingConn
-		var err error
 
-		log.Println("[Bridge] Attempting to open RDP Dynamic Virtual Channel 'BCR_VC'...")
-		dvcConn, err := OpenDVC("BCR_VC")
-		if err == nil {
-			log.Println("[Bridge] ✅ DVC transport active — signaling via RDP Dynamic Virtual Channel 'BCR_VC'")
-			conn = &DVCSignalingConn{DVCConn: dvcConn}
-		} else {
-			log.Printf("[Bridge] DVC not available (%v). Falling back to TCP loopback to localhost:8081...", err)
-			tcpConn, tcpErr := net.Dial("tcp", "127.0.0.1:8081")
-			if tcpErr != nil {
-				log.Printf("[Bridge] TCP fallback dial failed: %v. Retrying in %v...", tcpErr, bridgeReconnectDelay)
+		if isVDIMode() {
+			// VDI: signalling must ride the virtual channel. There is no TCP
+			// fallback by design — bcr_client lives on the thin client, so a TCP
+			// dial from here could never reach it and would only disguise the
+			// real DVC failure as a signalling timeout.
+			log.Printf("[Bridge] opening RDP Dynamic Virtual Channel %q...", dvcChannelName)
+			dvcConn, dvcErr := OpenDVC(dvcChannelName)
+			if dvcErr != nil {
+				log.Printf("[Bridge] DVC open failed: %v — retrying in %v (use BCR_TRANSPORT=local for same-machine dev)", dvcErr, bridgeReconnectDelay)
 				setClientConnected(false)
 				time.Sleep(bridgeReconnectDelay)
 				continue
 			}
-			log.Println("[Bridge] ✅ TCP transport active — signaling via TCP loopback 127.0.0.1:8081")
+			log.Printf("[Bridge] ✅ transport active: %s", transportSummary())
+			conn = &DVCSignalingConn{DVCConn: dvcConn}
+		} else {
+			// Local: bcr_client is on this machine. No virtual channel is probed
+			// — there is none to find, and probing for one logs a failure that
+			// reads like a real fault.
+			addr := clientAddr()
+			tcpConn, tcpErr := net.Dial("tcp", addr)
+			if tcpErr != nil {
+				log.Printf("[Bridge] dial %s failed: %v — retrying in %v (is bcr_client running?)", addr, tcpErr, bridgeReconnectDelay)
+				setClientConnected(false)
+				time.Sleep(bridgeReconnectDelay)
+				continue
+			}
+			log.Printf("[Bridge] ✅ transport active: %s", transportSummary())
 			conn = &TCPSignalingConn{Conn: tcpConn}
 		}
 
@@ -732,8 +744,7 @@ func (b *bridgeForwarder) runBridgeLoop() {
 					msg.packetType == PacketTypeRTCShadowLocal ||
 					msg.packetType == PacketTypeRTCShadowClose ||
 					msg.packetType == PacketTypeRTCShadowCandidate ||
-					msg.packetType == PacketTypeRTCShadowIceServers ||
-					msg.packetType == PacketTypeRTCShadowPreWarm {
+					msg.packetType == PacketTypeRTCShadowIceServers {
 					log.Printf("[Bridge] SHADOW_UP -> client type=%s bridgeId=%s", msg.packetType, msg.bridgeID)
 				}
 				return true
@@ -825,8 +836,7 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 		packetType == PacketTypeRTCShadowLocal ||
 		packetType == PacketTypeRTCShadowClose ||
 		packetType == PacketTypeRTCShadowCandidate ||
-		packetType == PacketTypeRTCShadowIceServers ||
-		packetType == PacketTypeRTCShadowPreWarm
+		packetType == PacketTypeRTCShadowIceServers
 	// Video lifecycle events forwarded so bcr_client can manage overlay window.
 	isVideoLifecycle := packetType == "VIDEO_ADDED" || packetType == "VIDEO_REMOVED" ||
 		packetType == "VIDEO_SOURCE_GONE"

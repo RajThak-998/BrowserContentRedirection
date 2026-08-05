@@ -10,8 +10,6 @@ const (
 	PacketTypeRTCShadowError     = "RTC_SHADOW_ERROR"
 	PacketTypeRTCShadowCandidate = "RTC_SHADOW_ICE_CANDIDATE"
 	PacketTypeRTCShadowIceServers = "RTC_SHADOW_ICE_SERVERS"
-	PacketTypeRTCShadowPreWarm       = "RTC_SHADOW_PRE_WARM"
-	PacketTypeRTCShadowPreWarmReady  = "RTC_SHADOW_PRE_WARM_READY"
 )
 
 type Packet struct {
