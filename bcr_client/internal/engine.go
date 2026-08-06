@@ -71,25 +71,14 @@ type Engine struct {
 	bridgeRetry map[string]bridgeRetryState
 
 	// Diagnostic: track unknown PTs to avoid log spam.
-	unknownPTMu   sync.Mutex
-	unknownPTs    map[uint8]bool
-	strictDropPTs map[uint8]bool
+	unknownPTMu sync.Mutex
+	unknownPTs  map[uint8]bool
 }
 
 func New(cfg Config, cb Callbacks) *Engine {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":8081"
 	}
-	// Default preferred codecs: H264 for video, Opus for audio.
-	// The browser extension strips all other codecs from the SDP; this is
-	// the Go-side safety net that drops any PTs that slip through.
-	if cfg.PreferredCodecs.Video == "" {
-		cfg.PreferredCodecs.Video = "H264"
-	}
-	if cfg.PreferredCodecs.Audio == "" {
-		cfg.PreferredCodecs.Audio = "opus"
-	}
-
 	return &Engine{
 		cfg:              cfg,
 		cb:               cb,
@@ -373,7 +362,6 @@ func (e *Engine) closeLoopbackSession(bridgeID string) {
 
 type bridgeRetryState struct {
 	attempts    int
-	lastAttempt time.Time
 	cooldown    bool
 	cooldownEnd time.Time
 }
@@ -649,11 +637,19 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 			return
 		}
 
-		// Reconstruct and print the new munged SDP that the browser is returning to Teams.
-		// Use this block to paste into chrome://webrtc-internals or check the final signaling payload.
-		munged := MungeSDPTransport(payload.SDP, ready.ICEUfrag, ready.ICEPwd, ready.DTLSFingerprint)
-		e.vlogf("[bcr_client] [SDP-MUNGED] bridgeId=%s type=%s\n--- BEGIN MUNGED SDP ---\n%s\n--- END MUNGED SDP ---",
-			bridgeID, sdpType, munged)
+		// Reconstruct the munged SDP the browser will return to Teams and dump it
+		// verbatim, for pasting into chrome://webrtc-internals or diffing against
+		// the cpconv request body.
+		//
+		// It is a ~200-line block per negotiation — several times the size of the
+		// rest of a healthy session's log — so it is opt-in via BCR_SDP_DUMP=1.
+		// The one-line [SDP-INSPECT] summary above always runs and carries the
+		// ufrag / fingerprint / c= / mids that most questions actually need.
+		if envEnabled("BCR_SDP_DUMP") {
+			munged := MungeSDPTransport(payload.SDP, ready.ICEUfrag, ready.ICEPwd, ready.DTLSFingerprint)
+			e.vlogf("[bcr_client] [SDP-MUNGED] bridgeId=%s type=%s\n--- BEGIN MUNGED SDP ---\n%s\n--- END MUNGED SDP ---",
+				bridgeID, sdpType, munged)
+		}
 
 		if err := writeJSONPacket(conn, "RTC_SHADOW_READY", ready); err != nil {
 			e.logf("[raw][%s] send SHADOW_READY failed: %v", bridgeID, err)
@@ -926,9 +922,7 @@ func (e *Engine) ensureLoopbackSession(bridgeID string, session *rawShadowSessio
 	}
 	session.mu.Unlock()
 
-	filteredForPreCreate := FilterPTCodecMapToPreferred(ptMap, e.cfg.PreferredCodecs)
-	e.logf("[bcr_client][loopback] eagerly creating loopback session bridgeId=%s totalCodecs=%d preferredCodecs=%d",
-		bridgeID, len(ptMap), len(filteredForPreCreate))
+	e.logf("[bcr_client][loopback] creating loopback session bridgeId=%s codecs=%d", bridgeID, len(ptMap))
 
 	e.relayMu.Lock()
 	// Double-check under lock to prevent TOCTOU race if two goroutines race here.
@@ -941,7 +935,7 @@ func (e *Engine) ensureLoopbackSession(bridgeID string, session *rawShadowSessio
 		bridgeID,
 		e.logf,
 		e.cb.OnLoopbackOffer,
-		filteredForPreCreate,
+		ptMap,
 		// onRequestKeyframe
 		func(bID string, ssrc uint32) {
 			e.shadowMu.Lock()
@@ -993,18 +987,6 @@ func (e *Engine) ReEmitAllLoopbackOffers() {
 			go e.cb.OnLoopbackOffer(bridgeID, offer)
 		}
 	}
-}
-
-func (e *Engine) clearActiveBridgeIfMatch(bridgeID, reason string) {
-	e.shadowMu.Lock()
-	if e.activeBridgeID != bridgeID {
-		e.shadowMu.Unlock()
-		return
-	}
-	e.activeBridgeID = ""
-	e.shadowMu.Unlock()
-
-	e.logf("[bcr_client][bridge] active bridge cleared bridgeId=%s reason=%s", bridgeID, reason)
 }
 
 func (e *Engine) shouldProcessBridgeTrack(bridgeID string) bool {
@@ -1127,8 +1109,7 @@ func (e *Engine) syncLoopbackTracks(bridgeID string, session *rawShadowSession) 
 	}
 	session.mu.Unlock()
 
-	filtered := FilterPTCodecMapToPreferred(ptMap, e.cfg.PreferredCodecs)
-	ls.SyncTracksFromCodecMap(filtered)
+	ls.SyncTracksFromCodecMap(ptMap)
 }
 
 func (e *Engine) handleRenegotiationRemote(session *rawShadowSession, bridgeID string, sdpType string, sdp string) {
@@ -1178,36 +1159,6 @@ func writeJSONPacket(conn SignalingConn, packetType string, payload any) error {
 		return err
 	}
 	return conn.WriteMessage(1, out) // 1 = TextMessage
-}
-
-func detectLocalIPv4() string {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return ""
-	}
-
-	for _, iface := range ifaces {
-		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok || ipNet.IP == nil {
-				continue
-			}
-			ip4 := ipNet.IP.To4()
-			if ip4 == nil || ip4.IsLoopback() {
-				continue
-			}
-			return ip4.String()
-		}
-	}
-
-	return ""
 }
 
 // hashSDP returns a 16-char MD5 hex prefix for dedup/logging.

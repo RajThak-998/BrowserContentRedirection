@@ -3,17 +3,7 @@ package engine
 import "encoding/json"
 
 type Config struct {
-	ListenAddr      string
-	PreferredCodecs PreferredCodecs
-}
-
-// PreferredCodecs controls which codecs the BCR pipeline accepts. The SDP
-// codec filter in the browser extension strips all other codecs from the SDP
-// so the SFU is constrained to send only these. The Go-side filter acts as a
-// safety net to drop any unexpected PTs that slip through renegotiation.
-type PreferredCodecs struct {
-	Video string // e.g. "VP8", "H264", "VP9" — matched case-insensitively against MimeType
-	Audio string // e.g. "opus" — matched case-insensitively against MimeType
+	ListenAddr string
 }
 
 type Callbacks struct {

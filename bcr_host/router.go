@@ -372,15 +372,12 @@ func handleMediaBinaryFrame(data []byte, registry *Registry) {
 		log.Printf("[router] MEDIA_CHUNK size mismatch header=%d actual=%d", hdr.Payload.Size, len(chunkBytes))
 	}
 
-	log.Printf("[router] MEDIA_CHUNK seq=%d size=%d track=%s init=%v",
-		hdr.Payload.Seq,
-		len(chunkBytes),
-		hdr.Payload.TrackType,
-		hdr.Payload.IsInitSegment,
-	)
-
+	// One line per MSE segment is thousands of lines over a YouTube video, and
+	// the sampled line below already carries the same fields. Init segments are
+	// always reported (they are the ones that matter for pipeline setup).
 	if hdr.Payload.IsInitSegment || hdr.Payload.Seq%50 == 0 {
-		log.Printf("[Host] track=%s codec=%s size=%d init=%v",
+		log.Printf("[Host] MEDIA_CHUNK seq=%d track=%s codec=%s size=%d init=%v",
+			hdr.Payload.Seq,
 			hdr.Payload.TrackType,
 			hdr.Payload.Codec,
 			len(chunkBytes),
@@ -433,9 +430,17 @@ func handleMediaBinaryFrame(data []byte, registry *Registry) {
 	registry.Broadcast(websocket.TextMessage, outBytes)
 }
 
+// shouldLogBridgeFailure reports whether the nth consecutive bridge-connect
+// failure is worth a log line: the first one, then one every 30s or so.
+func shouldLogBridgeFailure(n int) bool {
+	return n == 1 || n%bridgeRetryLogEvery == 0
+}
+
 const (
 	bridgeReconnectDelay = 2 * time.Second
-	bridgeControlQueue   = 512
+	// bridgeRetryLogEvery × bridgeReconnectDelay ≈ 30s between repeat reports.
+	bridgeRetryLogEvery = 15
+	bridgeControlQueue  = 512
 	bridgeMediaQueue      = 8192 // Dedicated media egress queue — sized for MSE burst tolerance
 	mediaEgressTimeout    = 50 * time.Millisecond
 )
@@ -607,6 +612,13 @@ func (b *bridgeForwarder) start() {
 }
 
 func (b *bridgeForwarder) runBridgeLoop() {
+	// bcr_client is frequently started after bcr_host, and it is normal for the
+	// dial to fail for as long as that takes. At one line per 2s attempt a
+	// couple of idle minutes buried the log in identical lines, so report the
+	// first failure and then only every bridgeRetryLogEvery-th one, with the
+	// count so the gap is not mistaken for the retries having stopped.
+	failures := 0
+
 	for {
 		var conn SignalingConn
 
@@ -615,15 +627,17 @@ func (b *bridgeForwarder) runBridgeLoop() {
 			// fallback by design — bcr_client lives on the thin client, so a TCP
 			// dial from here could never reach it and would only disguise the
 			// real DVC failure as a signalling timeout.
-			log.Printf("[Bridge] opening RDP Dynamic Virtual Channel %q...", dvcChannelName)
 			dvcConn, dvcErr := OpenDVC(dvcChannelName)
 			if dvcErr != nil {
-				log.Printf("[Bridge] DVC open failed: %v — retrying in %v (use BCR_TRANSPORT=local for same-machine dev)", dvcErr, bridgeReconnectDelay)
+				failures++
+				if shouldLogBridgeFailure(failures) {
+					log.Printf("[Bridge] DVC %q open failed (attempt %d): %v — retrying every %v (use BCR_TRANSPORT=local for same-machine dev)",
+						dvcChannelName, failures, dvcErr, bridgeReconnectDelay)
+				}
 				setClientConnected(false)
 				time.Sleep(bridgeReconnectDelay)
 				continue
 			}
-			log.Printf("[Bridge] ✅ transport active: %s", transportSummary())
 			conn = &DVCSignalingConn{DVCConn: dvcConn}
 		} else {
 			// Local: bcr_client is on this machine. No virtual channel is probed
@@ -632,14 +646,23 @@ func (b *bridgeForwarder) runBridgeLoop() {
 			addr := clientAddr()
 			tcpConn, tcpErr := net.Dial("tcp", addr)
 			if tcpErr != nil {
-				log.Printf("[Bridge] dial %s failed: %v — retrying in %v (is bcr_client running?)", addr, tcpErr, bridgeReconnectDelay)
+				failures++
+				if shouldLogBridgeFailure(failures) {
+					log.Printf("[Bridge] dial %s failed (attempt %d): %v — retrying every %v (is bcr_client running?)",
+						addr, failures, tcpErr, bridgeReconnectDelay)
+				}
 				setClientConnected(false)
 				time.Sleep(bridgeReconnectDelay)
 				continue
 			}
-			log.Printf("[Bridge] ✅ transport active: %s", transportSummary())
 			conn = &TCPSignalingConn{Conn: tcpConn}
 		}
+
+		if failures > 0 {
+			log.Printf("[Bridge] connected after %d failed attempt(s)", failures)
+			failures = 0
+		}
+		log.Printf("[Bridge] ✅ transport active: %s", transportSummary())
 
 		setClientConnected(true)
 
@@ -871,9 +894,9 @@ func (b *bridgeForwarder) tryForwardText(data []byte) {
 		packetType: packetType,
 		bridgeID:   bridgeID,
 	}:
-		if isShadow {
-			log.Printf("[Bridge] SHADOW_UP queued type=%s bridgeId=%s", packetType, bridgeID)
-		}
+		// Queueing is not reported: the write loop logs the packet when it
+		// actually goes out, and the two lines were always microseconds apart.
+		// Failures to queue ARE reported, below and above.
 	default:
 		if isShadow {
 			log.Printf("[Bridge] SHADOW_UP dropped reason=bridge_queue_full type=%s bridgeId=%s", packetType, bridgeID)

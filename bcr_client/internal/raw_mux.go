@@ -229,19 +229,25 @@ func (s *iceConnSplitter) ReadFrom(p []byte) (int, net.Addr, error) {
 
 		first := p[0]
 		if first < 128 {
+			// Alerts always matter — they are how a failed handshake explains
+			// itself, and they can arrive long after one succeeded.
+			//
 			// NOTE: ice.Conn does not expose the datagram's real source address —
 			// it funnels non-STUN traffic from every valid remote candidate into
 			// one buffer. selectedPair below is the pair ICE nominated, NOT proof
 			// of who sent this packet. Use the record trace and the certificate
 			// fingerprint to identify the sender.
 			if first == dtlsContentTypeAlert {
-				s.logf("[raw][%s] [VDI-DEBUG] splitter ReadFrom: read DTLS ALERT: %s, selectedPair.remote=%v",
+				s.logf("[raw][%s] DTLS ALERT in: %s (selectedPair.remote=%v)",
 					s.bridgeID, explainAlert(p[:n]), s.conn.RemoteAddr())
-			} else {
-				s.logf("[raw][%s] [VDI-DEBUG] splitter ReadFrom: read %d bytes, first_byte=0x%02x, selectedPair.remote=%v",
-					s.bridgeID, n, first, s.conn.RemoteAddr())
 			}
-			s.traceDTLS("IN", p[:n])
+			// Record tracing is only informative during the handshake. After it
+			// every record is encrypted application_data whose only readable
+			// fields are epoch and length — one line every couple of seconds,
+			// for the life of the call, saying nothing.
+			if !s.handshakeDone.Load() {
+				s.traceDTLS("IN", p[:n])
+			}
 		}
 		switch {
 		case first >= 20 && first <= 63: // DTLS record
@@ -280,11 +286,14 @@ func (s *iceConnSplitter) ReadFrom(p []byte) (int, net.Addr, error) {
 func (s *iceConnSplitter) WriteTo(p []byte, _ net.Addr) (int, error) {
 	if len(p) > 0 {
 		if p[0] == dtlsContentTypeAlert {
-			s.logf("[raw][%s] [VDI-DEBUG] splitter WriteTo: writing DTLS ALERT: %s", s.bridgeID, explainAlert(p))
-		} else {
-			s.logf("[raw][%s] [VDI-DEBUG] splitter WriteTo: writing %d bytes, first_byte=0x%02x", s.bridgeID, len(p), p[0])
+			s.logf("[raw][%s] DTLS ALERT out: %s", s.bridgeID, explainAlert(p))
 		}
-		s.traceDTLS("OUT", p)
+		// traceDTLS("OUT") must keep running until the handshake completes even
+		// when quiet: it is what sets clientHelloSent, which the stale-flight
+		// filter depends on.
+		if !s.handshakeDone.Load() {
+			s.traceDTLS("OUT", p)
+		}
 	}
 	// addr is ignored — the ICE transport already knows the remote address.
 	return s.conn.Write(p)
@@ -304,7 +313,6 @@ func (s *iceConnSplitter) LocalAddr() net.Addr {
 func (s *iceConnSplitter) SetIgnoreDeadlines(ignore bool) {
 	s.ignoreDeadlines = ignore
 	if ignore {
-		s.logf("[raw][%s] [VDI-DEBUG] splitter SetIgnoreDeadlines: active. Clearing all connection deadlines.", s.bridgeID)
 		_ = s.conn.SetDeadline(time.Time{})
 		_ = s.conn.SetReadDeadline(time.Time{})
 		_ = s.conn.SetWriteDeadline(time.Time{})

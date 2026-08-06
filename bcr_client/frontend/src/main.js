@@ -173,9 +173,12 @@ window.onload = function () {
 
     function startStatsPolling(bridgeID, pc) {
         cleanupStatsForBridge(bridgeID);
+        // 5s to line up with Go's [MEDIA-SUMMARY] tick, so the receiver's view
+        // and the relay's view of the same window sit next to each other in the
+        // log instead of interleaving at different rates.
         statsIntervals[bridgeID] = setInterval(() => {
             collectAndLogReceiverStats(bridgeID, pc);
-        }, 2000);
+        }, 5000);
     }
 
     // ── Video Element base configuration ───────────────────────────────────
@@ -890,18 +893,34 @@ window.onload = function () {
                 };
 
                 pc.ontrack = (event) => {
-                    logTerminal(`[Loopback][${bridgeID}] Track received: kind=${event.track.kind} id=${event.track.id} streams=${event.streams.length}`);
-                    if (event.streams && event.streams[0]) {
-                        if (videoElement.srcObject !== event.streams[0]) {
-                            logTerminal(`[Loopback][${bridgeID}] Binding stream to video element`);
-                            videoElement.srcObject = event.streams[0];
-                        }
-                        videoElement.play().catch(e => {
-                            logTerminal(`[Loopback][${bridgeID}] play() blocked: ${e}`);
-                        });
-                    } else {
-                        logTerminal(`[Loopback][${bridgeID}] ERROR: ontrack fired but event.streams[0] is missing`);
+                    const stream = event.streams && event.streams[0];
+                    if (!stream) {
+                        logTerminal(`[Loopback][${bridgeID}] ERROR: ontrack kind=${event.track.kind} fired with no stream — cannot bind`);
+                        return;
                     }
+
+                    const videoTracks = stream.getVideoTracks();
+                    const audioTracks = stream.getAudioTracks();
+                    logTerminal(`[Loopback][${bridgeID}] Track: kind=${event.track.kind} id=${event.track.id} ` +
+                                `(stream now has ${videoTracks.length} video, ${audioTracks.length} audio)`);
+
+                    // A <video> renders only the FIRST video track of its
+                    // MediaStream. Go now sends exactly one per kind, so this is
+                    // unambiguous — but say so loudly if that ever stops holding,
+                    // because the symptom (renders on some runs, not others, with
+                    // healthy stats either way) is otherwise very hard to place.
+                    if (videoTracks.length > 1) {
+                        logErrorTerm(`[Loopback][${bridgeID}] WARNING: ${videoTracks.length} video tracks in one stream — ` +
+                                     `only "${videoTracks[0].id}" will render. Expected exactly one.`);
+                    }
+
+                    if (videoElement.srcObject !== stream) {
+                        logTerminal(`[Loopback][${bridgeID}] Binding stream to video element`);
+                        videoElement.srcObject = stream;
+                    }
+                    videoElement.play().catch(e => {
+                        logTerminal(`[Loopback][${bridgeID}] play() blocked: ${e}`);
+                    });
                 };
 
                 pc.onconnectionstatechange = () => {

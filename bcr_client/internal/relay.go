@@ -30,54 +30,30 @@ func (e *Engine) onRawRTPPacket(bridgeID string, pkt *rtp.Packet, ptCodecMap map
 		return
 	}
 
-	// Strict drop filter: only forward RTP whose PT is currently allowlisted by
-	// preferred codecs (H264/Opus by default). Everything else is fail-closed.
-	strictPTMap := FilterPTCodecMapToPreferred(ptCodecMap, e.cfg.PreferredCodecs)
-	if _, allowed := strictPTMap[pkt.Header.PayloadType]; !allowed {
-		codec, known := ptCodecMap[pkt.Header.PayloadType]
-		e.unknownPTMu.Lock()
-		if e.strictDropPTs == nil {
-			e.strictDropPTs = make(map[uint8]bool)
-		}
-		if _, seen := e.strictDropPTs[pkt.Header.PayloadType]; !seen {
-			e.strictDropPTs[pkt.Header.PayloadType] = true
-			if known {
-				e.logf("[raw][%s] strict-drop PT=%d codec=%s SSRC=%d (not in preferred allowlist video=%q audio=%q)",
-					bridgeID,
-					pkt.Header.PayloadType,
-					codec.MimeType,
-					pkt.SSRC,
-					e.cfg.PreferredCodecs.Video,
-					e.cfg.PreferredCodecs.Audio,
-				)
-			} else {
-				e.logf("[raw][%s] strict-drop PT=%d SSRC=%d (unknown PT, %d codecs registered)",
-					bridgeID,
-					pkt.Header.PayloadType,
-					pkt.SSRC,
-					len(ptCodecMap),
-				)
-			}
-		}
-		e.unknownPTMu.Unlock()
-		return
-	}
-
-	// Look up codec for this packet's payload type.
+	// There is deliberately no codec allowlist here any more.
+	//
+	// This used to drop any payload type outside a preferred set (H264/Opus).
+	// It never narrowed anything — Teams offers H264 under seven payload types
+	// and all seven passed the name check — while being fail-closed, so an SFU
+	// choosing anything unexpected produced silence rather than a picture. The
+	// loopback negotiates its own codec with the receiver regardless of which
+	// payload type the SFU used, so the only question worth asking is whether
+	// we can map this codec at all, and loopbackSession.WriteRTP asks it.
 	codec, ok := ptCodecMap[pkt.Header.PayloadType]
 	if ok {
-		// Sampled diagnostic logging — log every 100th packet per track type.
+		// First packet per track type only — enough to confirm the stream
+		// started and on which SSRC/PT. Rate and loss thereafter are reported
+		// by [MEDIA-SUMMARY] every 5s; sampling here as well just interleaved
+		// several lines a second into the same log.
 		if strings.HasPrefix(strings.ToLower(codec.MimeType), "audio/") {
-			n := atomic.AddUint64(&rtpAudioCount, 1)
-			if n == 1 || n%100 == 0 {
-				e.logf("[raw][%s] RTP audio packet #%d SSRC=%d PT=%d codec=%s seq=%d ts=%d len=%d",
-					bridgeID, n, pkt.SSRC, pkt.PayloadType, codec.MimeType, pkt.SequenceNumber, pkt.Timestamp, len(pkt.Payload))
+			if atomic.AddUint64(&rtpAudioCount, 1) == 1 {
+				e.logf("[raw][%s] first RTP audio: SSRC=%d PT=%d codec=%s seq=%d",
+					bridgeID, pkt.SSRC, pkt.PayloadType, codec.MimeType, pkt.SequenceNumber)
 			}
 		} else if strings.HasPrefix(strings.ToLower(codec.MimeType), "video/") {
-			n := atomic.AddUint64(&rtpVideoCount, 1)
-			if n == 1 || n%100 == 0 {
-				e.logf("[raw][%s] RTP video packet #%d SSRC=%d PT=%d codec=%s seq=%d ts=%d len=%d",
-					bridgeID, n, pkt.SSRC, pkt.PayloadType, codec.MimeType, pkt.SequenceNumber, pkt.Timestamp, len(pkt.Payload))
+			if atomic.AddUint64(&rtpVideoCount, 1) == 1 {
+				e.logf("[raw][%s] first RTP video: SSRC=%d PT=%d codec=%s seq=%d",
+					bridgeID, pkt.SSRC, pkt.PayloadType, codec.MimeType, pkt.SequenceNumber)
 			}
 		}
 	}
@@ -119,13 +95,15 @@ func (e *Engine) onRawRTPPacket(bridgeID string, pkt *rtp.Packet, ptCodecMap map
 		return
 	}
 
-	// Forward the allowlisted, decrypted RTP packet to the loopback PeerConnection.
-	session.WriteRTP(pkt)
+	// Forward the decrypted RTP packet to the loopback PeerConnection, together
+	// with the codec it was negotiated as — that is what decides whether it is
+	// video or audio, and so which loopback track it belongs on.
+	session.WriteRTP(pkt, codec)
 
-	// Sampled loopback confirmation — first packet + every 500th.
-	n := atomic.AddUint64(&loopbackWriteCount, 1)
-	if n == 1 || n%500 == 0 {
-		e.logf("[loopback][relay] WriteRTP #%d bridgeId=%s PT=%d SSRC=%d seq=%d",
-			n, bridgeID, pkt.Header.PayloadType, pkt.SSRC, pkt.SequenceNumber)
+	// One line confirming the relay reached the loopback at all. Throughput
+	// after that is [MEDIA-SUMMARY]'s job.
+	if atomic.AddUint64(&loopbackWriteCount, 1) == 1 {
+		e.logf("[loopback][relay] first packet written to loopback bridgeId=%s PT=%d SSRC=%d",
+			bridgeID, pkt.Header.PayloadType, pkt.SSRC)
 	}
 }

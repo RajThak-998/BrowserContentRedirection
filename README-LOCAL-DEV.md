@@ -129,6 +129,21 @@ privileges that mean nothing on one machine), and no virtual-channel lines are e
 | `BCR_DTLS_STALE_FILTER` | *(on)* | `off` makes the stale/foreign DTLS flight filter report-only instead of dropping. |
 | `BCR_TURN_URL`, `BCR_TURN_USERNAME`, `BCR_TURN_CREDENTIAL` | *(unset)* | Optional TURN relay. |
 
+### Diagnostics (bcr_client)
+
+All off by default. A healthy session logs a few dozen lines; turn these on only
+for the layer you are actually debugging, one at a time.
+
+| Variable | Turns on |
+|---|---|
+| `BCR_ICE_DEBUG=1` | pion/ice at Debug — every candidate pair, every connectivity check, every TURN allocation step. Use when ICE never reaches `Connected`. |
+| `BCR_DTLS_DEBUG=1` | pion/dtls at Trace — per-flight handshake messages and the reason a certificate was rejected. Use when the handshake fails or you see a `bad_certificate` alert. |
+| `BCR_SDP_DUMP=1` | The full munged offer/answer written to `bcr_client.log` (~200 lines per negotiation), for pasting into `chrome://webrtc-internals` or diffing against the cpconv body. |
+
+Our own `[DTLS-TRACE]` record decoding always runs during the handshake and stops
+once it completes — after that every record is encrypted and shows nothing but an
+epoch and a length. DTLS **alerts** are always logged, in both directions.
+
 ### VDI only
 
 | Variable | Effect |

@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 )
 
 // ─── Per-SSRC Stream State ────────────────────────────────────────────────────
@@ -36,30 +35,27 @@ const (
 )
 
 // ssrcStats holds per-SSRC diagnostic counters updated on every inbound packet.
+// Every field here is read by EmitMediaSummary or by getPTForSSRC. Fields that
+// were only ever written have been removed: they were updated once per packet
+// on the SRTP hot path (lastSeen took a clock reading for every packet at
+// ~1000/s) and never appeared in any output.
 type ssrcStats struct {
 	mu sync.Mutex
 
-	ssrc       uint32
-	pt         uint8
-	codec      string
-	role       streamRole
-	firstSeen  time.Time
-	lastSeen   time.Time
-	pktCount   int64
-	byteCount  int64 // payload bytes (post-decrypt)
+	pt        uint8
+	role      streamRole
+	pktCount  int64
+	byteCount int64 // payload bytes (post-decrypt)
 
-	// Sequence tracking for gap/reorder detection.
+	// Sequence tracking for gap detection.
 	highestSeq   uint16
 	seqInitiated bool
 	totalLost    int64
-	totalReorder int64
-	totalDup     int64
 
-	// Keyframe counters (video only).
+	// Keyframe counter (video only).
 	keyframeCount int64
-	lastKeyframe  time.Time
 
-	// NACK counters (if NACK generation is implemented).
+	// NACK counters.
 	nackSent      int64
 	nackRecovered int64
 }
@@ -81,23 +77,44 @@ func (r *ssrcRegistry) getOrCreate(ssrc uint32) (*ssrcStats, bool) {
 	defer r.mu.Unlock()
 	s, ok := r.stats[ssrc]
 	if !ok {
-		s = &ssrcStats{ssrc: ssrc, firstSeen: time.Now()}
+		s = &ssrcStats{}
 		r.stats[ssrc] = s
 	}
 	return s, !ok
 }
 
+// ssrcSnapshot is a lock-free copy of one SSRC's counters, taken for the
+// summary ticker. It is a distinct type from ssrcStats because `*s` would copy
+// the embedded mutex along with the fields (go vet: "assignment copies lock
+// value"), handing the caller a struct carrying a mutex in whatever state it
+// happened to be in.
+type ssrcSnapshot struct {
+	role          streamRole
+	pktCount      int64
+	byteCount     int64
+	totalLost     int64
+	keyframeCount int64
+	nackSent      int64
+	nackRecovered int64
+}
+
 // snapshot returns a copy of all stats (for the summary ticker).
-func (r *ssrcRegistry) snapshot() []*ssrcStats {
+func (r *ssrcRegistry) snapshot() []ssrcSnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]*ssrcStats, 0, len(r.stats))
+	out := make([]ssrcSnapshot, 0, len(r.stats))
 	for _, s := range r.stats {
 		s.mu.Lock()
-		cp := *s
+		out = append(out, ssrcSnapshot{
+			role:          s.role,
+			pktCount:      s.pktCount,
+			byteCount:     s.byteCount,
+			totalLost:     s.totalLost,
+			keyframeCount: s.keyframeCount,
+			nackSent:      s.nackSent,
+			nackRecovered: s.nackRecovered,
+		})
 		s.mu.Unlock()
-		cp2 := cp
-		out = append(out, &cp2)
 	}
 	return out
 }
@@ -178,38 +195,6 @@ func (n *nackState) recover(ssrc uint32, seq uint16) bool {
 
 // ─── SDP Dump Helpers (called after every SDP parse) ─────────────────────────
 
-// DumpPTMap logs the full PT → codec topology using [PTMAP] prefix.
-// Called after ParsePTCodecMap, so it receives the raw map + the full SDP
-// to extract RTX apt mappings and extmaps inline.
-func DumpPTMap(sdp, context string, ptMap map[uint8]CodecInfo, logf func(string, ...any)) {
-	logf("[PTMAP] ── %s ──────────────────────────────────", context)
-	for pt, ci := range ptMap {
-		logf("[PTMAP] PT=%d mime=%s clock=%d", pt, ci.MimeType, ci.ClockRate)
-	}
-
-	// Extract RTX / FEC mappings from fmtp:apt= lines.
-	rtxMappings := extractFmtpAPT(sdp)
-	for rtxPT, mediaPT := range rtxMappings {
-		role := "RTX"
-		logf("[PTMAP] PT=%d mime=video/rtx fmtp=apt=%d  ← [RTX] PT=%d retransmits PT=%d",
-			rtxPT, mediaPT, rtxPT, mediaPT)
-		_ = role
-	}
-	if len(rtxMappings) == 0 {
-		logf("[PTMAP] (no RTX apt mappings found)")
-	}
-
-	// Extmap dump.
-	extmaps := extractExtmaps(sdp)
-	for id, uri := range extmaps {
-		logf("[EXTMAP] id=%d uri=%s", id, uri)
-		if strings.Contains(uri, "transport-wide-cc") || strings.Contains(uri, "transport-cc") {
-			logf("[TWCC] extmap id=%d present in %s", id, context)
-		}
-	}
-	logf("[PTMAP] ── end %s ──────────────────────────────", context)
-}
-
 // extractFmtpAPT parses "a=fmtp:<PT> apt=<N>" lines and returns rtxPT→mediaPT.
 func extractFmtpAPT(sdp string) map[uint8]uint8 {
 	out := make(map[uint8]uint8)
@@ -242,85 +227,29 @@ func extractFmtpAPT(sdp string) map[uint8]uint8 {
 	return out
 }
 
-// extractExtmaps parses "a=extmap:<id>[ direction] <uri>" lines.
-func extractExtmaps(sdp string) map[uint8]string {
-	out := make(map[uint8]string)
-	for _, line := range strings.Split(sdp, "\n") {
-		bare := strings.TrimRight(strings.TrimSpace(line), "\r")
-		if !strings.HasPrefix(bare, "a=extmap:") {
-			continue
-		}
-		rest := bare[len("a=extmap:"):]
-		parts := strings.Fields(rest)
-		if len(parts) < 2 {
-			continue
-		}
-		// parts[0] may be "3" or "3/sendrecv"
-		idStr := strings.SplitN(parts[0], "/", 2)[0]
-		var id uint8
-		if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-			continue
-		}
-		out[id] = parts[len(parts)-1]
-	}
-	return out
-}
-
-// DumpRTCPComposition logs the human-readable packet list for a compound RTCP.
-func DumpRTCPComposition(direction, label string, pktDescs []string, logf func(string, ...any)) {
-	logf("[RTCP-%s] %s packets=[%s]", direction, label, strings.Join(pktDescs, ", "))
-}
-
 // ─── H264 NAL Type Detection ──────────────────────────────────────────────────
 
-// H264NALType classifies an RTP payload as H264 NAL type.
-type H264NALType string
-
-const (
-	H264Single H264NALType = "single"
-	H264STAPA  H264NALType = "STAP-A"
-	H264FUA    H264NALType = "FU-A"
-	H264IDR    H264NALType = "IDR"
-	H264SPS    H264NALType = "SPS"
-	H264PPS    H264NALType = "PPS"
-	H264Other  H264NALType = "other"
-)
-
-// InspectH264NAL classifies RTP payload bytes for H264 media type awareness.
-// Returns (nalType, isKeyframe).
-// payload is the raw RTP payload (after header).
-func InspectH264NAL(payload []byte) (H264NALType, bool) {
+// IsH264Keyframe reports whether an RTP payload starts an IDR (keyframe),
+// handling both a bare NAL unit and the first fragment of a FU-A.
+//
+// This used to also return an H264NALType naming the packetisation form, but
+// its one caller discarded that value, so the type and its seven constants
+// existed only to be thrown away.
+func IsH264Keyframe(payload []byte) bool {
 	if len(payload) < 1 {
-		return H264Other, false
+		return false
 	}
-	nalByte := payload[0] & 0x1F
-	switch {
-	case nalByte == 24: // STAP-A
-		return H264STAPA, false
-	case nalByte == 28: // FU-A
+	switch nalType := payload[0] & 0x1F; nalType {
+	case 5: // IDR
+		return true
+	case 28: // FU-A — the IDR marker is in the fragmentation header
 		if len(payload) < 2 {
-			return H264FUA, false
+			return false
 		}
 		startBit := (payload[1] >> 7) & 1
-		fuNAL := payload[1] & 0x1F
-		if startBit == 1 && fuNAL == 5 {
-			return H264IDR, true // IDR inside FU-A
-		}
-		if startBit == 1 && fuNAL == 7 {
-			return H264SPS, false
-		}
-		if startBit == 1 && fuNAL == 8 {
-			return H264PPS, false
-		}
-		return H264FUA, false
-	case nalByte == 5: // IDR
-		return H264IDR, true
-	case nalByte == 7: // SPS
-		return H264SPS, false
-	case nalByte == 8: // PPS
-		return H264PPS, false
+		return startBit == 1 && payload[1]&0x1F == 5
 	default:
-		return H264Other, false
+		return false
 	}
 }
 
@@ -337,8 +266,28 @@ type mediaSummaryStats struct {
 	dropped   int64
 }
 
+// summaryBaseline holds the previous tick's cumulative totals so each block can
+// report what happened during the interval rather than since the session began.
+type summaryBaseline struct {
+	byRole   map[streamRole]mediaSummaryStats
+	rr       int64
+	remb     int64
+	pli      int64
+	nack     int64
+}
+
+func newSummaryBaseline() *summaryBaseline {
+	return &summaryBaseline{byRole: make(map[streamRole]mediaSummaryStats)}
+}
+
 // EmitMediaSummary logs a compact [MEDIA-SUMMARY] block from the ssrcRegistry snapshot.
-// rtxDropped is passed explicitly because it lives on the session, not the registry.
+//
+// The per-SSRC counters in the registry are cumulative for the life of the
+// session. The block is labelled with an interval, so it subtracts the previous
+// tick's totals and reports the delta — otherwise every number only ever grows
+// and the "bitrate" is lifetime-bytes÷interval, which climbs steadily no matter
+// what the stream is actually doing. Cumulative totals are still shown, in
+// parentheses, because absolute loss over a call is worth seeing too.
 func EmitMediaSummary(
 	bridgeID string,
 	reg *ssrcRegistry,
@@ -346,6 +295,7 @@ func EmitMediaSummary(
 	rtxMap *rtxMap,
 	rtcpRR, rtcpREMB, rtcpPLI, rtcpNACK int64,
 	intervalSec float64,
+	base *summaryBaseline,
 	logf func(string, ...any),
 ) {
 	snaps := reg.snapshot()
@@ -365,17 +315,29 @@ func EmitMediaSummary(
 		st.recovered += s.nackRecovered
 	}
 
-	logf("[MEDIA-SUMMARY] bridgeId=%s interval=%.0fs ──────────────────", bridgeID, intervalSec)
+	logf("[MEDIA-SUMMARY] bridgeId=%s last %.0fs (totals in parens) ─────", bridgeID, intervalSec)
 	for _, role := range []streamRole{roleAudio, rolePrimVideo, roleRTXVideo, roleUnknown} {
 		st, ok := byRole[role]
 		if !ok {
 			continue
 		}
-		kbps := float64(st.bytes*8) / (intervalSec * 1000)
-		logf("[MEDIA-SUMMARY] %-16s pkts=%-6d bitrate=%.0fkbps keyframes=%d lost=%d nack=%d recovered=%d",
-			role, st.packets, kbps, st.keyframes, st.lost, st.nack, st.recovered)
+		prev := base.byRole[role]
+		base.byRole[role] = *st
+
+		dPackets := st.packets - prev.packets
+		dBytes := st.bytes - prev.bytes
+		dKeyframes := st.keyframes - prev.keyframes
+		dLost := st.lost - prev.lost
+		dNack := st.nack - prev.nack
+		dRecovered := st.recovered - prev.recovered
+
+		kbps := float64(dBytes*8) / (intervalSec * 1000)
+		logf("[MEDIA-SUMMARY] %-16s pkts=%-5d bitrate=%-6.0fkbps keyframes=%d lost=%d(%d) nack=%d(%d) recovered=%d(%d)",
+			role, dPackets, kbps, dKeyframes,
+			dLost, st.lost, dNack, st.nack, dRecovered, st.recovered)
 	}
-	logf("[MEDIA-SUMMARY] rtcp: rr=%d remb=%d pli=%d nack=%d",
-		rtcpRR, rtcpREMB, rtcpPLI, rtcpNACK)
+	logf("[MEDIA-SUMMARY] rtcp tx: rr=%d remb=%d pli=%d nack=%d",
+		rtcpRR-base.rr, rtcpREMB-base.remb, rtcpPLI-base.pli, rtcpNACK-base.nack)
+	base.rr, base.remb, base.pli, base.nack = rtcpRR, rtcpREMB, rtcpPLI, rtcpNACK
 	logf("[MEDIA-SUMMARY] ──────────────────────────────────────────────")
 }

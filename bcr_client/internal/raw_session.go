@@ -19,9 +19,6 @@ package engine
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -102,7 +99,6 @@ type seqTracker struct {
 
 	// ── RFC 3550 §6.4.1 / §A.3 statistics for Receiver Report ───────
 	baseSeq     uint16 // First sequence number received
-	badSeq      uint16 // last 'bad' seq number + 1
 	expectedPrior uint32 // expected packets at last RR
 	receivedPrior uint32 // received packets at last RR
 	received    uint32 // packets received (distinct from total to handle init)
@@ -269,10 +265,6 @@ type rawShadowSession struct {
 	videoSSRCs   map[uint32]bool
 	videoSSRCsMu sync.Mutex
 
-	// Diagnostic: track unique PTs we've seen for logging.
-	seenPTs   map[uint8]int64 // PT → count
-	seenPTsMu sync.Mutex
-
 	// Track the highest sequence number + cycles received for each incoming SSRC.
 	// Used for constructing valid RTCP Receiver Reports with proper extended seq.
 	incomingSeqs   map[uint32]*seqTracker
@@ -294,8 +286,6 @@ type rawShadowSession struct {
 	// generation is an atomically-incrementing token attached to every async
 	// operation. Any goroutine holding a stale token self-terminates.
 	generation uint32
-
-	connectErrCh chan error
 
 	// lastRemoteSDPHash is the SDP hash of the SDP most recently accepted into
 	// stateConnecting.  Used to suppress duplicate SHADOW_REMOTE events.
@@ -372,6 +362,10 @@ type rawShadowSession struct {
 	rtcpREMBCount int64
 	rtcpPLICount  int64
 	rtcpNACKCount int64
+
+	// pliLoggedSSRCs remembers which SSRCs have already had an on-demand PLI
+	// reported, so the log carries one line per stream rather than one per PLI.
+	pliLoggedSSRCs map[uint32]bool
 
 	sessionStart time.Time // when SRTP came up
 
@@ -457,8 +451,12 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 	own := ownIceServers()
 	merged := append(append([]IceServer{}, s.iceServers...), own...)
 	stunURIs := iceServersToStunURIs(merged, s.logf, s.bridgeID)
-	s.logf("[raw][%s] using %d ICE server URL(s) (browser=%d servers + own=%d servers)",
-		s.bridgeID, len(stunURIs), len(s.iceServers), len(own))
+	urlNames := make([]string, 0, len(stunURIs))
+	for _, u := range stunURIs {
+		urlNames = append(urlNames, u.String())
+	}
+	s.logf("[raw][%s] ICE servers: %d url(s) (browser=%d own=%d) %s",
+		s.bridgeID, len(stunURIs), len(s.iceServers), len(own), strings.Join(urlNames, " "))
 
 	// ── Step 4: Create ICE agent ──────────────────────────────────────────────
 	gatherDone := make(chan struct{})
@@ -479,24 +477,38 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 			ice.NetworkTypeUDP4,
 			ice.NetworkTypeTCP4,
 		},
+		// Keep link-local (APIPA, 169.254/16) interfaces out of the agent
+		// entirely. Filtering them in OnCandidate only kept them out of the
+		// SDP — pion had already bound a socket on the interface and kept it
+		// as a local candidate, so every connectivity-check round tried to
+		// send from it and Windows answered WSAENETUNREACH ("a socket
+		// operation was attempted to an unreachable network") for each of the
+		// ~7 remote candidates, several times a second, for the whole
+		// checking phase. The address is unroutable off the machine, so no
+		// pair using it could ever succeed.
+		IPFilter: func(ip net.IP) bool {
+			return !ip.IsLinkLocalUnicast()
+		},
 	}
 	if reuseCreds {
 		agentConfig.LocalUfrag = reuseUfrag
 		agentConfig.LocalPwd = reusePwd
 		s.logf("[raw][%s] reusing existing ICE credentials: ufrag=%s", s.bridgeID, reuseUfrag)
 	}
-	// Opt-in verbose ICE tracing (set BCR_ICE_DEBUG=1). Routes pion/ice's per-
-	// candidate-pair connectivity-check logs to the same sink as the std logger
-	// (stdout + bcr_client.log), so we can see EXACTLY which pairs were tried and
-	// why each check failed — instead of only the final "connecting canceled".
-	// Verbose pion/ice tracing hardcoded ON for this test env (no env var needed),
-	// so every candidate-pair connectivity check is captured in bcr_client.log.
+	// pion/ice's own logging. At Debug it emits a line per candidate pair per
+	// connectivity-check round (plus every turnc allocation step), which buries
+	// our own trace — so it is opt-in via BCR_ICE_DEBUG=1 and otherwise reports
+	// warnings and errors only.
 	{
 		lf := logging.NewDefaultLoggerFactory()
 		lf.Writer = log.Default().Writer()
-		lf.DefaultLogLevel = logging.LogLevelDebug
+		if envEnabled("BCR_ICE_DEBUG") {
+			lf.DefaultLogLevel = logging.LogLevelDebug
+			s.logf("[raw][%s] verbose pion/ice tracing enabled (BCR_ICE_DEBUG)", s.bridgeID)
+		} else {
+			lf.DefaultLogLevel = logging.LogLevelWarn
+		}
 		agentConfig.LoggerFactory = lf
-		s.logf("[raw][%s] verbose pion/ice tracing enabled", s.bridgeID)
 	}
 
 	agent, err := ice.NewAgent(agentConfig)
@@ -524,8 +536,9 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 		// machine. In the VDI the 169.254.x host candidate produced nothing but
 		// "wsasendto: unreachable network" errors on every connectivity check,
 		// so it only lengthens ICE checking and bloats the offer.
+		// Defence in depth — agentConfig.IPFilter already keeps link-local
+		// interfaces out of the agent, so this should never fire.
 		if isLinkLocalCandidate(c.Address()) {
-			s.logf("[raw][%s] skipping link-local candidate: %s", s.bridgeID, "a=candidate:"+c.Marshal())
 			return
 		}
 
@@ -544,8 +557,6 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 			}
 			candidateMu.Unlock()
 			if dup {
-				s.logf("[raw][%s] skipping duplicate srflx (same public IP %s): %s",
-					s.bridgeID, addr, "a=candidate:"+c.Marshal())
 				return
 			}
 		}
@@ -555,7 +566,6 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 		idx := len(candidates)
 		candidates = append(candidates, line)
 		candidateMu.Unlock()
-		s.logf("[raw][%s] gathered: %s", s.bridgeID, line)
 
 		// Signal only after the candidate is in the slice, so a waiter woken by
 		// this always finds the srflx present in the payload it builds.
@@ -568,8 +578,17 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 		cb := s.onLateCandidate
 		readySent := s.state >= stateReady && s.readySentCount > 0
 		s.mu.Unlock()
-		if readySent && idx >= s.readySentCount && cb != nil {
-			s.logf("[raw][%s] late candidate (post-READY) trickle: %s", s.bridgeID, line)
+		late := readySent && idx >= s.readySentCount && cb != nil
+
+		// One line per candidate, saying whether it shipped inline in the offer
+		// or is being trickled behind it.
+		disposition := "inline"
+		if late {
+			disposition = "trickled"
+		}
+		s.logf("[raw][%s] candidate (%s): %s", s.bridgeID, disposition, line)
+
+		if late {
 			cb(line)
 		}
 	}); err != nil {
@@ -821,32 +840,13 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	//   a=setup:passive → Go initiates ClientHello     → Go is Client
 	//   default         → Server (Teams almost always advertises "active")
 	role := parseDTLSRole(remoteSDP)
-	s.logf("[raw][%s] DTLS role: %s (from a=setup: in remote SDP)", s.bridgeID, role)
-
-	// ── DIAG: Dump exact a=setup and a=fingerprint lines from remote SDP ──
-	for _, line := range strings.Split(remoteSDP, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "a=setup:") || strings.HasPrefix(trimmed, "a=fingerprint:") {
-			s.logf("[raw][%s] [DIAG] remote SDP line: %s", s.bridgeID, trimmed)
-		}
-	}
-
-	// ── DIAG: Log our own certificate key type ──
-	if len(s.cert.Certificate) > 0 {
-		if localCert, parseErr := x509.ParseCertificate(s.cert.Certificate[0]); parseErr == nil {
-			switch localCert.PublicKey.(type) {
-			case *ecdsa.PublicKey:
-				s.logf("[raw][%s] [DIAG] local cert key type: ECDSA, algo: %s", s.bridgeID, localCert.PublicKeyAlgorithm)
-			case *rsa.PublicKey:
-				s.logf("[raw][%s] [DIAG] local cert key type: RSA, algo: %s", s.bridgeID, localCert.PublicKeyAlgorithm)
-			case ed25519.PublicKey:
-				s.logf("[raw][%s] [DIAG] local cert key type: Ed25519", s.bridgeID)
-			default:
-				s.logf("[raw][%s] [DIAG] local cert key type: unknown (%T)", s.bridgeID, localCert.PublicKey)
-			}
-			s.logf("[raw][%s] [DIAG] local cert fingerprint: sha-256 %s", s.bridgeID, sha256ColonHex(localCert.Raw))
-		}
-	}
+	// One line for the whole role/identity decision. a=setup: and a=fingerprint:
+	// repeat once per m-section (4–8 lines each on a Teams SDP) and are always
+	// identical under BUNDLE, so only the parsed result is worth reporting; the
+	// full SDP is already in the [SDP-INSPECT] dump if a line-level check is
+	// ever needed.
+	s.logf("[raw][%s] DTLS role=%s (a=setup:%s) peer_fp=%s",
+		s.bridgeID, role, firstSDPAttr(remoteSDP, "a=setup:"), safePrefix(normalizeFingerprint(remoteFP), 17))
 
 	// Key material capture strategy:
 	//
@@ -864,13 +864,18 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 		exporterLabel = "EXTRACTOR-dtls_srtp"
 	)
 
-	// ── DIAG: pion/dtls internal logger to trace handshake flights ──
-	// Trace (not Debug) is required to see the per-flight handshake messages and
-	// the exact reason a certificate is rejected (parse error, sig alg, etc.) —
-	// which is what we need to explain the bad_certificate alert.
+	// pion/dtls's internal logger. Trace prints every flight transition and
+	// every record, which is what we needed while chasing the bad_certificate
+	// alert but is pure duplication of our own [DTLS-TRACE] lines in a healthy
+	// run. Opt in with BCR_DTLS_DEBUG=1 when a handshake actually fails —
+	// Trace is the only level that gives the reason a certificate was rejected.
 	pionLogFactory := logging.NewDefaultLoggerFactory()
-	pionLogFactory.DefaultLogLevel = logging.LogLevelTrace
 	pionLogFactory.Writer = log.Writer()
+	if envEnabled("BCR_DTLS_DEBUG") {
+		pionLogFactory.DefaultLogLevel = logging.LogLevelTrace
+	} else {
+		pionLogFactory.DefaultLogLevel = logging.LogLevelWarn
+	}
 
 	dtlsCfg := &dtls.Config{
 		Certificates:           []tls.Certificate{s.cert},
@@ -884,27 +889,15 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 		LoggerFactory:          pionLogFactory,
 		VerifyConnection: func(st *dtls.State) error {
 			vcCalled = true
-			s.logf("[raw][%s] [DIAG] VerifyConnection entered: peerCerts=%d cipherSuiteID=0x%04x",
-				s.bridgeID, len(st.PeerCertificates), st.CipherSuiteID)
-
 			if len(st.PeerCertificates) > 0 {
 				capturedPeerCert = make([]byte, len(st.PeerCertificates[0]))
 				copy(capturedPeerCert, st.PeerCertificates[0])
-
-				// DIAG: Log remote peer cert key type
-				if peerCert, pErr := x509.ParseCertificate(st.PeerCertificates[0]); pErr == nil {
-					s.logf("[raw][%s] [DIAG] remote peer cert key type: %T algo: %s",
-						s.bridgeID, peerCert.PublicKey, peerCert.PublicKeyAlgorithm)
-					s.logf("[raw][%s] [DIAG] remote peer cert fingerprint: sha-256 %s",
-						s.bridgeID, sha256ColonHex(peerCert.Raw))
-				}
 			}
 			return nil
 		},
 	}
 
 	rAddr := iceConn.RemoteAddr()
-	s.logf("[raw][%s] [DIAG] calling dtls.%s rAddr=%v", s.bridgeID, role, rAddr)
 
 	var dtlsConn *dtls.Conn
 	switch role {
@@ -920,13 +913,13 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	// pion/dtls v3 uses lazy handshake: Client()/Server() only create the
 	// connection struct — the actual DTLS flight exchange does NOT start until
 	// the first Read(), Write(), or explicit HandshakeContext() call.
-	s.logf("[raw][%s] [DIAG] starting explicit DTLS HandshakeContext", s.bridgeID)
+	dtlsStart := time.Now()
 	if err = dtlsConn.HandshakeContext(ctx); err != nil {
-		s.logf("[raw][%s] [DIAG] DTLS HandshakeContext FAILED: vcCalled=%v err=%v", s.bridgeID, vcCalled, err)
+		s.logf("[raw][%s] DTLS handshake FAILED after %v (role=%s peer=%v vcCalled=%v): %v — rerun with BCR_DTLS_DEBUG=1 for flight-level detail",
+			s.bridgeID, time.Since(dtlsStart).Round(time.Millisecond), role, rAddr, vcCalled, err)
 		_ = dtlsConn.Close()
 		return fmt.Errorf("DTLS handshake (%s): %w", role, err)
 	}
-	s.logf("[raw][%s] [DIAG] DTLS HandshakeContext completed successfully", s.bridgeID)
 	s.dtlsConn = dtlsConn
 
 	// Stop filtering: from here records are encrypted (epoch > 0) and cannot be
@@ -939,10 +932,9 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 
 	// ── Post-handshake: extract SRTP profile and keying material ─────────
 	srtpProfile, profileOK := dtlsConn.SelectedSRTPProtectionProfile()
-	s.logf("[raw][%s] DTLS handshake done: vcCalled=%v cert=%v srtpProfile=%v(%v)",
-		s.bridgeID, vcCalled,
-		len(capturedPeerCert) > 0,
-		srtpProfile, profileOK)
+	s.logf("[raw][%s] DTLS handshake OK in %v: role=%s profile=%v peerCert=%v",
+		s.bridgeID, time.Since(dtlsStart).Round(time.Millisecond), role,
+		srtpProfile, len(capturedPeerCert) > 0)
 
 	if !profileOK || srtpProfile == 0 {
 		_ = dtlsConn.Close()
@@ -981,8 +973,6 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 		_ = dtlsConn.Close()
 		return fmt.Errorf("DTLS: key material length %d != expected %d", len(capturedKeyMaterial), materialLen)
 	}
-	s.logf("[raw][%s] [DIAG] Key material exported: %d bytes", s.bridgeID, len(capturedKeyMaterial))
-
 	// Grab peer cert from ConnectionState if VerifyConnection didn't capture it.
 	if capturedPeerCert == nil && len(st.PeerCertificates) > 0 {
 		capturedPeerCert = st.PeerCertificates[0]
@@ -993,7 +983,6 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 		_ = dtlsConn.Close()
 		return fmt.Errorf("fingerprint verify: %w", err)
 	}
-	s.logf("[raw][%s] remote DTLS fingerprint verified", s.bridgeID)
 
 	// ── Step 8: SRTP key derivation ────────────────────────────────────────────
 	goIsClient := role == "client"
@@ -1003,7 +992,7 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	}
 	s.srtpCtx = srtpCtx
 	s.srtcpCtx = srtcpCtx
-	s.logf("[raw][%s] SRTP context ready, starting read loop", s.bridgeID)
+	s.logf("[raw][%s] peer fingerprint verified, SRTP up (%v) — decrypting", s.bridgeID, srtp.ProtectionProfile(srtpProfile))
 
 	// ── Step 9: SRTP read loop ─────────────────────────────────────────────────
 	// IMPORTANT: Do NOT derive loopCtx from the Connect() ctx parameter.
@@ -1057,7 +1046,13 @@ func (s *rawShadowSession) AddRemoteIceCandidate(raw string) {
 	// Strip any SDP attribute prefix so we get the bare candidate string.
 	raw = strings.TrimPrefix(raw, "a=candidate:")
 	raw = strings.TrimPrefix(raw, "candidate:")
-	raw = strings.TrimRight(raw, "\r")
+	raw = strings.TrimSpace(strings.TrimRight(raw, "\r"))
+
+	// An empty candidate is the peer's end-of-candidates marker arriving via
+	// addIceCandidate, not a malformed one. Nothing to add.
+	if raw == "" {
+		return
+	}
 
 	c, err := ice.UnmarshalCandidate(raw)
 	if err != nil {
@@ -1068,7 +1063,7 @@ func (s *rawShadowSession) AddRemoteIceCandidate(raw string) {
 		s.logf("[raw][%s] AddRemoteCandidate failed: %v", s.bridgeID, err)
 		return
 	}
-	s.logf("[raw][%s] remote ICE candidate added: %s", s.bridgeID, raw[:min(len(raw), 60)])
+	s.logf("[raw][%s] remote candidate: %s", s.bridgeID, raw[:min(len(raw), 60)])
 }
 
 func (s *rawShadowSession) UpdateIceServers(servers []IceServer) {
@@ -1077,17 +1072,6 @@ func (s *rawShadowSession) UpdateIceServers(servers []IceServer) {
 
 	s.iceServers = servers
 	s.logf("[raw][%s] received dynamic ICE servers update: %d server(s)", s.bridgeID, len(servers))
-}
-
-// checkGen returns an error if the session's generation has advanced past gen.
-// Call this at the start of long async operations and after wakes from sleep.
-func (s *rawShadowSession) checkGen(gen uint32) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.generation != gen {
-		return fmt.Errorf("ErrStaleGeneration: gen=%d current=%d", gen, s.generation)
-	}
-	return nil
 }
 
 // Close tears down the session. Safe to call multiple times.
@@ -1295,7 +1279,22 @@ func (s *rawShadowSession) requestKeyframe(videoSSRC uint32) {
 		s.logf("[raw][%s] requestKeyframe: write PLI failed: %v", s.bridgeID, writeErr)
 		return
 	}
-	s.logf("[raw][%s] requestKeyframe: PLI sent for SSRC %d", s.bridgeID, videoSSRC)
+
+	// On-demand PLIs are frequent — WebKit asks for one whenever its decoder
+	// stalls, which during a bad patch is several a second. Report the first
+	// per SSRC only; the running total is in [MEDIA-SUMMARY] pli=.
+	s.rtcpMu.Lock()
+	s.rtcpPLICount++
+	if s.pliLoggedSSRCs == nil {
+		s.pliLoggedSSRCs = make(map[uint32]bool)
+	}
+	first := !s.pliLoggedSSRCs[videoSSRC]
+	s.pliLoggedSSRCs[videoSSRC] = true
+	s.rtcpMu.Unlock()
+
+	if first {
+		s.logf("[raw][%s] on-demand PLI for video SSRC %d (further PLIs counted in [MEDIA-SUMMARY])", s.bridgeID, videoSSRC)
+	}
 }
 
 // startupKeyframeLoop fires a PLI for every known video SSRC shortly after
@@ -1328,7 +1327,6 @@ func (s *rawShadowSession) startupKeyframeLoop(ctx context.Context) {
 				continue
 			}
 			sentSSRCs[ssrc] = true
-			s.logf("[raw][%s] [startup-PLI] round %d: sending PLI for video SSRC %d", s.bridgeID, round, ssrc)
 			s.requestKeyframe(ssrc)
 		}
 	}
@@ -1541,14 +1539,6 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 		}
 	}
 
-	// Diagnostic: log unique PTs we see (sampled to avoid spam).
-	s.seenPTsMu.Lock()
-	if s.seenPTs == nil {
-		s.seenPTs = make(map[uint8]int64)
-	}
-	s.seenPTs[header.PayloadType]++
-	s.seenPTsMu.Unlock()
-
 	// ── Unmarshal full RTP packet (used for H264 inspection + relay) ───
 	pkt := &rtp.Packet{}
 	if err := pkt.Unmarshal(decrypted); err != nil {
@@ -1562,10 +1552,8 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 		if isNew {
 			st.pt = header.PayloadType
 			st.role = roleUnknown
-			st.codec = "?"
 			s.mu.Lock()
 			if ci, ok := s.ptCodecMap[header.PayloadType]; ok {
-				st.codec = ci.MimeType
 				if strings.Contains(strings.ToUpper(ci.MimeType), "VIDEO") {
 					st.role = rolePrimVideo
 				} else if strings.Contains(strings.ToUpper(ci.MimeType), "AUDIO") {
@@ -1573,11 +1561,9 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 				}
 			}
 			s.mu.Unlock()
-			if mediaPT, ok := s.rtxMapping.isRTX(header.PayloadType); ok {
+			if _, ok := s.rtxMapping.isRTX(header.PayloadType); ok {
 				st.role = roleRTXVideo
-				st.codec = fmt.Sprintf("video/rtx(apt=%d)", mediaPT)
 			}
-
 		}
 		// Gap / reorder detection.
 		if st.seqInitiated {
@@ -1598,8 +1584,7 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 						go s.sendNACK(header.SSRC, missing)
 					}
 				}
-			case delta < 0:
-				st.totalReorder++
+			case delta < 0: // reordered or duplicate — nothing to record
 			}
 		}
 		if !st.seqInitiated || int16(header.SequenceNumber-st.highestSeq) > 0 {
@@ -1608,7 +1593,6 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 		}
 		st.pktCount++
 		st.byteCount += int64(len(decrypted))
-		st.lastSeen = time.Now()
 		st.mu.Unlock()
 	}
 
@@ -1617,12 +1601,10 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 	ci, ciOK := s.ptCodecMap[header.PayloadType]
 	s.mu.Unlock()
 	if ciOK && strings.Contains(strings.ToUpper(ci.MimeType), "H264") && len(pkt.Payload) > 0 {
-		_, isKF := InspectH264NAL(pkt.Payload)
-		if isKF {
+		if IsH264Keyframe(pkt.Payload) {
 			if st, _ := s.ssrcReg.getOrCreate(header.SSRC); st != nil {
 				st.mu.Lock()
 				st.keyframeCount++
-				st.lastKeyframe = time.Now()
 				st.mu.Unlock()
 			}
 		}
@@ -1819,6 +1801,19 @@ func (s *rawShadowSession) addRemoteSdpCandidates(sdp string) {
 	s.logf("[raw][%s] added %d remote SDP candidates", s.bridgeID, added)
 }
 
+// firstSDPAttr returns the value of the first line with the given attribute
+// prefix, or "" if absent. Used for one-line diagnostics of attributes that
+// BUNDLE repeats identically in every m-section.
+func firstSDPAttr(sdp, prefix string) string {
+	for _, line := range strings.Split(sdp, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+		}
+	}
+	return ""
+}
+
 // parseDTLSRole reads a=setup: from the SDP and returns the DTLS role Go should use.
 //
 //	a=setup:active  → remote initiates ClientHello → Go is Server  ("server")
@@ -1836,15 +1831,14 @@ func parseDTLSRole(sdp string) string {
 		switch val {
 		case "passive":
 			return "client"
-		case "active":
-			return "server"
 		default:
-			log.Printf("[VDI-DEBUG] parseDTLSRole: found setup=%q, defaulting to 'server'", val)
-			return "server" 
+			// "active", "actpass", or anything unrecognised → server. The
+			// caller logs the parsed a=setup: value alongside the role, so a
+			// surprising input is visible there without a second line here.
+			return "server"
 		}
 	}
-	log.Printf("[VDI-DEBUG] parseDTLSRole: no a=setup line found, defaulting to 'server'")
-	return "server" 
+	return "server"
 }
 
 // verifyPeerCertByDER checks the DTLS peer cert (raw DER bytes captured via
@@ -1916,9 +1910,6 @@ func deriveSRTPContextFromMaterial(material []byte, goIsClient bool, profile srt
 		inboundSalt = material[keyLen*2 : keyLen*2+saltLen]
 		outboundSalt = material[keyLen*2+saltLen : expectedLen]
 	}
-
-	logf("[raw][%s] SRTP inbound key[0:4]=%x salt[0:4]=%x goIsClient=%v profile=%v",
-		bridgeID, inboundKey[:4], inboundSalt[:4], goIsClient, profile)
 
 	inboundCtx, err := srtp.CreateContext(
 		inboundKey, inboundSalt,
@@ -2010,6 +2001,16 @@ func gatherWaitBudget() time.Duration {
 	return defaultGatherWait
 }
 
+// envEnabled reports whether an opt-in diagnostic env var is switched on.
+// Accepts "1", "true", "yes", "on" (case-insensitive).
+func envEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // gatherWaitForComplete reports whether to wait for ICE gathering to finish
 // entirely rather than leaving as soon as the srflx is in hand. Set
 // BCR_GATHER_MODE=complete to restore the old (slow) behaviour for A/B testing.
@@ -2047,9 +2048,6 @@ func iceServersToStunURIs(servers []IceServer, logf func(string, ...any), bridge
 			if srv.Credential != "" {
 				uri.Password = srv.Credential
 			}
-			hasCreds := srv.Username != "" || srv.Credential != ""
-			logf("[raw][%s] parsed ICE server: %s (scheme: %s, host: %s, port: %d, credentials: %t)",
-				bridgeID, rawURL, uri.Scheme, uri.Host, uri.Port, hasCreds)
 			out = append(out, uri)
 		}
 	}
@@ -2076,9 +2074,11 @@ func (s *rawShadowSession) sendNACK(mediaSSRC uint32, missing []uint16) {
 	}
 
 	// Cap to avoid MTU overflow (each NackPair is 4 bytes; 100 pairs = 400 bytes).
+	// Capping is routine under loss and fires several times a second when the
+	// ingress leg is bad, so it is counted rather than logged; the NACK totals
+	// appear in [MEDIA-SUMMARY].
 	const maxNACKSeqs = 100
 	if len(missing) > maxNACKSeqs {
-		s.logf("[NACK-TX] capping NACK from %d to %d seqs for SSRC=%d", len(missing), maxNACKSeqs, mediaSSRC)
 		missing = missing[:maxNACKSeqs]
 	}
 
@@ -2245,6 +2245,8 @@ func (s *rawShadowSession) mediaSummaryLoop(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	baseline := newSummaryBaseline()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -2262,7 +2264,7 @@ func (s *rawShadowSession) mediaSummaryLoop(ctx context.Context) {
 			s.rtcpMu.Lock()
 			rr, remb, pli, nack := s.rtcpRRCount, s.rtcpREMBCount, s.rtcpPLICount, s.rtcpNACKCount
 			s.rtcpMu.Unlock()
-			EmitMediaSummary(s.bridgeID, s.ssrcReg, ptMap, s.rtxMapping, rr, remb, pli, nack, interval.Seconds(), s.logf)
+			EmitMediaSummary(s.bridgeID, s.ssrcReg, ptMap, s.rtxMapping, rr, remb, pli, nack, interval.Seconds(), baseline, s.logf)
 		}
 	}
 }

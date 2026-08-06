@@ -1460,19 +1460,6 @@
         return addr.includes(':');
     }
 
-    // ── DPI Firewall: Host-Candidate Filter ────────────────────────────────────
-    // Returns true if the candidate line is of type 'host'.
-    // Host candidates contain private LAN IPs (10.x, 192.168.x, 169.254.x).
-    // Trickling these to Teams causes Teams to include them in its signaling
-    // POST to the SFU — and the VDI DPI firewall RSTs the TCP connection
-    // when it sees private IPs in outbound HTTP payloads.
-    // Only srflx (STUN-mapped public IPs) and relay (TURN relay IPs) are safe.
-    function isHostCandidate(line) {
-        // candidate line format: candidate:... typ host ...
-        // or with a= prefix:    a=candidate:... typ host ...
-        return /\btyp\s+host\b/.test(line);
-    }
-
     // ══ BISECT TOGGLES ═════════════════════════════════════════════════════════
     // Diagnostic switches to isolate WHAT in the munged offer trips the VDI's
     // reset of POST api.flightproxy.skype.com/api/v2/cpconv. Relay-only candidates
@@ -1491,6 +1478,11 @@
     //   BCR_DISABLE_CODEC_PIN — keep shadow munge, but send Teams' full codec list
     //     instead of pinning to H264+opus. Tests whether the reduced codec set is the
     //     trigger (it's the biggest content difference vs a working non-BCR offer).
+    //     Now also stops remote offers being scrubbed; before, it only affected the
+    //     offers we create, so the pin was never fully off and the recorded result
+    //     below was measured with remote-offer scrubbing still active.
+    //     Safe to switch on for media reasons too — bcr_client no longer requires
+    //     H264/Opus. See the BCR_PREFERRED_*_CODEC notes further down.
     //
     //   BCR_DISABLE_SHADOW_MUNGE — keep codec pin, but do NOT replace ice-ufrag/pwd/
     //     fingerprint/connection-address. Tests whether the credential munge is the
@@ -1498,42 +1490,6 @@
     const BCR_SDP_PASSTHROUGH = false;
     const BCR_DISABLE_CODEC_PIN = false;  // Test 2 done: codec pin is NOT the cpconv trigger
     const BCR_DISABLE_SHADOW_MUNGE = false;
-
-    // ── DPI Firewall: srflx-Candidate Filter ──────────────────────────────────
-    // When true, only TURN 'relay' candidates are trickled to Teams; 'srflx'
-    // candidates are dropped.
-    //
-    // Why: a srflx candidate advertises the PUBLIC IP of the machine running
-    // bcr_client (e.g. 14.139.108.227) — an address that belongs to a completely
-    // different network than the VDI. A DPI appliance inspecting the outbound
-    // cpconv call-setup POST sees the session advertising media on a foreign
-    // public IP, which is the signature of media redirection, and RSTs the
-    // connection (observed as: POST api.flightproxy.skype.com/api/v2/cpconv
-    // net::ERR_CONNECTION_RESET, retried 3x, call never placed).
-    //
-    // Relay candidates carry Microsoft's own Azure TURN addresses (20.202.x.x)
-    // and are indistinguishable from an ordinary Teams call, so they pass.
-    // Media still reaches bcr_client — via Microsoft's TURN relay instead of
-    // directly — at the cost of a small amount of extra latency.
-    //
-    // Set to false to restore srflx trickling (direct path, lower latency) if
-    // the DPI policy allows it.
-    //
-    // UPDATE: proven safe and NECESSARY. bcr_client's host candidates are its local
-    // LAN (10.x/192.168.x) — unreachable from Microsoft's SFU. Its ONLY TURN-free
-    // routable candidate is srflx (its public IP). Dropping srflx left the SFU with
-    // no way to reach bcr_client → ICE never connected. Keep srflx flowing.
-    const BCR_RELAY_ONLY_CANDIDATES = false;
-
-    // Host candidates are bcr_client's local LAN (unreachable from the SFU). They're
-    // inlined into the offer anyway and are harmless to trickle, so we do NOT drop
-    // them by default (the "private IP trips the DPI" theory was disproven). Flip to
-    // true only to experiment with excluding them.
-    const BCR_DROP_HOST_CANDIDATES = false;
-
-    function isSrflxCandidate(line) {
-        return /\btyp\s+srflx\b/.test(line);
-    }
 
     // Scrubs `raddr <private-ip> rport <port>` from any candidate line.
     // srflx candidates carry the STUN-derived public address as the main IP (safe),
@@ -1590,23 +1546,19 @@
                     return false;
                 }
 
-                // Host candidates are NOT dropped anymore. The old "private IPs trip
-                // the DPI" theory was disproven: a working non-BCR cpconv carried
-                // private host IPs (172.25.0.219) and connected fine. Host candidates
-                // are bcr_client's local LAN (useless to the SFU) but harmless, and
-                // mirroring normal Teams (which sends them) is the safe default.
-                if (BCR_DROP_HOST_CANDIDATES && isHostCandidate(trimmed)) {
-                    BCR_LOG('[BCR] Dropping host candidate (toggle):', trimmed);
-                    return false;
-                }
-
-                // srflx is the KEY routable candidate (bcr_client's public IP → pairs
-                // with the SFU's relay). Only dropped if relay-only mode is forced on.
-                if (BCR_RELAY_ONLY_CANDIDATES && isSrflxCandidate(trimmed)) {
-                    BCR_LOG('[BCR] Dropping srflx candidate (relay-only mode):', trimmed);
-                    return false;
-                }
-
+                // Nothing else is filtered, and both of the candidate-type filters
+                // that used to live here have been removed because their experiments
+                // concluded:
+                //
+                //   srflx must NOT be dropped. It is bcr_client's only TURN-free
+                //   routable candidate — its host candidates are a LAN the SFU
+                //   cannot reach — so relay-only mode left the SFU with no path
+                //   and ICE never connected.
+                //
+                //   host candidates are harmless to send. The "private IPs trip the
+                //   VDI DPI" theory was disproven: a working non-BCR cpconv carried
+                //   private host IPs (172.25.0.219) and connected fine. Normal Teams
+                //   sends them, so mirroring that is the safe default.
                 return true;
             });
 
@@ -1680,10 +1632,28 @@
     }
 
     // ── SDP Codec Pinning ──────────────────────────────────────────────────────
-    // Preferred codecs for the BCR pipeline. By constraining the SDP to a single
-    // video codec (H264) and audio codec (Opus), we prevent the SFU from switching
-    // codecs mid-session, which would trigger renegotiation cascades that crash
-    // the external player's decoder pipeline.
+    // Constrains the SDP to one video codec (H264) and one audio codec (Opus),
+    // so the SFU cannot switch codec mid-session.
+    //
+    // This is now a POLICY choice, not a correctness requirement. bcr_client used
+    // to need it: its loopback built one track per payload type and dropped
+    // anything outside an H264/Opus allowlist, so an unexpected codec meant
+    // silence. It no longer does — the loopback carries one video and one audio
+    // track, maps VP8/VP9/AV1/H265/Opus/G722/PCMU/PCMA onto them, and rebuilds a
+    // track around whatever actually arrives if its initial guess was wrong (see
+    // canonicalCodec and switchTrackCodecLocked in bcr_client/internal/loopback.go).
+    //
+    // What the pin still buys is a stable decoder in the WebView and no mid-call
+    // codec change to renegotiate around. What it costs is that Teams may not use
+    // VP9/AV1 even where they would be more efficient than H264 on this path.
+    //
+    // Note it does NOT pin to a single payload type: Teams offers H264 under
+    // seven, differing in packetization-mode and profile-level-id, and all seven
+    // survive here. That is harmless — bcr_client treats them as one codec — but
+    // it does mean "pinned" means "one codec", not "one format".
+    //
+    // To turn the pin off, set BCR_DISABLE_CODEC_PIN below; it now covers both
+    // the offers we create and the remote offers we answer.
     const BCR_PREFERRED_VIDEO_CODEC = 'H264';
     const BCR_PREFERRED_AUDIO_CODEC = 'opus';
 
@@ -2266,9 +2236,17 @@
                 const descType = description.type.toLowerCase();
                 let effectiveRemoteSdp = description.sdp;
 
-                // Aggressive renegotiation pinning: scrub remote offers before any
-                // downstream processing so H264/VP9 never leak into Go state.
-                if (descType === 'offer') {
+                // Renegotiation pinning: constrain a remote offer to the preferred
+                // codecs before the browser answers it, so the answer — and
+                // therefore what the SFU goes on to send — stays on one codec.
+                //
+                // This MUST honour the same toggles as the createOffer path below.
+                // It did not, which meant BCR_DISABLE_CODEC_PIN and
+                // BCR_SDP_PASSTHROUGH only ever disabled half the pinning: our own
+                // offers went out with the full codec list while remote offers were
+                // still being scrubbed to H264. Any earlier bisect result recorded
+                // against those flags was measured in that half-on state.
+                if (descType === 'offer' && !BCR_SDP_PASSTHROUGH && !BCR_DISABLE_CODEC_PIN) {
                     const scrubbedOfferSdp = filterSdpToPreferredCodecs(description.sdp);
                     if (scrubbedOfferSdp !== description.sdp) {
                         BCR_LOG('[BCR] Scrubbed remote offer to preferred codecs bridgeId=', entry.bridgeId);
@@ -2316,18 +2294,10 @@
                     BCR_LOG('[BCR] setRemoteDescription FAILED bridgeId=', entry2.bridgeId,
                         'name=', errName, 'message=', errMsg);
 
-                    // Emit diagnostic so Go side / content script can correlate failures
-                    emitShadowEvent('BCR_SHADOW_DIAGNOSTIC', {
-                        type: 'SET_REMOTE_DESC_FAILED',
-                        bridgeId: entry2.bridgeId,
-                        errorName: errName,
-                        errorMessage: errMsg,
-                        sdpType: entry2?.lastCreateActionType ?? 'unknown',
-                        timestamp: Date.now(),
-                    });
-
-                    // Still swallow to prevent unhandled rejection crashing Teams UI,
-                    // but NOW we have a record of it.
+                    // Swallowed to keep an unhandled rejection from breaking Teams'
+                    // UI. The BCR_LOG above is the record — a BCR_SHADOW_DIAGNOSTIC
+                    // event used to be emitted here too, but bootstrap.js forwards
+                    // only the fixed BCR_RTC_SHADOW_* set, so nothing ever saw it.
                 });
             }
             return srdPromise;

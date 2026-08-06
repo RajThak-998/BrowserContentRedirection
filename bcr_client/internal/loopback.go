@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,8 +30,9 @@ const (
 
 	// nackLogMinInterval is the minimum wall-clock gap between NACK-summary log
 	// lines. Time-based (not per-N-NACKs) so heavy loss can't turn logging into a
-	// self-inflicted CPU/IO storm that starves the SRTP read loop.
-	nackLogMinInterval = 2 * time.Second
+	// self-inflicted CPU/IO storm that starves the SRTP read loop. Matched to the
+	// [MEDIA-SUMMARY] cadence so the two can be read as one picture.
+	nackLogMinInterval = 5 * time.Second
 
 	// nackCooldownMs is the minimum interval (in ms) between forwarding
 	// NACKs to the remote VDI for the same SSRC. Prevents flooding.
@@ -79,6 +81,56 @@ func (rb *rtpRingBuffer) retrieve(seq uint16) ([]byte, bool) {
 	return nil, false
 }
 
+// trackKind is the media kind a loopback track carries. The loopback has
+// exactly one track per kind — see loopbackSession.tracks.
+type trackKind string
+
+const (
+	kindVideo trackKind = "video"
+	kindAudio trackKind = "audio"
+)
+
+// loopbackTrack is one outbound track on the loopback PeerConnection, together
+// with everything needed to rewrite inbound SFU packets onto it.
+type loopbackTrack struct {
+	kind   trackKind
+	track  *webrtc.TrackLocalStaticRTP
+	sender *webrtc.RTPSender
+
+	// mime is the canonical Pion MimeType the track was created with. Packets
+	// whose codec maps to a different mime cannot be written here — the
+	// receiver negotiated one decoder for this track.
+	mime string
+
+	// boundPT / boundSSRC are what Pion assigned on the loopback side, taken
+	// from the sender's parameters after SetLocalDescription. Every packet is
+	// rewritten to these before being written to the track.
+	boundPT   webrtc.PayloadType
+	boundSSRC uint32
+
+	// srcSSRC is the single inbound (SFU-side) SSRC pinned to this track,
+	// claimed by the first packet of this kind to arrive. Later packets from
+	// other SSRCs are dropped rather than interleaved: two encoders muxed onto
+	// one SSRC produce a stream no decoder can make sense of.
+	srcSSRC uint32
+
+	// cache holds recent packets as written, so a NACK from the receiver can be
+	// answered locally instead of waiting a round trip to the SFU.
+	cache *rtpRingBuffer
+
+	// codecSwitches counts how many times this track has been rebuilt because
+	// the arriving codec did not match the one it was created with. Bounded by
+	// maxCodecSwitchesPerKind so an SFU that alternates codecs cannot put the
+	// loopback into a renegotiation loop.
+	codecSwitches int
+}
+
+// maxCodecSwitchesPerKind bounds self-healing. One switch is the expected case
+// (the initial codec was guessed from the offer, the SFU chose another); more
+// than a couple means something is flapping, and continuing to renegotiate
+// would be worse than settling on what we have.
+const maxCodecSwitchesPerKind = 3
+
 type loopbackSession struct {
 	bridgeID        string
 	logf            func(format string, args ...any)
@@ -90,30 +142,32 @@ type loopbackSession struct {
 	mu sync.Mutex
 	pc *webrtc.PeerConnection
 
-	// Map of PayloadType to the local track where we write decrypted RTP
-	tracks map[uint8]*webrtc.TrackLocalStaticRTP
+	// Exactly one track per media kind.
+	//
+	// This used to be one track per inbound payload type, which meant a Teams
+	// offer (seven H264 PTs differing only in packetization-mode and
+	// profile-level-id, plus Opus) produced eight tracks — seven of them video,
+	// six of which never carried a packet. The frontend binds
+	// videoElement.srcObject = event.streams[0], and a <video> renders the FIRST
+	// video track in the stream, so whether anything appeared depended on which
+	// track Pion happened to add first. That order comes from Go map iteration,
+	// which is randomised per process: the same build rendered on one run and
+	// showed nothing on the next.
+	//
+	// The loopback has its own payload-type space anyway — all seven H264 PTs
+	// were bound to loopback PT=96 regardless — so per-PT tracks bought nothing
+	// even when they worked.
+	tracks map[trackKind]*loopbackTrack
 
-	// Map of VDI PayloadType to the RTPSender to retrieve assigned parameters
-	senders map[uint8]*webrtc.RTPSender
-
-	// Map of VDI PayloadType to Pion's dynamically assigned loopback PayloadType
-	boundPTs map[uint8]webrtc.PayloadType
-
-	// Map of VDI PayloadType to Pion's dynamically assigned loopback SSRC
-	boundSSRCs map[uint8]uint32
-
-	// Map of loopback SSRC to original VDI SSRC
+	// loopbackToVdiSSRC maps our outbound SSRC back to the SFU-side SSRC, so
+	// RTCP arriving from the receiver can be addressed to the right remote
+	// stream.
 	loopbackToVdiSSRC map[uint32]uint32
-
-	// Local RTP packet cache per loopback SSRC for instant NACK retransmission.
-	// Key: loopback SSRC, Value: ring buffer of recent packets.
-	rtpCache map[uint32]*rtpRingBuffer
 
 	// NACK statistics for sampled logging (avoids per-packet log spam).
 	nackLocalHit   uint64 // NACKs satisfied from local cache
 	nackLocalMiss  uint64 // NACKs that had to be forwarded to VDI
 	nackTotal      uint64 // total NACK requests received
-	nackLastLog    uint64 // nackTotal value at last log
 
 	nackLastLogTime time.Time // wall-clock of last NACK-summary log (time throttle)
 
@@ -125,9 +179,6 @@ type loopbackSession struct {
 
 	// Track the current codecs we know about to detect when to add tracks
 	ptCodecMap map[uint8]CodecInfo
-
-	// Whether the initial offer (with pre-created tracks) has been emitted.
-	initialOfferSent bool
 
 	// Renegotiation safety: coalesce requests while an offer is in-flight.
 	renegotiateQueued bool
@@ -156,12 +207,8 @@ func newLoopbackSession(
 		onLoopbackOffer:   onLoopbackOffer,
 		onRequestKeyframe: onRequestKeyframe,
 		onNACK:            onNACK,
-		tracks:            make(map[uint8]*webrtc.TrackLocalStaticRTP),
-		senders:           make(map[uint8]*webrtc.RTPSender),
-		boundPTs:          make(map[uint8]webrtc.PayloadType),
-		boundSSRCs:        make(map[uint8]uint32),
+		tracks:            make(map[trackKind]*loopbackTrack),
 		loopbackToVdiSSRC: make(map[uint32]uint32),
-		rtpCache:          make(map[uint32]*rtpRingBuffer),
 		nackLastForward:   make(map[uint32]time.Time),
 		droppedPTs:        make(map[uint8]bool),
 		ptCodecMap:        ptCodecMap,
@@ -203,24 +250,150 @@ func (ls *loopbackSession) initPC() {
 	}
 	ls.pc = pc
 
-	// ── Pre-create tracks for all known preferred codecs ────────────────────
-	// Because the SDP codec pinning guarantees only H264 + Opus will arrive,
-	// we create exactly the tracks we need upfront. This avoids mid-stream
-	// renegotiation that destabilizes WebKit's decoder pipeline.
-	preCreated := 0
-	for pt, codecInfo := range ls.ptCodecMap {
-		ls.addTrackLocked(pt, codecInfo)
-		if _, ok := ls.tracks[pt]; ok {
-			preCreated++
+	// ── Create the one video and one audio track ────────────────────────────
+	// Eagerly, before any media arrives, so the offer reaches the frontend
+	// while the SFU is still bringing the stream up rather than after it.
+	if ls.ensureTracksLocked() > 0 {
+		ls.renegotiateLocked()
+	} else {
+		ls.logf("[bcr_client][loopback][%s] WARNING: no usable codecs in ptCodecMap — loopback created with no tracks", ls.bridgeID)
+	}
+}
+
+// ensureTracksLocked creates whichever of the video/audio tracks do not exist
+// yet, guessing each kind's codec from the SDP codec map. Returns how many were
+// added. MUST be called with ls.mu held.
+//
+// This is only a guess, and it cannot be anything better. The codec map is the
+// union of every codec in the offer AND the answer, so it does not record which
+// one the SFU actually selected — with the browser's full codec list that union
+// holds VP8, VP9, AV1 and H264 at once. The guess is ranked by what Teams
+// overwhelmingly picks in practice, and WriteRTP repairs it if the first packet
+// proves it wrong, so being wrong costs one renegotiation rather than the whole
+// call.
+func (ls *loopbackSession) ensureTracksLocked() int {
+	added := 0
+	for _, kind := range []trackKind{kindVideo, kindAudio} {
+		if _, exists := ls.tracks[kind]; exists {
+			continue
+		}
+		mime, info, ok := ls.guessCodecForKindLocked(kind)
+		if !ok {
+			continue
+		}
+		if ls.addTrackLocked(kind, mime, info) {
+			added++
+		}
+	}
+	return added
+}
+
+// codecPreference ranks canonical mime types per kind, most likely first. Used
+// only to choose the codec a track is created with before any media has
+// arrived.
+var codecPreference = map[trackKind][]string{
+	kindVideo: {webrtc.MimeTypeH264, webrtc.MimeTypeVP8, webrtc.MimeTypeVP9, webrtc.MimeTypeAV1, webrtc.MimeTypeH265},
+	kindAudio: {webrtc.MimeTypeOpus, webrtc.MimeTypeG722, webrtc.MimeTypePCMU, webrtc.MimeTypePCMA},
+}
+
+// guessCodecForKindLocked picks the most likely codec of the given kind out of
+// the codec map. MUST be called with ls.mu held.
+func (ls *loopbackSession) guessCodecForKindLocked(kind trackKind) (string, CodecInfo, bool) {
+	// Index the map by canonical mime. Where several payload types map to the
+	// same codec — Teams offers H264 under seven, differing only in
+	// packetization-mode and profile-level-id — take the lowest, so the choice
+	// is identical on every run.
+	byMime := make(map[string]CodecInfo)
+	pts := make([]uint8, 0, len(ls.ptCodecMap))
+	for pt := range ls.ptCodecMap {
+		pts = append(pts, pt)
+	}
+	sort.Slice(pts, func(i, j int) bool { return pts[i] < pts[j] })
+
+	for _, pt := range pts {
+		info := ls.ptCodecMap[pt]
+		k, mime, ok := canonicalCodec(info.MimeType)
+		if !ok || k != kind {
+			continue
+		}
+		if _, seen := byMime[mime]; !seen {
+			byMime[mime] = info
 		}
 	}
 
-	if preCreated > 0 {
-		ls.logf("[bcr_client][loopback][%s] pre-created %d track(s) from preferred codec map", ls.bridgeID, preCreated)
-		ls.renegotiateLocked()
-		ls.initialOfferSent = true
-	} else {
-		ls.logf("[bcr_client][loopback][%s] WARNING: no codecs in ptCodecMap — loopback session created with no tracks", ls.bridgeID)
+	for _, mime := range codecPreference[kind] {
+		if info, ok := byMime[mime]; ok {
+			return mime, info, true
+		}
+	}
+	return "", CodecInfo{}, false
+}
+
+// switchTrackCodecLocked rebuilds a track around a different codec and fires a
+// fresh offer, so a wrong initial guess costs one renegotiation instead of the
+// call. Returns false when the switch budget is spent. MUST be called with
+// ls.mu held.
+func (ls *loopbackSession) switchTrackCodecLocked(lt *loopbackTrack, newMime string, info CodecInfo) bool {
+	if lt.codecSwitches >= maxCodecSwitchesPerKind {
+		return false
+	}
+
+	kind := lt.kind
+	switches := lt.codecSwitches + 1
+	ls.logf("[bcr_client][loopback][%s] %s arrived as %s but track carries %s — rebuilding the track (switch %d/%d)",
+		ls.bridgeID, kind, newMime, lt.mime, switches, maxCodecSwitchesPerKind)
+
+	if err := ls.pc.RemoveTrack(lt.sender); err != nil {
+		ls.logf("[bcr_client][loopback][%s] could not remove %s track to switch codec: %v", ls.bridgeID, kind, err)
+		return false
+	}
+	delete(ls.loopbackToVdiSSRC, lt.boundSSRC)
+	delete(ls.tracks, kind)
+
+	if !ls.addTrackLocked(kind, newMime, info) {
+		return false
+	}
+	// srcSSRC deliberately starts unset on the new track: a codec change
+	// normally comes with a new stream, so the next packet re-pins it.
+	ls.tracks[kind].codecSwitches = switches
+
+	ls.renegotiateLocked()
+	return true
+}
+
+// canonicalCodec maps an SDP codec mime ("video/H264", "audio/opus", and Teams'
+// proprietary "video/X-H264UC", whose RTP payload format is standard H264) onto
+// the media kind and the canonical Pion MimeType constant.
+//
+// RTX ("video/rtx") is deliberately not mapped: retransmissions are
+// decapsulated back into their original payload type upstream in
+// rawShadowSession.decapsulateRTX, so the loopback never sees an RTX packet and
+// must not create a track for one.
+func canonicalCodec(sdpMime string) (trackKind, string, bool) {
+	lower := strings.ToLower(sdpMime)
+	switch {
+	case strings.Contains(lower, "rtx"):
+		return "", "", false
+	case strings.Contains(lower, "vp8"):
+		return kindVideo, webrtc.MimeTypeVP8, true
+	case strings.Contains(lower, "vp9"):
+		return kindVideo, webrtc.MimeTypeVP9, true
+	case strings.Contains(lower, "av1"):
+		return kindVideo, webrtc.MimeTypeAV1, true
+	case strings.Contains(lower, "h265"):
+		return kindVideo, webrtc.MimeTypeH265, true
+	case strings.Contains(lower, "h264"):
+		return kindVideo, webrtc.MimeTypeH264, true
+	case strings.Contains(lower, "opus"):
+		return kindAudio, webrtc.MimeTypeOpus, true
+	case strings.Contains(lower, "g722"):
+		return kindAudio, webrtc.MimeTypeG722, true
+	case strings.Contains(lower, "pcmu"):
+		return kindAudio, webrtc.MimeTypePCMU, true
+	case strings.Contains(lower, "pcma"):
+		return kindAudio, webrtc.MimeTypePCMA, true
+	default:
+		return "", "", false
 	}
 }
 
@@ -232,32 +405,12 @@ func (ls *loopbackSession) initPC() {
 // match the track against the MediaEngine's registered codecs and to generate
 // valid a=rtpmap lines in the SDP. Without ClockRate, the SDP may be
 // malformed and rejected by the browser's setRemoteDescription.
-func (ls *loopbackSession) addTrackLocked(pt uint8, codecInfo CodecInfo) {
-	mimeType := ""
-	lowerMime := strings.ToLower(codecInfo.MimeType)
-
-	// Map the SFU's codec name to Pion's canonical MimeType constants.
-	// Teams may send "X-H264UC" which is a proprietary H264 variant —
-	// we map it to standard H264 since the RTP payload is compatible.
-	switch {
-	case strings.Contains(lowerMime, "vp8"):
-		mimeType = webrtc.MimeTypeVP8
-	case strings.Contains(lowerMime, "vp9"):
-		mimeType = webrtc.MimeTypeVP9
-	case strings.Contains(lowerMime, "h264"):
-		mimeType = webrtc.MimeTypeH264
-	case strings.Contains(lowerMime, "opus"):
-		mimeType = webrtc.MimeTypeOpus
-	default:
-		ls.logf("[bcr_client][loopback][%s] skipping unsupported codec PT=%d mime=%s", ls.bridgeID, pt, codecInfo.MimeType)
-		return
-	}
-
+func (ls *loopbackSession) addTrackLocked(kind trackKind, mimeType string, codecInfo CodecInfo) bool {
 	// Determine clock rate and channels from our CodecInfo (parsed from
 	// the SDP). Fall back to standard defaults if the SDP didn't have them.
 	clockRate := codecInfo.ClockRate
 	if clockRate == 0 {
-		if strings.HasPrefix(mimeType, "video/") {
+		if kind == kindVideo {
 			clockRate = 90000 // standard for all video codecs
 		} else if mimeType == webrtc.MimeTypeOpus {
 			clockRate = 48000
@@ -275,29 +428,37 @@ func (ls *loopbackSession) addTrackLocked(pt uint8, codecInfo CodecInfo) {
 		Channels:  channels,
 	}
 
-	// Create a local track with a unique ID based on Payload Type
-	trackID := fmt.Sprintf("track-%d-%s", pt, strings.ReplaceAll(lowerMime, "/", "-"))
+	// Track IDs are per-kind and stable. They used to embed the payload type,
+	// which made them differ run to run for no benefit — and made the log look
+	// like the tracks were meaningfully distinct when they were not.
+	trackID := "bcr-" + string(kind)
 	streamID := "stream-" + ls.bridgeID
 
 	track, err := webrtc.NewTrackLocalStaticRTP(capability, trackID, streamID)
 	if err != nil {
-		ls.logf("[bcr_client][loopback][%s] failed to create local track for PT=%d mime=%s clockRate=%d: %v",
-			ls.bridgeID, pt, mimeType, clockRate, err)
-		return
+		ls.logf("[bcr_client][loopback][%s] failed to create %s track mime=%s clockRate=%d: %v",
+			ls.bridgeID, kind, mimeType, clockRate, err)
+		return false
 	}
 
 	sender, err := ls.pc.AddTrack(track)
 	if err != nil {
-		ls.logf("[bcr_client][loopback][%s] failed to add track to PC for PT=%d: %v", ls.bridgeID, pt, err)
-		return
+		ls.logf("[bcr_client][loopback][%s] failed to add %s track to PC: %v", ls.bridgeID, kind, err)
+		return false
 	}
 
 	go ls.readRTCP(sender)
 
-	ls.tracks[pt] = track
-	ls.senders[pt] = sender
-	ls.logf("[bcr_client][loopback][%s] added local track PT=%d mimeType=%s clockRate=%d channels=%d trackID=%s",
-		ls.bridgeID, pt, mimeType, clockRate, channels, trackID)
+	ls.tracks[kind] = &loopbackTrack{
+		kind:   kind,
+		track:  track,
+		sender: sender,
+		mime:   mimeType,
+		cache:  newRTPRingBuffer(),
+	}
+	ls.logf("[bcr_client][loopback][%s] %s track: mime=%s clockRate=%d channels=%d (from SDP %s)",
+		ls.bridgeID, kind, mimeType, clockRate, channels, codecInfo.MimeType)
+	return true
 }
 
 // renegotiateLocked creates a new offer and emits it to the frontend.
@@ -380,15 +541,18 @@ func (ls *loopbackSession) GetLastOffer() string {
 	return ls.lastOfferSDP
 }
 
-// SyncTracksFromCodecMap diffs the given codec map (already filtered to
-// preferred codecs) against the loopback session's existing tracks. For every
-// PT that is preferred but has no local track yet, a new TrackLocalStaticRTP
-// is added and a Pion renegotiation offer is fired to the frontend.
+// SyncTracksFromCodecMap adds whichever of the video/audio tracks is still
+// missing after a renegotiation, and fires a fresh Pion offer if it added one.
 //
 // This handles the Teams 2-phase negotiation pattern where the SFU sends an
 // initial audio-only answer (triggering SRTP ready + loopback creation) and
-// immediately follows with a renegotiation offer adding video tracks.
-func (ls *loopbackSession) SyncTracksFromCodecMap(filteredCodecMap map[uint8]CodecInfo) {
+// immediately follows with a renegotiation offer adding video.
+//
+// With one track per kind this is a no-op in the common case — new payload
+// types for a kind we already carry no longer add tracks or trigger an offer,
+// so a Teams call that renegotiates repeatedly no longer walks the loopback
+// through a renegotiation per payload type.
+func (ls *loopbackSession) SyncTracksFromCodecMap(codecMap map[uint8]CodecInfo) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 
@@ -396,33 +560,27 @@ func (ls *loopbackSession) SyncTracksFromCodecMap(filteredCodecMap map[uint8]Cod
 		return
 	}
 
-	added := 0
-	for pt, codecInfo := range filteredCodecMap {
-		if _, exists := ls.tracks[pt]; exists {
-			continue // track already present
-		}
-		ls.logf("[bcr_client][loopback][%s] renegotiation sync: adding missing track PT=%d codec=%s clockRate=%d",
-			ls.bridgeID, pt, codecInfo.MimeType, codecInfo.ClockRate)
-		ls.addTrackLocked(pt, codecInfo)
-		if _, nowExists := ls.tracks[pt]; nowExists {
-			added++
+	// Merge new codecs in so ensureTracksLocked can see them.
+	for pt, info := range codecMap {
+		if _, exists := ls.ptCodecMap[pt]; !exists {
+			ls.ptCodecMap[pt] = info
 		}
 	}
 
-	if added > 0 {
-		ls.logf("[bcr_client][loopback][%s] renegotiation sync: added %d new track(s) — triggering new Pion offer to frontend",
-			ls.bridgeID, added)
+	if added := ls.ensureTracksLocked(); added > 0 {
+		ls.logf("[bcr_client][loopback][%s] renegotiation added %d track(s) — new offer to frontend", ls.bridgeID, added)
 		ls.renegotiateLocked()
-	} else {
-		ls.logf("[bcr_client][loopback][%s] renegotiation sync: no new tracks needed (all preferred PTs already present)",
-			ls.bridgeID)
 	}
 }
 
-// WriteRTP routes incoming RTP packets to the correct local track.
-// With strict codec pinning, tracks are pre-created and unexpected PTs are
-// dropped immediately (no dynamic AddTrack/renegotiation fallback).
-func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet) {
+// WriteRTP rewrites one decrypted SFU packet onto the loopback track for its
+// media kind and writes it.
+//
+// codec is the packet's entry from the SDP codec map, resolved by the caller —
+// it is what decides which track the packet belongs to. Routing by kind rather
+// than by payload type is what makes rendering deterministic; see the comment
+// on loopbackSession.tracks.
+func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet, codec CodecInfo) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 
@@ -430,72 +588,140 @@ func (ls *loopbackSession) WriteRTP(pkt *rtp.Packet) {
 		return
 	}
 
-	track, ok := ls.tracks[pkt.Header.PayloadType]
+	kind, mime, ok := canonicalCodec(codec.MimeType)
 	if !ok {
-		if !ls.droppedPTs[pkt.Header.PayloadType] {
-			ls.droppedPTs[pkt.Header.PayloadType] = true
-			ls.logf("[bcr_client][loopback][%s] strict-drop PT=%d (no pre-created local track — check codec pinning)",
-				ls.bridgeID, pkt.Header.PayloadType)
+		ls.warnDropOnceLocked(pkt.Header.PayloadType, "codec %q has no loopback mapping", codec.MimeType)
+		return
+	}
+
+	lt := ls.tracks[kind]
+	if lt == nil {
+		ls.warnDropOnceLocked(pkt.Header.PayloadType, "no %s track on the loopback", kind)
+		return
+	}
+
+	// A packet whose codec differs from the one this track was negotiated with
+	// cannot be written to it: the receiver has one decoder per track, and
+	// feeding it another codec's payload corrupts rather than fails cleanly.
+	//
+	// The track's codec was guessed from the offer before any media arrived
+	// (see ensureTracksLocked), so this is the expected way to discover the
+	// guess was wrong — rebuild the track around what actually arrived instead
+	// of dropping the call's media forever. This packet is lost either way; the
+	// next ones flow once the frontend answers the new offer.
+	if lt.mime != mime {
+		if !ls.switchTrackCodecLocked(lt, mime, codec) {
+			ls.warnDropOnceLocked(pkt.Header.PayloadType,
+				"%s track carries %s, packet is %s, and the codec-switch budget is spent", kind, lt.mime, mime)
 		}
 		return
 	}
 
-	vdiPT := pkt.Header.PayloadType
-	originalVdiSSRC := pkt.Header.SSRC
-
-	// Rewrite PayloadType to match the loopback SDP, otherwise WebKit drops it.
-	if boundPT, ok := ls.boundPTs[vdiPT]; ok {
-		pkt.Header.PayloadType = uint8(boundPT)
+	// boundPT/boundSSRC come from the sender's parameters, which only exist
+	// once SetLocalDescription has run. Reaching here without them means the
+	// offer failed to build; writing the packet anyway would put it on SSRC 0,
+	// which the receiver silently discards — a failure mode indistinguishable
+	// from "no media arrived".
+	if lt.boundSSRC == 0 {
+		ls.warnDropOnceLocked(pkt.Header.PayloadType, "%s track has no negotiated SSRC yet (loopback offer did not complete)", kind)
+		return
 	}
 
-	// Strip RTP Header Extensions to prevent parsing errors in WebKit,
-	// as these extensions (like MID, RID) were likely not negotiated in the loopback.
+	// Pin the track to the first SSRC that actually sends for this kind. A
+	// Teams video m-section advertises several SSRCs (simulcast layers, other
+	// participants) but only one is live at a time; muxing two of them onto our
+	// single outbound SSRC would interleave two encoders' output into a stream
+	// no decoder can follow.
+	srcSSRC := pkt.Header.SSRC
+	if lt.srcSSRC == 0 {
+		lt.srcSSRC = srcSSRC
+		ls.loopbackToVdiSSRC[lt.boundSSRC] = srcSSRC
+		ls.logf("[bcr_client][loopback][%s] %s track pinned to SFU SSRC=%d (PT=%d %s) → loopback SSRC=%d PT=%d",
+			ls.bridgeID, kind, srcSSRC, pkt.Header.PayloadType, codec.MimeType, lt.boundSSRC, lt.boundPT)
+	} else if lt.srcSSRC != srcSSRC {
+		ls.warnDropOnceLocked(pkt.Header.PayloadType, "%s track is pinned to SSRC=%d, packet is from SSRC=%d", kind, lt.srcSSRC, srcSSRC)
+		return
+	}
+
+	// Rewrite PayloadType and SSRC to the loopback's own negotiated values —
+	// WebKit drops anything it did not negotiate.
+	pkt.Header.PayloadType = uint8(lt.boundPT)
+	pkt.Header.SSRC = lt.boundSSRC
+
+	// Strip RTP header extensions: MID/RID/abs-send-time were negotiated with
+	// the SFU, not with the loopback, and WebKit rejects extensions it has no
+	// extmap for.
 	pkt.Header.Extension = false
 	pkt.Header.ExtensionProfile = 0
 	pkt.Header.Extensions = nil
 
-	// Rewrite SSRC to match the loopback track's negotiated SSRC, otherwise WebKit discards it.
-	if boundSSRC, ok := ls.boundSSRCs[vdiPT]; ok && boundSSRC != 0 {
-		pkt.Header.SSRC = boundSSRC
-		ls.loopbackToVdiSSRC[boundSSRC] = originalVdiSSRC
-	}
-
-	// Cache the serialized packet BEFORE writing it to the track, so that
-	// if WebKit immediately NACKs it (due to reorder), we can retransmit
-	// from cache in microseconds rather than waiting for a VDI round-trip.
-	loopSSRC := pkt.Header.SSRC
-	if _, hasBuf := ls.rtpCache[loopSSRC]; !hasBuf {
-		ls.rtpCache[loopSSRC] = newRTPRingBuffer()
-	}
+	// Cache before writing, so a NACK arriving immediately after (WebKit is on
+	// the same machine — its NACK can beat our next packet) can be answered
+	// from memory rather than by asking the SFU across the internet.
 	if raw, marshalErr := pkt.Marshal(); marshalErr == nil {
-		ls.rtpCache[loopSSRC].store(pkt.Header.SequenceNumber, raw)
+		lt.cache.store(pkt.Header.SequenceNumber, raw)
 	}
 
-	if err := track.WriteRTP(pkt); err != nil {
+	if err := lt.track.WriteRTP(pkt); err != nil {
 		ls.writeErrCount++
 		if ls.writeErrCount == 1 || ls.writeErrCount%500 == 0 {
-			ls.logf("[bcr_client][loopback][%s] track.WriteRTP error #%d PT=%d: %v",
-				ls.bridgeID, ls.writeErrCount, pkt.Header.PayloadType, err)
+			ls.logf("[bcr_client][loopback][%s] %s track WriteRTP error #%d: %v",
+				ls.bridgeID, kind, ls.writeErrCount, err)
 		}
 	} else {
 		ls.writeErrCount = 0
 	}
 }
 
+// warnDropOnceLocked reports the first dropped packet for a given payload type
+// and stays quiet for the rest. Drops here are per-packet events on the media
+// hot path; one line each would be thousands a second. MUST be called with
+// ls.mu held.
+func (ls *loopbackSession) warnDropOnceLocked(pt uint8, format string, args ...any) {
+	if ls.droppedPTs[pt] {
+		return
+	}
+	ls.droppedPTs[pt] = true
+	ls.logf("[bcr_client][loopback][%s] dropping PT=%d and further packets like it: %s",
+		ls.bridgeID, pt, fmt.Sprintf(format, args...))
+}
+
 // updateBindingsLocked extracts mapped Payload Types and SSRCs from RTPSenders.
 // MUST be called with ls.mu held.
 func (ls *loopbackSession) updateBindingsLocked() {
-	for pt, sender := range ls.senders {
-		params := sender.GetParameters()
+	mappings := make([]string, 0, len(ls.tracks))
+	for _, kind := range []trackKind{kindVideo, kindAudio} {
+		lt := ls.tracks[kind]
+		if lt == nil {
+			continue
+		}
+		params := lt.sender.GetParameters()
 		if len(params.Codecs) > 0 {
-			ls.boundPTs[pt] = params.Codecs[0].PayloadType
-			ls.logf("[bcr_client][loopback][%s] mapped VDI PT=%d to loopback PT=%d", ls.bridgeID, pt, params.Codecs[0].PayloadType)
+			lt.boundPT = params.Codecs[0].PayloadType
 		}
 		if len(params.Encodings) > 0 && params.Encodings[0].SSRC != 0 {
-			ls.boundSSRCs[pt] = uint32(params.Encodings[0].SSRC)
-			ls.logf("[bcr_client][loopback][%s] mapped VDI PT=%d to loopback SSRC=%d", ls.bridgeID, pt, params.Encodings[0].SSRC)
+			lt.boundSSRC = uint32(params.Encodings[0].SSRC)
+			if lt.srcSSRC != 0 {
+				ls.loopbackToVdiSSRC[lt.boundSSRC] = lt.srcSSRC
+			}
+		}
+		mappings = append(mappings, fmt.Sprintf("%s=PT%d/SSRC%d", kind, lt.boundPT, lt.boundSSRC))
+	}
+
+	if len(mappings) > 0 {
+		ls.logf("[bcr_client][loopback][%s] loopback bindings: %s", ls.bridgeID, strings.Join(mappings, " "))
+	}
+}
+
+// trackByBoundSSRCLocked finds the track carrying a given outbound SSRC — the
+// SSRC the receiver names in its RTCP. MUST be called with ls.mu held.
+func (ls *loopbackSession) trackByBoundSSRCLocked(ssrc uint32) *loopbackTrack {
+	for _, lt := range ls.tracks {
+		if lt.boundSSRC == ssrc {
+			return lt
 		}
 	}
+	return nil
 }
 
 // SetRemoteDescription applies the SDP answer from the frontend
@@ -573,122 +799,107 @@ func (ls *loopbackSession) readRTCP(sender *webrtc.RTPSender) {
 				if hasMapping {
 					targetSSRC = vdiSSRC
 				}
-				ls.logf("[bcr_client][loopback][%s] PLI from Wails SSRC=%d → VDI SSRC=%d", ls.bridgeID, p.MediaSSRC, targetSSRC)
-
+				// requestKeyframe logs the first PLI per SSRC and counts the
+				// rest; logging here as well doubled every line.
 				if ls.onRequestKeyframe != nil {
 					ls.onRequestKeyframe(ls.bridgeID, targetSSRC)
 				}
 
 			case *rtcp.TransportLayerNack:
-				ls.handleNACK(p, sender)
+				ls.handleNACK(p)
 			}
 		}
 	}
 }
 
-// handleNACK processes a single NACK packet from WebKit. It attempts to
-// retransmit the requested packets from the local RTP cache first.
-// Only cache misses are forwarded to the remote VDI as a fallback.
-func (ls *loopbackSession) handleNACK(p *rtcp.TransportLayerNack, sender *webrtc.RTPSender) {
-	ls.mu.Lock()
-	vdiSSRC, hasMapping := ls.loopbackToVdiSSRC[p.MediaSSRC]
-	cache := ls.rtpCache[p.MediaSSRC]
-
-	// Get the track for this SSRC so we can retransmit directly.
-	var retransmitTrack *webrtc.TrackLocalStaticRTP
-	for _, track := range ls.tracks {
-		// Any track on this sender will do — we write raw packets.
-		retransmitTrack = track
-		break
-	}
-	// Find the specific track by checking which bound SSRC matches.
-	for pt, ssrc := range ls.boundSSRCs {
-		if ssrc == p.MediaSSRC {
-			if t, ok := ls.tracks[pt]; ok {
-				retransmitTrack = t
-			}
-			break
-		}
-	}
-	ls.mu.Unlock()
-
-	targetSSRC := p.MediaSSRC
-	if hasMapping {
-		targetSSRC = vdiSSRC
-	}
-
+// handleNACK processes a single NACK packet from the receiver. Requested
+// packets are retransmitted from this track's local cache where possible;
+// anything the cache does not hold is forwarded to the SFU, which is the only
+// party that can still produce it.
+func (ls *loopbackSession) handleNACK(p *rtcp.TransportLayerNack) {
 	// Collect all missing sequence numbers from the NACK packet.
 	var allMissing []uint16
 	for _, pair := range p.Nacks {
 		allMissing = append(allMissing, pair.PacketList()...)
 	}
-
-	// Attempt local retransmission from cache.
-	var localRetransmitted int
-	var cacheMisses []uint16
-
-	if cache != nil && retransmitTrack != nil {
-		for _, seq := range allMissing {
-			if raw, found := cache.retrieve(seq); found {
-				// Parse the cached packet and write it to the track.
-				var cachedPkt rtp.Packet
-				if unmarshalErr := cachedPkt.Unmarshal(raw); unmarshalErr == nil {
-					if writeErr := retransmitTrack.WriteRTP(&cachedPkt); writeErr == nil {
-						localRetransmitted++
-					}
-				}
-			} else {
-				cacheMisses = append(cacheMisses, seq)
-			}
-		}
-	} else {
-		// No cache available — all are misses.
-		cacheMisses = allMissing
+	if len(allMissing) == 0 {
+		return
 	}
 
-	// Update statistics.
-	totalNACKed := uint64(len(allMissing))
+	// The whole cache lookup and retransmit runs under ls.mu. It used to take
+	// the ring-buffer pointer under the lock and then read from it outside,
+	// racing WriteRTP's stores into the same buffer on the SRTP goroutine.
 	ls.mu.Lock()
-	ls.nackTotal += totalNACKed
+
+	lt := ls.trackByBoundSSRCLocked(p.MediaSSRC)
+	if lt == nil {
+		// A NACK for an SSRC we do not send. Nothing to retransmit and nothing
+		// sensible to forward — the SFU does not know this SSRC either.
+		ls.mu.Unlock()
+		return
+	}
+
+	targetSSRC := lt.srcSSRC
+	if targetSSRC == 0 {
+		targetSSRC = p.MediaSSRC
+	}
+
+	var localRetransmitted int
+	var cacheMisses []uint16
+	for _, seq := range allMissing {
+		raw, found := lt.cache.retrieve(seq)
+		if !found {
+			cacheMisses = append(cacheMisses, seq)
+			continue
+		}
+		var cachedPkt rtp.Packet
+		if err := cachedPkt.Unmarshal(raw); err != nil {
+			cacheMisses = append(cacheMisses, seq)
+			continue
+		}
+		if err := lt.track.WriteRTP(&cachedPkt); err != nil {
+			cacheMisses = append(cacheMisses, seq)
+			continue
+		}
+		localRetransmitted++
+	}
+
+	ls.nackTotal += uint64(len(allMissing))
 	ls.nackLocalHit += uint64(localRetransmitted)
 	ls.nackLocalMiss += uint64(len(cacheMisses))
-	currentTotal := ls.nackTotal
-	lastLog := ls.nackLastLog
-	hitTotal := ls.nackLocalHit
-	missTotal := ls.nackLocalMiss
-	ls.mu.Unlock()
+	currentTotal, hitTotal, missTotal := ls.nackTotal, ls.nackLocalHit, ls.nackLocalMiss
 
 	// Time-throttled logging: at most once every nackLogMinInterval, regardless of
 	// NACK volume. Under heavy loss the old every-50-NACKs rule produced ~1000s of
 	// lines/sec, whose synchronous file+stdout writes could starve the SRTP read
 	// loop and cause MORE loss. Keep the counters accurate; just log sparsely.
-	_ = lastLog
-	ls.mu.Lock()
 	shouldLog := time.Since(ls.nackLastLogTime) >= nackLogMinInterval
 	if shouldLog {
 		ls.nackLastLogTime = time.Now()
-		ls.nackLastLog = currentTotal
 	}
+
+	// Rate-limit what we forward upstream: the SFU is an internet round trip
+	// away, and asking it repeatedly for the same gap only adds load.
+	forward := false
+	if len(cacheMisses) > 0 && ls.onNACK != nil {
+		now := time.Now()
+		if now.Sub(ls.nackLastForward[p.MediaSSRC]).Milliseconds() >= nackCooldownMs {
+			ls.nackLastForward[p.MediaSSRC] = now
+			forward = true
+		}
+	}
+
+	kind := lt.kind
 	ls.mu.Unlock()
+
 	if shouldLog {
-		ls.logf("[bcr_client][loopback][%s] NACK summary: total=%d localHit=%d localMiss=%d hitRate=%.1f%% (SSRC %d→%d)",
-			ls.bridgeID, currentTotal, hitTotal, missTotal,
+		ls.logf("[bcr_client][loopback][%s] %s NACK: total=%d servedLocally=%d forwarded=%d hitRate=%.1f%% (loopback SSRC %d → SFU SSRC %d)",
+			ls.bridgeID, kind, currentTotal, hitTotal, missTotal,
 			float64(hitTotal)/float64(max(currentTotal, 1))*100.0,
 			p.MediaSSRC, targetSSRC)
 	}
 
-	// Forward cache misses to the remote VDI as a fallback, with rate-limiting.
-	if len(cacheMisses) > 0 && ls.onNACK != nil {
-		now := time.Now()
-		ls.mu.Lock()
-		lastFwd := ls.nackLastForward[p.MediaSSRC]
-		ls.mu.Unlock()
-
-		if now.Sub(lastFwd).Milliseconds() >= nackCooldownMs {
-			ls.mu.Lock()
-			ls.nackLastForward[p.MediaSSRC] = now
-			ls.mu.Unlock()
-			ls.onNACK(ls.bridgeID, targetSSRC, cacheMisses)
-		}
+	if forward {
+		ls.onNACK(ls.bridgeID, targetSSRC, cacheMisses)
 	}
 }
