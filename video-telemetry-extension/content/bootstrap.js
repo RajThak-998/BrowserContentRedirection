@@ -162,9 +162,25 @@
                 return;
             }
 
+            // NOTE the "_DOWN" suffix, and keep it.
+            //
+            // RTC_SHADOW_ICE_CANDIDATE is the only message that travels in BOTH
+            // directions under one name: bcr_client trickles its candidates down,
+            // and patchedAddIceCandidate posts the SFU's candidates up. Posting the
+            // downstream one as "BCR_RTC_SHADOW_ICE_CANDIDATE" fed it straight back
+            // into _onWindowMessage below — a same-window postMessage satisfies the
+            // `event.source !== window` guard — which matched it as an UPSTREAM
+            // message and emitted it back to bcr_client. Every candidate bcr_client
+            // gathered returned to it 2-3ms later as a "remote" candidate, and it
+            // then paired its own srflx and relay against themselves.
+            //
+            // INVARIANT: no type posted by _onRuntimeMessage may appear in
+            // _onWindowMessage's match list. Renaming only the downstream direction
+            // keeps the upstream name free for the legitimate patchedAddIceCandidate
+            // path, which must keep working.
             if (message.type === "RTC_SHADOW_ICE_CANDIDATE") {
                 window.postMessage({
-                    type: "BCR_RTC_SHADOW_ICE_CANDIDATE",
+                    type: "BCR_RTC_SHADOW_ICE_CANDIDATE_DOWN",
                     payload: message.payload ?? {},
                 }, "*");
             }

@@ -1370,6 +1370,15 @@
         return next;
     }
 
+    // Reads the first a=setup: value. Under BUNDLE every m-section repeats the
+    // same value, so the first is the whole answer. Used only for diagnostics —
+    // the DTLS role decision itself is made in Go, from both sides' values.
+    function sdpSetupRole(sdp) {
+        if (typeof sdp !== 'string') return '(none)';
+        const m = sdp.match(/^a=setup:(\S+)/m);
+        return m ? m[1] : '(none)';
+    }
+
     function extractOrderedMids(sdp) {
         if (typeof sdp !== 'string' || sdp.length === 0) {
             return [];
@@ -2032,7 +2041,11 @@
             }
         }
 
-        if (data.type === 'BCR_RTC_SHADOW_ICE_CANDIDATE') {
+        // "_DOWN" distinguishes bcr_client's trickle from the upstream message
+        // patchedAddIceCandidate posts under the un-suffixed name. Both used to
+        // share one type, so bootstrap.js relayed each downstream candidate
+        // straight back upstream — see the invariant comment there.
+        if (data.type === 'BCR_RTC_SHADOW_ICE_CANDIDATE_DOWN') {
             const payload = data.payload;
             const bridgeId = payload?.bridgeId;
             const candidateStr = payload?.candidate;
@@ -2194,7 +2207,44 @@
         rtcProto.setLocalDescription = async function patchedSetLocalDescription(...args) {
             const description = args[0];
             if (!description || typeof description.sdp !== 'string') {
-                return origSetLocalDescription.apply(this, args);
+                // ── Implicit form: pc.setLocalDescription() with no argument ──
+                // Per spec the browser then creates the offer/answer ITSELF, which
+                // would bypass our patched createOffer/createAnswer completely: no
+                // BCR_RTC_SHADOW_LOCAL is emitted, Go never runs Init(), nothing is
+                // munged, and the SDP that reaches the SFU carries Chrome's own ICE
+                // credentials and DTLS fingerprint — so the SFU connects its media
+                // to the VDI browser instead of bcr_client.
+                //
+                // Route it through our own createOffer/createAnswer instead, then
+                // hand Chrome the ORIGINAL (un-munged) SDP exactly as the explicit
+                // path does. The result is identical to what the browser would have
+                // produced, but intercepted.
+                //
+                // This branch cannot affect the outgoing-call path: that path works
+                // today, which means Teams passes a description explicitly there, so
+                // we never get here for it.
+                const implicitEntry = ensureRtcState(this);
+                const state = this.signalingState;
+                BCR_LOG('[BCR] setLocalDescription() called with NO description (implicit form)',
+                        'signalingState=', state, 'bridgeId=', implicitEntry.bridgeId,
+                        '— routing through the patched create path');
+
+                try {
+                    const wantsAnswer = (state === 'have-remote-offer' || state === 'have-remote-pranswer');
+                    const created = wantsAnswer ? await this.createAnswer() : await this.createOffer();
+
+                    // createOffer/createAnswer stash the pre-munge SDP here; that is
+                    // what Chrome's ICE agent must see, since its ufrag/pwd have to
+                    // match the ones it generated.
+                    const chromeSdp = implicitEntry.lastOriginalLocalSdp || created.sdp;
+                    BCR_LOG('[BCR] implicit setLocalDescription resolved to a', created.type,
+                            'bridgeId=', implicitEntry.bridgeId);
+                    return origSetLocalDescription.apply(this, [{ type: created.type, sdp: chromeSdp }]);
+                } catch (e) {
+                    // Never make things worse than the un-intercepted behaviour.
+                    BCR_LOG('[BCR] implicit setLocalDescription interception failed — falling back to native:', e);
+                    return origSetLocalDescription.apply(this, args);
+                }
             }
 
             const entry = ensureRtcState(this);
@@ -2230,8 +2280,15 @@
                 // browser (so if bcr_client never logs RTC_SHADOW_REMOTE, the loss is
                 // between here and Go). If this never fires with type='answer', the SFU
                 // answer never reached the browser at all — the offer/answer exchange failed.
+                // A remote OFFER means this is an INCOMING call (the SFU is the
+                // offerer and we answer). Its a=setup: is normally "actpass",
+                // which leaves the DTLS role to our answer — so both values are
+                // logged here and in Go to make that handshake decision traceable.
                 BCR_LOG('[BCR] setRemoteDescription received type=', description.type,
-                    'sdpLen=', description.sdp.length, 'bridgeId=', entry.bridgeId);
+                    'sdpLen=', description.sdp.length,
+                    'remote a=setup:', sdpSetupRole(description.sdp),
+                    description.type.toLowerCase() === 'offer' ? '(INCOMING call — we answer)' : '',
+                    'bridgeId=', entry.bridgeId);
 
                 const descType = description.type.toLowerCase();
                 let effectiveRemoteSdp = description.sdp;
@@ -2351,6 +2408,7 @@
             });
 
             BCR_LOG('[BCR] Emitted SHADOW_LOCAL from', actionType, 'bridgeId=', entry.bridgeId,
+                    'local a=setup:', sdpSetupRole(pinnedSdp),
                     '— blocking for SHADOW_READY');
 
             // ── BLOCKING WAIT ─────────────────────────────────────────────────────────

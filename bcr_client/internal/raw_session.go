@@ -299,6 +299,18 @@ type rawShadowSession struct {
 	// Used so the answerer-path Init() can call Connect() when init finishes.
 	remoteOfferSDP string
 
+	// connectedRemoteSDP is the remote SDP this session's ICE agent is actually
+	// authenticating against — the one handed to Connect(). It is the correct
+	// baseline for deciding whether a later renegotiation moved the peer's
+	// transport, and unlike remoteOfferSDP it is set on both the offerer and the
+	// answerer path.
+	connectedRemoteSDP string
+
+	// localDTLSSetup is the a=setup: value from the browser's own SDP — the
+	// role we advertised to the SFU. Authoritative for choosing our DTLS role
+	// whenever it is concrete ("active"/"passive"); see resolveDTLSRole.
+	localDTLSSetup string
+
 	// PT → codec capability map populated from the browser's offer/answer SDP.
 	// Used by the relay layer to create TrackLocalStaticRTP with correct codecs.
 	ptCodecMap map[uint8]CodecInfo
@@ -318,6 +330,21 @@ type rawShadowSession struct {
 	// engine before Init() is called so no candidates are missed.
 	onLateCandidate func(candidate string)
 	readySentCount  int // number of candidates included in SHADOW_READY
+
+	// localCandidateKeys holds an addr/port/component key for every candidate
+	// this session has gathered, so AddRemoteIceCandidate can recognise one of
+	// our own coming back at us and refuse to pair it against itself.
+	//
+	// This guards a loop that actually happened: bootstrap.js relayed each
+	// downstream RTC_SHADOW_ICE_CANDIDATE straight back upstream, so every
+	// candidate we trickled returned 2-3ms later as a "remote" one. The relay
+	// is fixed at the source, but a single misrouted message is enough to
+	// poison the checklist silently, so the receiving end checks too.
+	//
+	// Keyed on the tuple rather than the raw line because the extension
+	// rewrites raddr to 0.0.0.0 before dispatching (scrubCandidateRaddr), so a
+	// string comparison would miss exactly the relay candidates that matter.
+	localCandidateKeys map[string]bool
 
 	// onGatheringComplete is called once, when no further candidates will be
 	// trickled. The extension turns this into the end-of-candidates event that
@@ -374,8 +401,9 @@ type rawShadowSession struct {
 
 func newRawShadowSession(bridgeID string, logf func(string, ...any)) *rawShadowSession {
 	return &rawShadowSession{
-		bridgeID:        bridgeID,
-		ptCodecMap:      make(map[uint8]CodecInfo),
+		bridgeID:           bridgeID,
+		ptCodecMap:         make(map[uint8]CodecInfo),
+		localCandidateKeys: make(map[string]bool),
 		lastSRBySSRC:    make(map[uint32]srRecord),
 		twcc:            &twccTracker{entries: make([]twccEntry, 0, 512)},
 		logf:            logf,
@@ -521,6 +549,13 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 		s.logf("[raw][%s] ICE connection state changed: %s", s.bridgeID, state.String())
 	})
 
+	// Fires only when a pair is actually nominated, so it is silent on a failing
+	// call and pairs with the checklist sampler: the sampler shows what was
+	// tried, this shows what won.
+	agent.OnSelectedCandidatePairChange(func(local, remote ice.Candidate) {
+		s.logf("[raw][%s] ICE selected pair: %s -> %s", s.bridgeID, local.String(), remote.String())
+	})
+
 	// ── Step 5: OnCandidate handler ───────────────────────────────────────────
 	// A nil Candidate argument signals end-of-gathering per the pion/ice API.
 	if err := agent.OnCandidate(func(c ice.Candidate) {
@@ -575,6 +610,7 @@ func (s *rawShadowSession) Init(ctx context.Context, sdpType string) (*RTCShadow
 
 		// Trickle late candidates — those arriving after SHADOW_READY was sent.
 		s.mu.Lock()
+		s.localCandidateKeys[candidateKey(c.Address(), c.Port(), c.Component())] = true
 		cb := s.onLateCandidate
 		readySent := s.state >= stateReady && s.readySentCount > 0
 		s.mu.Unlock()
@@ -771,6 +807,9 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 		return fmt.Errorf("ErrStaleGeneration: got=%d current=%d", gen, s.generation)
 	}
 	s.state = stateConnecting
+	// Record the SDP this agent will authenticate against, so a later
+	// renegotiation can be compared to it rather than assumed equivalent.
+	s.connectedRemoteSDP = remoteSDP
 	s.mu.Unlock()
 
 	// ── Step 1: Remote ICE credentials ───────────────────────────────────────
@@ -794,6 +833,28 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	isRemoteIceLite := strings.Contains(remoteSDP, "a=ice-lite")
 	isControlling := s.isOfferer || isRemoteIceLite
 
+	// Snapshot what the agent is starting from. A checklist with no remote
+	// candidates, or with only unroutable local ones, explains a stalled ICE on
+	// its own and costs one line to rule out.
+	localCands, _ := s.iceAgent.GetLocalCandidates()
+	remoteCands, _ := s.iceAgent.GetRemoteCandidates()
+	s.logf("[raw][%s] ICE start: local=%d remote=%d role=%s ice-lite=%v",
+		s.bridgeID, len(localCands), len(remoteCands),
+		map[bool]string{true: "controlling", false: "controlled"}[isControlling], isRemoteIceLite)
+
+	// Sample the checklist while the handshake blocks.
+	//
+	// Until now a failed ICE produced exactly one line — "connecting canceled by
+	// caller" after the full timeout — which cannot distinguish "our checks are
+	// being answered but the peer never nominates" from "our checks are going
+	// nowhere". ResponsesReceived is what separates them: >0 means the SFU is
+	// talking to us and the problem is nomination or reachability; 0 across every
+	// pair means it is not acting on our credentials at all.
+	//
+	// This is deliberately NOT env-gated. A healthy connect finishes well inside
+	// the first tick and logs nothing; only a stalling one is ever heard from.
+	stopSampler := s.startICEChecklistSampler()
+
 	if isControlling {
 		s.logf("[raw][%s] ICE Dial (controlling — Go was offerer or remote is ice-lite)", s.bridgeID)
 		iceConn, err = s.iceAgent.Dial(ctx, remoteUfrag, remotePwd)
@@ -801,6 +862,7 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 		s.logf("[raw][%s] ICE Accept (controlled — Go was answerer)", s.bridgeID)
 		iceConn, err = s.iceAgent.Accept(ctx, remoteUfrag, remotePwd)
 	}
+	stopSampler()
 	if err != nil {
 		return fmt.Errorf("ICE handshake: %w", err)
 	}
@@ -835,18 +897,21 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	// nothing on the media plane.
 
 	// ── Step 5: DTLS handshake ────────────────────────────────────────────────
-	// Role is determined by a=setup: in the remote SDP:
-	//   a=setup:active  → remote initiates ClientHello → Go is Server
-	//   a=setup:passive → Go initiates ClientHello     → Go is Client
-	//   default         → Server (Teams almost always advertises "active")
-	role := parseDTLSRole(remoteSDP)
+	// Role comes from both a=setup: values — see resolveDTLSRole. Using the
+	// remote one alone works for outgoing calls and deadlocks incoming ones.
+	s.mu.Lock()
+	localSetup := s.localDTLSSetup
+	s.mu.Unlock()
+	role := resolveDTLSRole(localSetup, remoteSDP)
+
 	// One line for the whole role/identity decision. a=setup: and a=fingerprint:
 	// repeat once per m-section (4–8 lines each on a Teams SDP) and are always
 	// identical under BUNDLE, so only the parsed result is worth reporting; the
 	// full SDP is already in the [SDP-INSPECT] dump if a line-level check is
 	// ever needed.
-	s.logf("[raw][%s] DTLS role=%s (a=setup:%s) peer_fp=%s",
-		s.bridgeID, role, firstSDPAttr(remoteSDP, "a=setup:"), safePrefix(normalizeFingerprint(remoteFP), 17))
+	s.logf("[raw][%s] DTLS role=%s (local a=setup:%s, remote a=setup:%s, offerer=%v) peer_fp=%s",
+		s.bridgeID, role, orNone(localSetup), orNone(firstSDPAttr(remoteSDP, "a=setup:")),
+		s.isOfferer, safePrefix(normalizeFingerprint(remoteFP), 17))
 
 	// Key material capture strategy:
 	//
@@ -1059,6 +1124,18 @@ func (s *rawShadowSession) AddRemoteIceCandidate(raw string) {
 		s.logf("[raw][%s] UnmarshalCandidate failed: %v (raw=%q)", s.bridgeID, err, raw)
 		return
 	}
+
+	// Refuse our own candidate handed back to us. Adding it would make pion pair
+	// a local candidate against itself — hairpin pairs that can never carry SFU
+	// media but are retried for the whole checking phase. See localCandidateKeys.
+	s.mu.Lock()
+	isOwn := s.localCandidateKeys[candidateKey(c.Address(), c.Port(), c.Component())]
+	s.mu.Unlock()
+	if isOwn {
+		s.logf("[raw][%s] IGNORED echoed local candidate: %s", s.bridgeID, raw[:min(len(raw), 60)])
+		return
+	}
+
 	if err := s.iceAgent.AddRemoteCandidate(c); err != nil {
 		s.logf("[raw][%s] AddRemoteCandidate failed: %v", s.bridgeID, err)
 		return
@@ -1814,31 +1891,46 @@ func firstSDPAttr(sdp, prefix string) string {
 	return ""
 }
 
-// parseDTLSRole reads a=setup: from the SDP and returns the DTLS role Go should use.
+// resolveDTLSRole decides whether Go acts as DTLS client or server, per
+// RFC 5763 §5.
 //
-//	a=setup:active  → remote initiates ClientHello → Go is Server  ("server")
-//	a=setup:passive → Go initiates ClientHello     → Go is Client  ("client")
-//	a=setup:actpass → ambiguous, default to server (Teams usually sends "active")
-//	missing         → default to server
-func parseDTLSRole(sdp string) string {
-	for _, line := range strings.Split(sdp, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "a=setup:") {
-			continue
-		}
-		val := strings.ToLower(strings.TrimRight(
-			strings.TrimPrefix(trimmed, "a=setup:"), "\r"))
-		switch val {
-		case "passive":
-			return "client"
-		default:
-			// "active", "actpass", or anything unrecognised → server. The
-			// caller logs the parsed a=setup: value alongside the role, so a
-			// surprising input is visible there without a second line here.
-			return "server"
-		}
+// The LOCAL a=setup: is authoritative whenever it names a concrete role,
+// because it is the value the SFU actually received and is acting on:
+//
+//	local a=setup:active  → we promised to send the ClientHello → Go is client
+//	local a=setup:passive → we promised to wait for it          → Go is server
+//
+// Only when the local side is "actpass" — which means we were the offerer and
+// left the choice open — does the remote's answer decide:
+//
+//	remote a=setup:passive → remote waits → Go is client
+//	remote a=setup:active  → remote initiates → Go is server
+//
+// Reading only the remote SDP is what broke incoming calls. On an outgoing call
+// the remote is the SFU's ANSWER, which carries a concrete "passive", so the
+// old logic happened to be right. On an incoming call the remote is the SFU's
+// OFFER, which carries "actpass" — and the old default mapped that to "server"
+// while the browser's answer, which we forward to the SFU untouched, said
+// "active". Both ends then waited for a ClientHello that neither would send,
+// and the handshake simply never started.
+func resolveDTLSRole(localSetup, remoteSDP string) string {
+	switch strings.ToLower(strings.TrimSpace(localSetup)) {
+	case "active":
+		return "client"
+	case "passive":
+		return "server"
 	}
-	return "server"
+
+	// Local is actpass (or unknown): we offered, so the remote answer decides.
+	switch strings.ToLower(firstSDPAttr(remoteSDP, "a=setup:")) {
+	case "passive":
+		return "client"
+	default:
+		// "active", "actpass" or absent. Teams answers "passive" in practice,
+		// so reaching here means the remote left it open too; defaulting to
+		// server matches the offerer-waits convention.
+		return "server"
+	}
 }
 
 // verifyPeerCertByDER checks the DTLS peer cert (raw DER bytes captured via
@@ -2052,6 +2144,107 @@ func iceServersToStunURIs(servers []IceServer, logf func(string, ...any), bridge
 		}
 	}
 	return out
+}
+
+// iceSamplerInterval is how often the checklist is summarised while ICE is
+// still connecting. A healthy connect completes well inside one interval, so a
+// successful call logs nothing; a 30s failure logs six lines.
+const iceSamplerInterval = 5 * time.Second
+
+// startICEChecklistSampler logs a one-line summary of pion's candidate-pair
+// checklist every iceSamplerInterval until the returned stop function is called.
+// Stop is idempotent and blocks until the sampler goroutine has exited, so no
+// line can appear after the handshake has been reported.
+//
+// GetCandidatePairsStats runs on the agent's own loop, so it is safe to call
+// while Dial/Accept is blocked.
+func (s *rawShadowSession) startICEChecklistSampler() func() {
+	done := make(chan struct{})
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+		ticker := time.NewTicker(iceSamplerInterval)
+		defer ticker.Stop()
+
+		start := time.Now()
+		reportedResponders := false
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+			}
+
+			pairs := s.iceAgent.GetCandidatePairsStats()
+
+			var waiting, inProgress, succeeded, failed, nominated int
+			var responses uint64
+			for _, p := range pairs {
+				switch p.State {
+				case ice.CandidatePairStateWaiting:
+					waiting++
+				case ice.CandidatePairStateInProgress:
+					inProgress++
+				case ice.CandidatePairStateSucceeded:
+					succeeded++
+				case ice.CandidatePairStateFailed:
+					failed++
+				}
+				if p.Nominated {
+					nominated++
+				}
+				responses += p.ResponsesReceived
+			}
+
+			selected := "none"
+			if sel, ok := s.iceAgent.GetSelectedCandidatePairStats(); ok {
+				selected = sel.LocalCandidateID + "->" + sel.RemoteCandidateID
+			}
+
+			s.logf("[raw][%s] ICE checklist t=%v pairs=%d waiting=%d inprogress=%d succeeded=%d failed=%d nominated=%d respRecv=%d selected=%s",
+				s.bridgeID, time.Since(start).Round(time.Second), len(pairs),
+				waiting, inProgress, succeeded, failed, nominated, responses, selected)
+
+			// Name the pairs the SFU actually answered on, once. This is the line
+			// that says "the transport works, we are waiting to be nominated".
+			if responses > 0 && !reportedResponders {
+				reportedResponders = true
+				for _, p := range pairs {
+					if p.ResponsesReceived > 0 {
+						s.logf("[raw][%s] ICE responding pair: %s -> %s state=%s nominated=%v responses=%d",
+							s.bridgeID, p.LocalCandidateID, p.RemoteCandidateID,
+							p.State, p.Nominated, p.ResponsesReceived)
+					}
+				}
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-finished
+	}
+}
+
+// candidateKey identifies an ICE candidate by the only fields that survive the
+// round trip through the extension: transport address, port and component.
+// Foundation and priority are stable too, but raddr is rewritten to 0.0.0.0 by
+// scrubCandidateRaddr before dispatch, so the full candidate line is not a
+// reliable key.
+func candidateKey(address string, port int, component uint16) string {
+	return fmt.Sprintf("%s:%d/%d", strings.ToLower(address), port, component)
+}
+
+// orNone renders an absent SDP attribute as "(none)" so a missing value is
+// distinguishable from an empty one in the log.
+func orNone(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "(none)"
+	}
+	return s
 }
 
 func safePrefix(s string, n int) string {

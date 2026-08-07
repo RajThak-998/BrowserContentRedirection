@@ -364,13 +364,17 @@ func ShortenSDP(sdp string) string {
 		}
 	}
 
-	mids := ExtractMediaSections(sdp)
-	var midStr []string
-	for _, m := range mids {
-		midStr = append(midStr, m.Type+":"+m.Port)
+	// These are media SECTIONS (type + m-line port), NOT a=mid: values. The label
+	// used to read "mids=", which invited exactly the wrong reading of every log
+	// line it produced — "mids=[audio:9, video:9]" is two m-sections on port 9,
+	// not two mids named "audio:9" and "video:9".
+	sections := ExtractMediaSections(sdp)
+	var sectionStr []string
+	for _, m := range sections {
+		sectionStr = append(sectionStr, m.Type+":"+m.Port)
 	}
 
-	return "ufrag=" + ufrag + " pwd=" + pwd + " fingerprint=" + fingerprint + " c=[" + strings.Join(cLines, ", ") + "] mids=[" + strings.Join(midStr, ", ") + "]"
+	return "ufrag=" + ufrag + " pwd=" + pwd + " fingerprint=" + fingerprint + " c=[" + strings.Join(cLines, ", ") + "] msections=[" + strings.Join(sectionStr, ", ") + "]"
 }
 
 // MungeSDPTransport Go implementation of the SDP munger.

@@ -412,6 +412,10 @@ func (e *Engine) triggerConnect(conn SignalingConn, bridgeID string, session *ra
 			session.mu.Lock()
 			iceServers := session.iceServers
 			ptCodecMap := session.ptCodecMap
+			// Carried over so a retried INCOMING call still knows which DTLS
+			// role we advertised; without it Connect() would fall back to the
+			// SFU offer's "actpass" and pick the wrong side again.
+			localDTLSSetup := session.localDTLSSetup
 			
 			var cert tls.Certificate
 			var localCreds *RTCShadowReadyPayload
@@ -434,6 +438,7 @@ func (e *Engine) triggerConnect(conn SignalingConn, bridgeID string, session *ra
 				newSession.localCredentials = localCreds
 			}
 			newSession.isOfferer = (sdpType == "offer")
+			newSession.localDTLSSetup = localDTLSSetup
 			newSession.mu.Unlock()
 
 			go e.retryBridge(conn, bridgeID, newSession, remoteSDP, sdpType, backoff)
@@ -495,7 +500,8 @@ func (e *Engine) retryBridge(conn SignalingConn, bridgeID string, session *rawSh
 	if err := writeJSONPacket(conn, "RTC_SHADOW_READY", ready); err != nil {
 		e.logf("[raw][%s] send SHADOW_READY failed: %v", bridgeID, err)
 	}
-	e.logf("[bcr_client] RTC_SHADOW_READY (retry) sent bridgeId=%s sdpType=%s", bridgeID, sdpType)
+	e.logf("[bcr_client] RTC_SHADOW_READY (retry) sent bridgeId=%s sdpType=%s ufrag=%s cands=%d",
+		bridgeID, sdpType, ready.ICEUfrag, len(ready.Candidates))
 
 	session.mu.Lock()
 	gen := session.generation
@@ -555,8 +561,23 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 	// renegotiate with different PT numbers, and we must accept any PT it sends.
 	// The extension's SDP codec pinning constrains WHAT the SFU sends;
 	// this map just lets us identify the packets when they arrive.
-	session.ptCodecMap = ParsePTCodecMap(payload.SDP)
-	e.logf("[raw][%s] parsed %d codec(s) from local %s SDP", bridgeID, len(session.ptCodecMap), sdpType)
+	//
+	// Merged rather than replaced: on an INCOMING call the SFU's offer arrives
+	// first and handleShadowRemote has already populated this map from it.
+	// Assigning a fresh map here would discard that.
+	localCodecs := ParsePTCodecMap(payload.SDP)
+	session.mu.Lock()
+	for pt, info := range localCodecs {
+		session.ptCodecMap[pt] = info
+	}
+	codecCount := len(session.ptCodecMap)
+	// The a=setup: role we are advertising to the SFU. Captured here because
+	// Connect() only receives the remote SDP, and on an incoming call the
+	// remote side says "actpass" — leaving the choice to this value.
+	session.localDTLSSetup = firstSDPAttr(payload.SDP, "a=setup:")
+	localSetup := session.localDTLSSetup
+	session.mu.Unlock()
+	e.logf("[raw][%s] local %s SDP: %d codec(s), a=setup:%s", bridgeID, sdpType, codecCount, orNone(localSetup))
 	// Populate RTX mappings from SDP fmtp:apt= lines.
 	for rtxPT, mediaPT := range extractFmtpAPT(payload.SDP) {
 		session.rtxMapping.set(rtxPT, mediaPT)
@@ -594,7 +615,9 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 	}
 
 	// Mark ICE role: offerer = controlling (Dial), answerer = controlled (Accept).
+	session.mu.Lock()
 	session.isOfferer = sdpType == "offer"
+	session.mu.Unlock()
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -654,7 +677,8 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 		if err := writeJSONPacket(conn, "RTC_SHADOW_READY", ready); err != nil {
 			e.logf("[raw][%s] send SHADOW_READY failed: %v", bridgeID, err)
 		}
-		e.logf("[bcr_client] RTC_SHADOW_READY sent bridgeId=%s sdpType=%s", bridgeID, sdpType)
+		e.logf("[bcr_client] RTC_SHADOW_READY sent bridgeId=%s sdpType=%s ufrag=%s cands=%d",
+			bridgeID, sdpType, ready.ICEUfrag, len(ready.Candidates))
 
 		// Answerer path: if SHADOW_REMOTE(offer) already arrived, connect now.
 		// Offerer path: Connect() will be triggered by SHADOW_REMOTE(answer).
@@ -1087,6 +1111,12 @@ func (e *Engine) handleRenegotiationLocal(conn SignalingConn, session *rawShadow
 		e.logf("[raw][%s] renegotiation SHADOW_READY send failed: %v", bridgeID, err)
 		return
 	}
+	// Success used to be silent here, so bcr_host.log could show a READY going
+	// down with nothing in bcr_client.log to account for it. The candidate count
+	// is the interesting part: it is what the extension will inject inline into
+	// the munged SDP, and anything gathered after Init() is missing from it.
+	e.logf("[raw][%s] renegotiation SHADOW_READY sent sdpType=%s ufrag=%s cands=%d",
+		bridgeID, sdpType, ready.ICEUfrag, len(ready.Candidates))
 }
 
 // syncLoopbackTracks snapshots the session's current codec map under the
@@ -1120,6 +1150,16 @@ func (e *Engine) handleRenegotiationRemote(session *rawShadowSession, bridgeID s
 	for _, sec := range sections {
 		e.logf("[raw][%s] [Renegotiation Track Mapping] Section: m=%s %s %s", bridgeID, sec.Type, sec.Port, sec.Protocol)
 	}
+
+	// Say whether the peer's transport actually moved, rather than assuming it
+	// did not. CHANGED=true means the live ICE agent is authenticating against
+	// credentials the peer has already abandoned, and no amount of retrying the
+	// current agent can recover — see transportDiff.
+	session.mu.Lock()
+	prevRemote := session.connectedRemoteSDP
+	session.mu.Unlock()
+	diff, changed := transportDiff(prevRemote, sdp)
+	e.logf("[raw][%s] renegotiation %s transport: %s CHANGED=%v", bridgeID, sdpType, diff, changed)
 
 	e.mergeCodecsAndSSRCs(session, bridgeID, sdpType, sdp, false)
 
@@ -1159,6 +1199,54 @@ func writeJSONPacket(conn SignalingConn, packetType string, payload any) error {
 		return err
 	}
 	return conn.WriteMessage(1, out) // 1 = TextMessage
+}
+
+// transportDiff compares the transport plane — ICE credentials, DTLS
+// fingerprint, candidate count, a=setup: — of a newly arrived SDP against the
+// one the live session was built from, and reports whether the peer moved.
+//
+// This exists because handleRenegotiationRemote used to log "transport
+// unchanged" without ever checking. On an incoming call the post-pickup
+// renegotiation is exactly where a transport change would appear, and if the
+// SFU rotates its ICE credentials there we would keep authenticating every
+// connectivity check against the pre-pickup ufrag forever.
+//
+// changed is driven by ufrag/pwd/fingerprint only. A differing candidate count
+// is normal (the peer may simply have gathered more) and does not by itself
+// mean the transport moved.
+//
+// The password is never logged; hashSDP gives a stable token that can be
+// compared across lines without exposing the credential.
+func transportDiff(prevSDP, newSDP string) (summary string, changed bool) {
+	newUfrag, newPwd, newFP := ExtractShadowCredentials(newSDP)
+	newFP = normalizeFingerprint(newFP)
+	newCands := len(ExtractShadowCandidates(newSDP))
+	newSetup := firstSDPAttr(newSDP, "a=setup:")
+
+	if strings.TrimSpace(prevSDP) == "" {
+		return fmt.Sprintf("ufrag=%s pwd_hash=%s fp=%s cands=%d setup=%s (no prior transport recorded)",
+			orNone(newUfrag), safePrefix(hashSDP(newPwd), 8), safePrefix(newFP, 17),
+			newCands, orNone(newSetup)), false
+	}
+
+	oldUfrag, oldPwd, oldFP := ExtractShadowCredentials(prevSDP)
+	oldFP = normalizeFingerprint(oldFP)
+
+	was := func(now, before string) string {
+		if now == before {
+			return ""
+		}
+		return "(was " + orNone(before) + ")"
+	}
+
+	changed = newUfrag != oldUfrag || newPwd != oldPwd || newFP != oldFP
+
+	return fmt.Sprintf("ufrag=%s%s pwd_hash=%s%s fp=%s%s cands=%d(was %d) setup=%s",
+		orNone(newUfrag), was(newUfrag, oldUfrag),
+		safePrefix(hashSDP(newPwd), 8), was(safePrefix(hashSDP(newPwd), 8), safePrefix(hashSDP(oldPwd), 8)),
+		safePrefix(newFP, 17), was(safePrefix(newFP, 17), safePrefix(oldFP, 17)),
+		newCands, len(ExtractShadowCandidates(prevSDP)),
+		orNone(newSetup)), changed
 }
 
 // hashSDP returns a 16-char MD5 hex prefix for dedup/logging.
