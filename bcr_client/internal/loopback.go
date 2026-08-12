@@ -33,22 +33,28 @@ const (
 	// self-inflicted CPU/IO storm that starves the SRTP read loop. Matched to the
 	// [MEDIA-SUMMARY] cadence so the two can be read as one picture.
 	nackLogMinInterval = 5 * time.Second
-
-	// nackCooldownMs is the minimum interval (in ms) between forwarding
-	// NACKs to the remote VDI for the same SSRC. Prevents flooding.
-	nackCooldownMs = 200
 )
 
-// rtpRingBuffer is a lock-free (single-writer) ring buffer for caching RTP packets.
+// rtpRingBuffer is a single-writer ring buffer for caching RTP packets.
+// Serialised by loopbackSession.mu, which both WriteRTP and handleNACK hold.
 type rtpRingBuffer struct {
 	buf  [rtpCacheSize]cachedRTPPacket
 	mask uint16 // rtpCacheSize - 1, for fast modulo
+
+	// newestSeq / initialised track the highest sequence number stored, so an
+	// out-of-order write can be recognised and refused. See store.
+	newestSeq   uint16
+	initialised bool
 }
 
 type cachedRTPPacket struct {
-	seq     uint16
-	valid   bool
-	payload []byte     // serialized RTP packet (header + payload)
+	seq   uint16
+	valid bool
+
+	// payload is the serialised RTP packet (header + payload). Backed by a
+	// per-slot buffer that is reused across stores rather than reallocated:
+	// this is written once per outbound packet, over a thousand times a second.
+	payload []byte
 }
 
 func newRTPRingBuffer() *rtpRingBuffer {
@@ -58,16 +64,34 @@ func newRTPRingBuffer() *rtpRingBuffer {
 }
 
 // store caches a serialized RTP packet by its sequence number.
+//
+// Out-of-order writes are refused. Slots are indexed by seq modulo the buffer
+// size, so a retransmission arriving late — an RTX-recovered packet, say —
+// carries an old sequence number that maps onto the slot of a packet 512 ahead
+// of it. Storing it would evict a current packet in favour of one already
+// delivered, and the NACK most likely to arrive next is for the current one.
+// The cache exists to answer that NACK, so it must not overwrite itself
+// backwards.
 func (rb *rtpRingBuffer) store(seq uint16, raw []byte) {
-	idx := seq & rb.mask
-	// Copy the raw bytes so we don't hold references to the original buffer.
-	dup := make([]byte, len(raw))
-	copy(dup, raw)
-	rb.buf[idx] = cachedRTPPacket{
-		seq:     seq,
-		valid:   true,
-		payload: dup,
+	if rb.initialised && int16(seq-rb.newestSeq) <= 0 {
+		return
 	}
+	rb.newestSeq = seq
+	rb.initialised = true
+
+	idx := seq & rb.mask
+	entry := &rb.buf[idx]
+	// Reuse the slot's existing allocation when it is large enough. The copy is
+	// required either way — raw belongs to the caller — but the allocation is
+	// not, and this runs on the media path.
+	if cap(entry.payload) >= len(raw) {
+		entry.payload = entry.payload[:len(raw)]
+	} else {
+		entry.payload = make([]byte, len(raw))
+	}
+	copy(entry.payload, raw)
+	entry.seq = seq
+	entry.valid = true
 }
 
 // retrieve looks up a cached packet by sequence number.
@@ -137,7 +161,6 @@ type loopbackSession struct {
 	onLoopbackOffer func(bridgeID, sdp string)
 
 	onRequestKeyframe func(bridgeID string, ssrc uint32)
-	onNACK            func(bridgeID string, ssrc uint32, missing []uint16)
 
 	mu sync.Mutex
 	pc *webrtc.PeerConnection
@@ -165,14 +188,11 @@ type loopbackSession struct {
 	loopbackToVdiSSRC map[uint32]uint32
 
 	// NACK statistics for sampled logging (avoids per-packet log spam).
-	nackLocalHit   uint64 // NACKs satisfied from local cache
-	nackLocalMiss  uint64 // NACKs that had to be forwarded to VDI
-	nackTotal      uint64 // total NACK requests received
+	nackLocalHit  uint64 // NACKs satisfied from local cache
+	nackLocalMiss uint64 // NACKs the cache could not answer
+	nackTotal     uint64 // total NACK requests received
 
 	nackLastLogTime time.Time // wall-clock of last NACK-summary log (time throttle)
-
-	// Per-SSRC cooldown for forwarding NACKs to VDI.
-	nackLastForward map[uint32]time.Time
 
 	// One-time logging guard for dropped RTP PTs with no local track.
 	droppedPTs map[uint8]bool
@@ -199,17 +219,14 @@ func newLoopbackSession(
 	onLoopbackOffer func(bridgeID, sdp string),
 	ptCodecMap map[uint8]CodecInfo,
 	onRequestKeyframe func(bridgeID string, ssrc uint32),
-	onNACK func(bridgeID string, ssrc uint32, missing []uint16),
 ) *loopbackSession {
 	ls := &loopbackSession{
 		bridgeID:          bridgeID,
 		logf:              logf,
 		onLoopbackOffer:   onLoopbackOffer,
 		onRequestKeyframe: onRequestKeyframe,
-		onNACK:            onNACK,
 		tracks:            make(map[trackKind]*loopbackTrack),
 		loopbackToVdiSSRC: make(map[uint32]uint32),
-		nackLastForward:   make(map[uint32]time.Time),
 		droppedPTs:        make(map[uint8]bool),
 		ptCodecMap:        ptCodecMap,
 	}
@@ -812,10 +829,27 @@ func (ls *loopbackSession) readRTCP(sender *webrtc.RTPSender) {
 	}
 }
 
-// handleNACK processes a single NACK packet from the receiver. Requested
-// packets are retransmitted from this track's local cache where possible;
-// anything the cache does not hold is forwarded to the SFU, which is the only
-// party that can still produce it.
+// handleNACK processes a single NACK packet from the receiver, retransmitting
+// what it can from this track's local cache.
+//
+// Cache misses are counted but deliberately NOT forwarded to the SFU any more.
+//
+// Sequence numbers pass through this leg unchanged — WriteRTP rewrites the
+// payload type and SSRC but keeps the SFU's sequence number — so a NACK from
+// the receiver names the same number the ingress leg tracks. Which means a miss
+// here is almost always a packet the SFU never delivered, and the NACK engine
+// (nack.go) already has it pending, has already asked, and will ask again on
+// its own timer. Forwarding was a second, uncoordinated request for the same
+// packet from a different goroutine.
+//
+// It was also mostly theatre: the forward path was rate-limited to one NACK per
+// SSRC per 200ms, so under the sustained loss where repair actually matters it
+// dropped the overwhelming majority of what it was handed. The remaining case —
+// a packet we did receive and write, but which the cache no longer holds — is
+// not something the SFU can help with either, since it is a local eviction.
+//
+// The receiver's other feedback, PLI, IS still forwarded: only the SFU can
+// produce a keyframe.
 func (ls *loopbackSession) handleNACK(p *rtcp.TransportLayerNack) {
 	// Collect all missing sequence numbers from the NACK packet.
 	var allMissing []uint16
@@ -844,21 +878,20 @@ func (ls *loopbackSession) handleNACK(p *rtcp.TransportLayerNack) {
 		targetSSRC = p.MediaSSRC
 	}
 
-	var localRetransmitted int
-	var cacheMisses []uint16
+	var localRetransmitted, cacheMisses int
 	for _, seq := range allMissing {
 		raw, found := lt.cache.retrieve(seq)
 		if !found {
-			cacheMisses = append(cacheMisses, seq)
+			cacheMisses++
 			continue
 		}
 		var cachedPkt rtp.Packet
 		if err := cachedPkt.Unmarshal(raw); err != nil {
-			cacheMisses = append(cacheMisses, seq)
+			cacheMisses++
 			continue
 		}
 		if err := lt.track.WriteRTP(&cachedPkt); err != nil {
-			cacheMisses = append(cacheMisses, seq)
+			cacheMisses++
 			continue
 		}
 		localRetransmitted++
@@ -866,7 +899,7 @@ func (ls *loopbackSession) handleNACK(p *rtcp.TransportLayerNack) {
 
 	ls.nackTotal += uint64(len(allMissing))
 	ls.nackLocalHit += uint64(localRetransmitted)
-	ls.nackLocalMiss += uint64(len(cacheMisses))
+	ls.nackLocalMiss += uint64(cacheMisses)
 	currentTotal, hitTotal, missTotal := ls.nackTotal, ls.nackLocalHit, ls.nackLocalMiss
 
 	// Time-throttled logging: at most once every nackLogMinInterval, regardless of
@@ -878,28 +911,13 @@ func (ls *loopbackSession) handleNACK(p *rtcp.TransportLayerNack) {
 		ls.nackLastLogTime = time.Now()
 	}
 
-	// Rate-limit what we forward upstream: the SFU is an internet round trip
-	// away, and asking it repeatedly for the same gap only adds load.
-	forward := false
-	if len(cacheMisses) > 0 && ls.onNACK != nil {
-		now := time.Now()
-		if now.Sub(ls.nackLastForward[p.MediaSSRC]).Milliseconds() >= nackCooldownMs {
-			ls.nackLastForward[p.MediaSSRC] = now
-			forward = true
-		}
-	}
-
 	kind := lt.kind
 	ls.mu.Unlock()
 
 	if shouldLog {
-		ls.logf("[bcr_client][loopback][%s] %s NACK: total=%d servedLocally=%d forwarded=%d hitRate=%.1f%% (loopback SSRC %d → SFU SSRC %d)",
+		ls.logf("[bcr_client][loopback][%s] %s NACK: total=%d servedLocally=%d cacheMiss=%d hitRate=%.1f%% (loopback SSRC %d → SFU SSRC %d)",
 			ls.bridgeID, kind, currentTotal, hitTotal, missTotal,
 			float64(hitTotal)/float64(max(currentTotal, 1))*100.0,
 			p.MediaSSRC, targetSSRC)
-	}
-
-	if forward {
-		ls.onNACK(ls.bridgeID, targetSSRC, cacheMisses)
 	}
 }

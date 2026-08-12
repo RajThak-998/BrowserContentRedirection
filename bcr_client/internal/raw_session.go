@@ -24,6 +24,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/dtls/v3"
@@ -108,6 +110,11 @@ type seqTracker struct {
 	lastTransit int64   // last transit time (arrivalTS - rtpTS) in clock units
 	jitterInited bool
 	clockRate   uint32  // RTP clock rate for this SSRC (e.g. 90000 for video, 48000 for audio)
+
+	// lastPacketAt is when this SSRC last delivered a packet. Trackers that go
+	// quiet past staleSSRCTimeout are dropped from incomingSeqs, so a call full
+	// of renegotiations does not accumulate dead streams forever.
+	lastPacketAt time.Time
 }
 
 const (
@@ -148,13 +155,21 @@ func (t *seqTracker) updateSeq(seq uint16) {
 }
 
 // updateJitter computes interarrival jitter per RFC 3550 §A.8.
-// arrivalTime is time.Now().UnixMicro(), rtpTimestamp is the RTP timestamp.
+//
+// arrivalTimeUs must be microseconds since some fixed session-local epoch, NOT
+// a Unix timestamp. This is load-bearing: the previous version passed
+// time.Now().UnixMicro() (~1.79e15 today) and multiplied by the clock rate,
+// which for 90kHz video gives ~1.6e20 and overflows int64 (max ~9.22e18) —
+// silently, wrapping to an arbitrary value. Audio at 48kHz overflowed too. The
+// Jitter field in every Receiver Report we ever sent was therefore noise, and
+// jitter is one of the two signals the SFU uses to judge whether the receiver
+// is coping. sessionMicros() produces the correct relative value.
 func (t *seqTracker) updateJitter(arrivalTimeUs int64, rtpTimestamp uint32) {
 	if t.clockRate == 0 {
 		return // can't compute without clock rate
 	}
-	// Convert arrival time to RTP timestamp units.
-	// Use relative arrival in microseconds → convert to clock units.
+	// Convert arrival time to RTP timestamp units. Both operands stay small
+	// because arrivalTimeUs is measured from session start, not from 1970.
 	arrivalInClockUnits := arrivalTimeUs * int64(t.clockRate) / 1_000_000
 	transit := arrivalInClockUnits - int64(rtpTimestamp)
 
@@ -214,7 +229,13 @@ func (t *seqTracker) extended() uint32 {
 // twccEntry records a single transport-wide sequence number and its arrival time.
 type twccEntry struct {
 	seq       uint16
-	arrivalUs int64 // time.Now().UnixMicro() at reception
+	// arrivalUs is microseconds since session start (sessionMicros), not a Unix
+	// timestamp. TWCC's reference time is a 24-bit count of 64ms units and the
+	// receiver only reads deltas, so either origin transmits correctly — but a
+	// session-relative one starts at zero and cannot wrap during a call, and it
+	// keeps every arrival timestamp in the session on one scale that is safe to
+	// multiply by a clock rate. See updateJitter for what happens otherwise.
+	arrivalUs int64
 }
 
 // twccTracker accumulates transport-wide sequence numbers between feedback
@@ -254,11 +275,33 @@ type rawShadowSession struct {
 	iceAgent *ice.Agent
 
 	// ── Phase 2 fields (set by Connect) ────────────────────────────────────
-	iceConn  *ice.Conn
+	//
+	// The nominated ICE connection is not kept here: everything that writes to
+	// it now goes through mediaWriter, under the lock that guards the outbound
+	// SRTP context. Keeping a second, unsynchronised handle to the same socket
+	// would be an invitation to bypass that.
 	splitter *iceConnSplitter
 	dtlsConn *dtls.Conn
-	srtpCtx  *srtp.Context
-	srtcpCtx *srtp.Context
+
+	// inboundCtx decrypts everything the SFU sends us — both SRTP media and
+	// SRTCP feedback. outboundCtx encrypts everything we send it. The two are
+	// derived from opposite halves of the DTLS key material (see
+	// deriveSRTPContextFromMaterial), so using one where the other belongs
+	// fails silently rather than loudly.
+	//
+	// These were called srtpCtx/srtcpCtx, which read as "the RTP one" and "the
+	// RTCP one" and is not what they are: outboundCtx encrypts our RTCP today
+	// and will encrypt our outbound RTP when the uplink lands. Only inbound vs
+	// outbound distinguishes them.
+	inboundCtx  *srtp.Context
+	outboundCtx *srtp.Context
+
+	// mediaWriter is where encrypted SRTP/SRTCP goes — the ICE connection in
+	// production. It is an interface rather than *ice.Conn so the serialisation
+	// around outboundCtx can be exercised without a live transport, which is
+	// the only way to have a regression test for a fault whose symptom is the
+	// process dying. Read and written under outboundWriteMu.
+	mediaWriter io.Writer
 
 	// Video SSRC tracking for RTCP PLI (Picture Loss Indication).
 	// PLI is required to trigger the SFU to send video keyframes.
@@ -275,8 +318,16 @@ type rawShadowSession struct {
 	lastSRBySSRCMu sync.Mutex
 
 	// ── TWCC (Transport-Wide Congestion Control) ─────────────────────────
-	twcc             *twccTracker
-	transportCCExtID uint8  // RTP header extension ID for transport-cc
+	twcc *twccTracker
+
+	// transportCCExtID is the RTP header extension ID carrying the
+	// transport-wide sequence number, 0 when transport-cc was not negotiated.
+	//
+	// Atomic because it is written from the signalling goroutine on every SDP
+	// parse and read from the SRTP read loop on every packet. It is also
+	// write-once-then-sticky: see setTransportCCExtID for why a renegotiation
+	// must never be allowed to clear it back to 0.
+	transportCCExtID atomic.Uint32
 
 	// ── SDES CNAME (extracted from VDI browser's local SDP) ──────────────
 	localCNAME string
@@ -313,7 +364,25 @@ type rawShadowSession struct {
 
 	// PT → codec capability map populated from the browser's offer/answer SDP.
 	// Used by the relay layer to create TrackLocalStaticRTP with correct codecs.
+	//
+	// Guarded by mu, and written only by the signalling goroutine. The media
+	// path must NOT read this — it reads codecSnapshot instead.
 	ptCodecMap map[uint8]CodecInfo
+
+	// codecSnapshot is an immutable copy of ptCodecMap, republished whenever
+	// the map changes. Readers on the media path take it with a single atomic
+	// load and must never mutate it.
+	//
+	// This exists because the previous arrangement was the most expensive thing
+	// in the whole receive path. Every inbound RTP packet took the session-wide
+	// mutex three times in decryptAndDispatch to look up the SAME payload type,
+	// and then onRTPPacket took it a fourth time to allocate and deep-copy the
+	// entire map — per packet. A Teams offer carries fifteen to twenty payload
+	// types (seven H.264 profiles, RTX, Opus, comfort noise), so at a thousand
+	// packets a second that was a thousand map allocations a second, each
+	// holding the mutex that Connect, the heartbeat and the TWCC loop also
+	// need. Now the hot path allocates nothing and blocks on nothing.
+	codecSnapshot atomic.Pointer[map[uint8]CodecInfo]
 
 	// ICE servers captured from the browser's RTCPeerConnection config.
 	iceServers []IceServer
@@ -367,16 +436,28 @@ type rawShadowSession struct {
 	// recognises us as the video receiver (not the audio participant).
 	localVideoSSRC uint32
 
-	// srtcpWriteMu serialises all SRTCP encrypt+write operations.
-	// The SRTCP context maintains an internal index counter; concurrent
-	// EncryptRTCP calls (heartbeat, PLI, NACK) cause index collisions
-	// that make the SFU reject packets silently.
-	srtcpWriteMu sync.Mutex
+	// outboundWriteMu serialises every use of outboundCtx.
+	//
+	// This is not merely about the SRTCP index counter (though concurrent
+	// EncryptRTCP calls do collide there and make the SFU drop the feedback
+	// silently). pion's srtp.Context keeps its per-SSRC state in plain maps
+	// with no internal locking — srtcpSSRCStates is read and written by
+	// EncryptRTCP without a mutex — so two goroutines encrypting at once is a
+	// concurrent map access, which the Go runtime turns into an unrecoverable
+	// fatal error, not a catchable panic.
+	//
+	// EVERY path that touches outboundCtx must hold this: heartbeat, TWCC,
+	// PLI, NACK — and outbound RTP when the uplink lands, since EncryptRTP
+	// shares the same Context and the same unguarded maps. Use sendRTCP
+	// rather than locking by hand.
+	outboundWriteMu sync.Mutex
 
 	// ── Deep Observability (diag.go) ─────────────────────────────────────
 	ssrcReg    *ssrcRegistry // per-SSRC stream state
 	rtxMapping *rtxMap       // PT→apt RTX mappings from SDP
-	nackSt     *nackState    // missing seq sets per SSRC
+
+	// nackEng owns loss detection and repair for the ingress leg — see nack.go.
+	nackEng *nackEngine
 
 	// rtxSSRCtoMedia maps RTX SSRC → media SSRC from a=ssrc-group:FID lines.
 	// Populated by ExtractFIDGroups on every SDP parse. Used by decapsulateRTX.
@@ -394,26 +475,152 @@ type rawShadowSession struct {
 	// reported, so the log carries one line per stream rather than one per PLI.
 	pliLoggedSSRCs map[uint32]bool
 
-	sessionStart time.Time // when SRTP came up
+	// sessionStart is fixed at construction and is the epoch for every relative
+	// timestamp in the session — notably the arrival times fed to jitter and
+	// TWCC, which must not be Unix-scale. See sessionMicros.
+	sessionStart time.Time
 
 	logf func(string, ...any)
+
+	// logThrottle rate-limits repeated diagnostics, keyed by a caller-chosen
+	// tag. Everything it guards sits on or beside the media path, where an
+	// unconditional log line is not a diagnostic but a load generator: the
+	// writes are synchronous to file and stdout, so a fault that repeats per
+	// packet starves the SRTP read loop and manufactures the very loss it is
+	// reporting. See logEvery.
+	logThrottleMu sync.Mutex
+	logThrottle   map[string]*throttledLog
+}
+
+// throttledLog is one tag's rate-limiter state: when it last emitted, and how
+// many calls have been swallowed since.
+type throttledLog struct {
+	last       time.Time
+	suppressed int64
+}
+
+// logThrottleInterval is the minimum gap between two log lines sharing a tag.
+const logThrottleInterval = 5 * time.Second
+
+// logEvery logs at most once per logThrottleInterval per tag. Suppressed calls
+// are counted and the count is appended to the next line that gets through, so
+// a throttled fault still reveals its true rate — "failed once" and "failed
+// 40 000 times" are very different diagnoses and must not look identical.
+func (s *rawShadowSession) logEvery(tag, format string, args ...any) {
+	s.logThrottleMu.Lock()
+	if s.logThrottle == nil {
+		s.logThrottle = make(map[string]*throttledLog)
+	}
+	t := s.logThrottle[tag]
+	if t == nil {
+		t = &throttledLog{}
+		s.logThrottle[tag] = t
+	}
+	if !t.last.IsZero() && time.Since(t.last) < logThrottleInterval {
+		t.suppressed++
+		s.logThrottleMu.Unlock()
+		return
+	}
+	suppressed := t.suppressed
+	t.suppressed = 0
+	t.last = time.Now()
+	s.logThrottleMu.Unlock()
+
+	if suppressed > 0 {
+		format += fmt.Sprintf(" (+%d more in the last %v)", suppressed, logThrottleInterval)
+	}
+	s.logf(format, args...)
 }
 
 func newRawShadowSession(bridgeID string, logf func(string, ...any)) *rawShadowSession {
-	return &rawShadowSession{
+	s := &rawShadowSession{
 		bridgeID:           bridgeID,
 		ptCodecMap:         make(map[uint8]CodecInfo),
 		localCandidateKeys: make(map[string]bool),
-		lastSRBySSRC:    make(map[uint32]srRecord),
-		twcc:            &twccTracker{entries: make([]twccEntry, 0, 512)},
-		logf:            logf,
-		state:           stateNew,
-		ssrcReg:         newSSRCRegistry(),
-		rtxMapping:      newRTXMap(),
-		nackSt:          newNACKState(),
-		rtxSSRCtoMedia:  make(map[uint32]uint32),
-		sessionStart:    time.Now(),
+		lastSRBySSRC:       make(map[uint32]srRecord),
+		twcc:               &twccTracker{entries: make([]twccEntry, 0, 512)},
+		logf:               logf,
+		state:              stateNew,
+		ssrcReg:            newSSRCRegistry(),
+		rtxMapping:         newRTXMap(),
+		rtxSSRCtoMedia:     make(map[uint32]uint32),
+		sessionStart:       time.Now(),
 	}
+	s.publishCodecSnapshot()
+	s.nackEng = newNACKEngine(logf)
+	s.nackEng.sendNACK = s.sendNACK
+	s.nackEng.requestKeyframe = s.requestKeyframe
+	s.nackEng.onRequested = func(ssrc uint32, count int) {
+		s.rtcpMu.Lock()
+		s.rtcpNACKCount++
+		s.rtcpMu.Unlock()
+		if st, _ := s.ssrcReg.getOrCreate(ssrc); st != nil {
+			st.mu.Lock()
+			st.nackSent += int64(count)
+			st.mu.Unlock()
+		}
+	}
+	s.nackEng.onGaveUp = func(ssrc uint32, count int) {
+		if st, _ := s.ssrcReg.getOrCreate(ssrc); st != nil {
+			st.mu.Lock()
+			st.totalLost += int64(count)
+			st.mu.Unlock()
+		}
+	}
+	return s
+}
+
+// publishCodecSnapshot republishes the immutable codec map the media path
+// reads. Call after every mutation of ptCodecMap; must NOT be called with mu
+// held, and the caller must have finished mutating before calling.
+func (s *rawShadowSession) publishCodecSnapshot() {
+	s.mu.Lock()
+	snap := make(map[uint8]CodecInfo, len(s.ptCodecMap))
+	for pt, info := range s.ptCodecMap {
+		snap[pt] = info
+	}
+	s.mu.Unlock()
+	s.codecSnapshot.Store(&snap)
+}
+
+// codecs returns the current immutable codec map. Never nil, never mutated.
+// This is the only codec lookup the media path may use.
+func (s *rawShadowSession) codecs() map[uint8]CodecInfo {
+	if p := s.codecSnapshot.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// setTransportCCExtID records the transport-cc header extension ID parsed from
+// an SDP, ignoring a zero.
+//
+// The "ignoring a zero" part is the whole point. mergeCodecsAndSSRCs used to
+// assign the remote SDP's extracted ID unconditionally, so any renegotiation
+// whose answer omitted the extmap silently reset this to 0 mid-call. From that
+// moment twccFeedbackLoop became a no-op and the heartbeat quietly downgraded
+// to REMB — congestion control degraded with nothing in the log to say so.
+//
+// A peer that negotiated transport-cc once does not stop understanding it, and
+// the ID is fixed for the session, so once known it is kept. A genuine change
+// of ID is honoured and reported, since that would be a real renegotiation.
+func (s *rawShadowSession) setTransportCCExtID(id uint8) {
+	if id == 0 {
+		return
+	}
+	prev := s.transportCCExtID.Swap(uint32(id))
+	if prev != 0 && prev != uint32(id) {
+		s.logf("[raw][%s] transport-cc extension ID changed %d → %d", s.bridgeID, prev, id)
+	}
+}
+
+// sessionMicros returns microseconds elapsed since this session was created.
+//
+// Every arrival timestamp that gets scaled by a clock rate must come from here
+// rather than from the wall clock: a Unix microsecond count multiplied by 90000
+// overflows int64. See updateJitter.
+func (s *rawShadowSession) sessionMicros() int64 {
+	return time.Since(s.sessionStart).Microseconds()
 }
 
 // ─── Phase 1 ─────────────────────────────────────────────────────────────────
@@ -866,7 +1073,6 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	if err != nil {
 		return fmt.Errorf("ICE handshake: %w", err)
 	}
-	s.iceConn = iceConn
 	s.logf("[raw][%s] ICE connected local=%s remote=%s", s.bridgeID, iceConn.LocalAddr(), iceConn.RemoteAddr())
 
 	// ── Step 4: Inline SRTP Splitter ─────────────────────────────────────────
@@ -1051,12 +1257,17 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 
 	// ── Step 8: SRTP key derivation ────────────────────────────────────────────
 	goIsClient := role == "client"
-	srtpCtx, srtcpCtx, err := deriveSRTPContextFromMaterial(capturedKeyMaterial, goIsClient, srtp.ProtectionProfile(srtpProfile), keyLen, saltLen, s.logf, s.bridgeID)
+	inboundCtx, outboundCtx, err := deriveSRTPContextFromMaterial(capturedKeyMaterial, goIsClient, srtp.ProtectionProfile(srtpProfile), keyLen, saltLen, s.logf, s.bridgeID)
 	if err != nil {
 		return fmt.Errorf("derive SRTP context: %w", err)
 	}
-	s.srtpCtx = srtpCtx
-	s.srtcpCtx = srtcpCtx
+	// Published together, under the lock that guards every use of the outbound
+	// side, so no sender can observe a context without its writer or vice versa.
+	s.outboundWriteMu.Lock()
+	s.inboundCtx = inboundCtx
+	s.outboundCtx = outboundCtx
+	s.mediaWriter = iceConn
+	s.outboundWriteMu.Unlock()
 	s.logf("[raw][%s] peer fingerprint verified, SRTP up (%v) — decrypting", s.bridgeID, srtp.ProtectionProfile(srtpProfile))
 
 	// ── Step 9: SRTP read loop ─────────────────────────────────────────────────
@@ -1075,6 +1286,9 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	go s.twccFeedbackLoop(loopCtx)
 	go s.startupKeyframeLoop(loopCtx)
 	go s.mediaSummaryLoop(loopCtx)
+	// One goroutine owns every NACK transmission for the session. Loss used to
+	// spawn a goroutine per gap directly from the SRTP read loop.
+	go s.nackEng.run(loopCtx.Done())
 
 	// ── DTLS drain loop ─────────────────────────────────────────────────────
 	// CRITICAL: pion/dtls v3's internal packet-reader goroutine only runs
@@ -1202,20 +1416,42 @@ func (s *rawShadowSession) getVideoSSRCs() []uint32 {
 	return result
 }
 
-// rtcpHeartbeatLoop sends a strict compound RTCP packet every 2 seconds:
+// maxReceptionReports bounds how many reception-report blocks one Receiver
+// Report may carry. The RTCP header's RC field is 5 bits (RFC 3550 §6.4.2), so
+// 31 is a hard protocol ceiling, not a tuning choice — go over it and
+// rtcp.Marshal fails and the whole compound packet is lost.
+const maxReceptionReports = 31
+
+// staleSSRCTimeout is how long an inbound SSRC may go without a packet before
+// it stops being reported on and its tracker is discarded. Teams renegotiates
+// repeatedly over a call and each renegotiation can introduce fresh SSRCs; the
+// dead ones would otherwise accumulate in incomingSeqs for the whole session,
+// crowding out the live streams from the RR and growing without bound.
+const staleSSRCTimeout = 30 * time.Second
+
+// rtcpHeartbeatLoop sends a compound RTCP packet every 2 seconds:
 //
 //  1. ReceiverReport  (RR)  — per-SSRC reception statistics with LSR/DLSR
 //  2. SourceDescription     (SDES / CNAME)
-//  3. PictureLossIndication (PLI) — one per known video SSRC
-//  4. ReceiverEstimatedMaximumBitrate (REMB) — only when TWCC is not active
+//  3. ReceiverEstimatedMaximumBitrate (REMB) — only when TWCC is not active
 //
-// PLI is sent unconditionally on every tick. Because this proxy does not
-// implement a full NACK engine, the Teams SFU's packet-loss estimator has no
-// other way to learn that the receiver is alive. Without periodic PLI the SFU
-// eventually halts the video track (~11 s). A PLI every 2 s is the correct
-// keep-alive signal — it guarantees a fresh keyframe and pacifies the SFU's
-// video watchdog without tripping its congestion limiter (which is triggered
-// by continuous rapid-fire PLI, not by 2-second cadence).
+// There is deliberately NO periodic PLI here any more.
+//
+// It used to send one per known video SSRC on every tick, justified by this
+// proxy not having "a full NACK engine" and by the SFU's video watchdog. Both
+// halves of that reasoning have expired: there is a real NACK engine now (see
+// nack.go), and RR+SDES is the liveness signal RFC 3550 actually defines — a
+// receiver that reports is a receiver that is alive.
+//
+// Meanwhile the cost was severe. A PLI forces a keyframe, and an H.264 IDR runs
+// 5–20x the size of a delta frame, so a PLI every 2s spent a large slice of the
+// video budget on keyframes nobody asked for and put a bitrate spike on the
+// wire every 2s. That spike builds queues, queues drop packets, drops trigger
+// more repair traffic — the loop was feeding the loss it was meant to survive.
+//
+// Keyframes are still requested where they are actually warranted: at startup
+// (startupKeyframeLoop), when the receiver asks (readRTCP → requestKeyframe),
+// and when the NACK engine gives up on a gap too large to repair.
 //
 // TWCC feedback is sent on its own 100ms loop (twccFeedbackLoop) to avoid
 // MTU overflow and BWE starvation.
@@ -1223,15 +1459,11 @@ func (s *rawShadowSession) rtcpHeartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	heartbeatCount := uint64(0)
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			heartbeatCount++
-
 			s.mu.Lock()
 			senderSSRC := s.localSenderSSRC
 			cname := s.localCNAME
@@ -1243,37 +1475,13 @@ func (s *rawShadowSession) rtcpHeartbeatLoop(ctx context.Context) {
 				cname = "bcr-shadow"
 			}
 
-			// ── Build Receiver Reports with real statistics ──────────────
-			var reports []rtcp.ReceptionReport
-			s.incomingSeqsMu.Lock()
-			for ssrc, tracker := range s.incomingSeqs {
-				fractionLost, totalLost := tracker.computeRRStats()
-				rr := rtcp.ReceptionReport{
-					SSRC:               ssrc,
-					FractionLost:       fractionLost,
-					TotalLost:          totalLost,
-					LastSequenceNumber: tracker.extended(),
-					Jitter:             uint32(tracker.jitter),
-				}
-				// Reflect LSR/DLSR from the last Sender Report we received.
-				s.lastSRBySSRCMu.Lock()
-				if sr, ok := s.lastSRBySSRC[ssrc]; ok {
-					// LSR = middle 32 bits of the 64-bit NTP timestamp.
-					rr.LastSenderReport = uint32(sr.ntpTime >> 16)
-					// DLSR = delay since SR received, in 1/65536 second units.
-					delayUs := time.Since(sr.receivedAt).Microseconds()
-					rr.Delay = uint32(delayUs * 65536 / 1_000_000)
-				}
-				s.lastSRBySSRCMu.Unlock()
-				reports = append(reports, rr)
-			}
-			s.incomingSeqsMu.Unlock()
+			reports := s.buildReceptionReports()
 
-			// Snapshot video SSRCs once — used for both PLI and REMB.
+			// Snapshot video SSRCs once — used by REMB.
 			videoSSRCs := s.getVideoSSRCs()
 
 			// ── Compound RTCP packet (RFC 3550 §6.1) ──────────────────────
-			// Order: RR → SDES → PLI(s) → REMB
+			// Order: RR → SDES → REMB
 			pkts := []rtcp.Packet{
 				&rtcp.ReceiverReport{
 					SSRC:    senderSSRC,
@@ -1282,43 +1490,86 @@ func (s *rawShadowSession) rtcpHeartbeatLoop(ctx context.Context) {
 				rtcp.NewCNAMESourceDescription(senderSSRC, cname),
 			}
 
-			// PLI — one per known video SSRC. Acts as both a keyframe
-			// request and a SFU video-watchdog keep-alive signal.
-			for _, ssrc := range videoSSRCs {
-				pkts = append(pkts, &rtcp.PictureLossIndication{
-					SenderSSRC: senderSSRC,
-					MediaSSRC:  ssrc,
-				})
-			}
-
 			// REMB — only when TWCC is not active (SFU rejected transport-cc).
-			if s.transportCCExtID == 0 {
+			if s.transportCCExtID.Load() == 0 {
 				pkts = append(pkts, &rtcp.ReceiverEstimatedMaximumBitrate{
 					SenderSSRC: senderSSRC,
 					Bitrate:    5_000_000,
 					SSRCs:      videoSSRCs,
 				})
+				s.rtcpMu.Lock()
+				s.rtcpREMBCount++
+				s.rtcpMu.Unlock()
 			}
 
-
-
-
-			// Increment RTCP counters for [MEDIA-SUMMARY].
 			s.rtcpMu.Lock()
 			s.rtcpRRCount++
-			for _, p := range pkts {
-				switch p.(type) {
-				case *rtcp.PictureLossIndication:
-					s.rtcpPLICount++
-				case *rtcp.ReceiverEstimatedMaximumBitrate:
-					s.rtcpREMBCount++
-				}
-			}
 			s.rtcpMu.Unlock()
 
-			s.sendCompoundRTCP(pkts, "heartbeat", heartbeatCount, senderSSRC, len(reports), len(videoSSRCs))
+			s.sendRTCP(pkts, "heartbeat")
 		}
 	}
+}
+
+// buildReceptionReports produces the reception-report blocks for one heartbeat,
+// dropping trackers that have gone silent and capping the result at the 31 the
+// RTCP header can express.
+//
+// When there are more live SSRCs than slots, the busiest ones win: a report on
+// the stream actually carrying the call is worth more to the SFU than a report
+// on an idle one.
+func (s *rawShadowSession) buildReceptionReports() []rtcp.ReceptionReport {
+	now := time.Now()
+
+	s.incomingSeqsMu.Lock()
+	for ssrc, tracker := range s.incomingSeqs {
+		if !tracker.lastPacketAt.IsZero() && now.Sub(tracker.lastPacketAt) > staleSSRCTimeout {
+			delete(s.incomingSeqs, ssrc)
+		}
+	}
+
+	reports := make([]rtcp.ReceptionReport, 0, len(s.incomingSeqs))
+	packetsBySSRC := make(map[uint32]uint32, len(s.incomingSeqs))
+	for ssrc, tracker := range s.incomingSeqs {
+		fractionLost, totalLost := tracker.computeRRStats()
+		reports = append(reports, rtcp.ReceptionReport{
+			SSRC:               ssrc,
+			FractionLost:       fractionLost,
+			TotalLost:          totalLost,
+			LastSequenceNumber: tracker.extended(),
+			Jitter:             uint32(tracker.jitter),
+		})
+		packetsBySSRC[ssrc] = tracker.received
+	}
+	s.incomingSeqsMu.Unlock()
+
+	// Reflect LSR/DLSR from the last Sender Report we received. Done outside
+	// incomingSeqsMu so the two locks are never held together — the SRTP read
+	// loop takes incomingSeqsMu on every packet and must not queue behind this.
+	s.lastSRBySSRCMu.Lock()
+	for i := range reports {
+		sr, ok := s.lastSRBySSRC[reports[i].SSRC]
+		if !ok {
+			continue
+		}
+		// LSR = middle 32 bits of the 64-bit NTP timestamp.
+		reports[i].LastSenderReport = uint32(sr.ntpTime >> 16)
+		// DLSR = delay since SR received, in 1/65536 second units.
+		reports[i].Delay = uint32(time.Since(sr.receivedAt).Microseconds() * 65536 / 1_000_000)
+	}
+	s.lastSRBySSRCMu.Unlock()
+
+	if len(reports) > maxReceptionReports {
+		sort.Slice(reports, func(i, j int) bool {
+			return packetsBySSRC[reports[i].SSRC] > packetsBySSRC[reports[j].SSRC]
+		})
+		s.logEvery("rr-overflow",
+			"[raw][%s] [RTCP] %d inbound SSRCs but a Receiver Report holds at most %d — reporting the %d busiest",
+			s.bridgeID, len(reports), maxReceptionReports, maxReceptionReports)
+		reports = reports[:maxReceptionReports]
+	}
+
+	return reports
 }
 
 
@@ -1334,28 +1585,10 @@ func (s *rawShadowSession) requestKeyframe(videoSSRC uint32) {
 		senderSSRC = 1
 	}
 
-	pli := &rtcp.PictureLossIndication{
+	s.sendRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{
 		SenderSSRC: senderSSRC,
 		MediaSSRC:  videoSSRC,
-	}
-	raw, err := rtcp.Marshal([]rtcp.Packet{pli})
-	if err != nil {
-		s.logf("[raw][%s] requestKeyframe: marshal PLI failed: %v", s.bridgeID, err)
-		return
-	}
-	s.srtcpWriteMu.Lock()
-	encrypted, err := s.srtcpCtx.EncryptRTCP(nil, raw, nil)
-	if err != nil {
-		s.srtcpWriteMu.Unlock()
-		s.logf("[raw][%s] requestKeyframe: encrypt PLI failed: %v", s.bridgeID, err)
-		return
-	}
-	_, writeErr := s.iceConn.Write(encrypted)
-	s.srtcpWriteMu.Unlock()
-	if writeErr != nil {
-		s.logf("[raw][%s] requestKeyframe: write PLI failed: %v", s.bridgeID, writeErr)
-		return
-	}
+	}}, "pli")
 
 	// On-demand PLIs are frequent — WebKit asks for one whenever its decoder
 	// stalls, which during a bad patch is several a second. Report the first
@@ -1397,9 +1630,8 @@ func (s *rawShadowSession) startupKeyframeLoop(ctx context.Context) {
 	// spam the same SSRC across rounds — only send for newly-seen ones.
 	sentSSRCs := make(map[uint32]bool)
 
-	sendForNewSSRCs := func(round int) {
-		ssrcs := s.getVideoSSRCs()
-		for _, ssrc := range ssrcs {
+	sendForNewSSRCs := func() {
+		for _, ssrc := range s.getVideoSSRCs() {
 			if sentSSRCs[ssrc] {
 				continue
 			}
@@ -1414,7 +1646,7 @@ func (s *rawShadowSession) startupKeyframeLoop(ctx context.Context) {
 		return
 	case <-time.After(initialDelay):
 	}
-	sendForNewSSRCs(1)
+	sendForNewSSRCs()
 
 	// Rounds 2 & 3 — catch SSRCs registered by renegotiation after round 1.
 	for round := 2; round <= maxRounds; round++ {
@@ -1423,7 +1655,7 @@ func (s *rawShadowSession) startupKeyframeLoop(ctx context.Context) {
 			return
 		case <-time.After(retryDelay):
 		}
-		sendForNewSSRCs(round)
+		sendForNewSSRCs()
 	}
 }
 
@@ -1441,7 +1673,7 @@ func (s *rawShadowSession) twccFeedbackLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if s.transportCCExtID == 0 {
+			if s.transportCCExtID.Load() == 0 {
 				continue // transport-cc not negotiated yet
 			}
 
@@ -1476,59 +1708,60 @@ func (s *rawShadowSession) twccFeedbackLoop(ctx context.Context) {
 			}
 
 			twccCount++
-			pkts := []rtcp.Packet{fb}
-			raw, err := rtcp.Marshal(pkts)
-			if err != nil {
-				if twccCount <= 3 || twccCount%100 == 0 {
-					s.logf("[raw][%s] [TWCC] marshal failed #%d: %v", s.bridgeID, twccCount, err)
-				}
-				continue
-			}
-			encrypted, err := s.srtcpCtx.EncryptRTCP(nil, raw, nil)
-			if err != nil {
-				if twccCount <= 3 || twccCount%100 == 0 {
-					s.logf("[raw][%s] [TWCC] encrypt failed #%d: %v", s.bridgeID, twccCount, err)
-				}
-				continue
-			}
-			if s.iceConn != nil {
-				_, _ = s.iceConn.Write(encrypted)
-				if twccCount <= 5 || twccCount%200 == 0 {
-					s.logf("[raw][%s] [TWCC] feedback #%d sent: seqs=%d", s.bridgeID, twccCount, fb.PacketStatusCount)
-				}
+			// Goes through sendRTCP like every other sender. This loop used to
+			// call EncryptRTCP directly with no lock held — at 10 Hz it was the
+			// busiest outbound RTCP path in the session and the only one racing
+			// the others on outboundCtx's unguarded maps.
+			s.sendRTCP([]rtcp.Packet{fb}, "twcc")
+			if twccCount <= 5 || twccCount%200 == 0 {
+				s.logf("[raw][%s] [TWCC] feedback #%d sent: seqs=%d", s.bridgeID, twccCount, fb.PacketStatusCount)
 			}
 		}
 	}
 }
 
-// sendCompoundRTCP encrypts and sends a compound RTCP packet via the ICE connection.
-func (s *rawShadowSession) sendCompoundRTCP(pkts []rtcp.Packet, label string, count uint64, senderSSRC uint32, nReports, nPLIs int) {
+// sendRTCP marshals, encrypts and writes one RTCP packet (or compound) to the
+// SFU. It is the ONLY place outboundCtx may be used — see outboundWriteMu for
+// why touching that context from two goroutines is fatal rather than merely
+// racy.
+//
+// label names the caller for logging. Errors are reported through logEvery so a
+// persistent failure cannot turn into a per-packet log storm on the media path.
+func (s *rawShadowSession) sendRTCP(pkts []rtcp.Packet, label string) {
+	if len(pkts) == 0 {
+		return
+	}
+
 	raw, err := rtcp.Marshal(pkts)
 	if err != nil {
-		s.logf("[raw][%s] [RTCP] marshal failed: %v", s.bridgeID, err)
+		s.logEvery("rtcp-marshal-"+label, "[raw][%s] [RTCP] %s marshal failed: %v", s.bridgeID, label, err)
 		return
 	}
-	s.srtcpWriteMu.Lock()
-	encrypted, err := s.srtcpCtx.EncryptRTCP(nil, raw, nil)
+
+	s.outboundWriteMu.Lock()
+	if s.outboundCtx == nil || s.mediaWriter == nil {
+		s.outboundWriteMu.Unlock()
+		return
+	}
+	encrypted, err := s.outboundCtx.EncryptRTCP(nil, raw, nil)
 	if err != nil {
-		s.srtcpWriteMu.Unlock()
-		if count <= 3 || count%10 == 0 {
-			s.logf("[raw][%s] [RTCP] encrypt failed #%d: %v", s.bridgeID, count, err)
-		}
+		s.outboundWriteMu.Unlock()
+		s.logEvery("rtcp-encrypt-"+label, "[raw][%s] [RTCP] %s encrypt failed: %v", s.bridgeID, label, err)
 		return
 	}
-	if s.iceConn != nil {
-		_, writeErr := s.iceConn.Write(encrypted)
-		s.srtcpWriteMu.Unlock()
-		if writeErr != nil {
-			s.logf("[raw][%s] [RTCP] %s #%d write failed: %v", s.bridgeID, label, count, writeErr)
-		}
-	} else {
-		s.srtcpWriteMu.Unlock()
+	// The write stays inside the lock deliberately. Releasing after encryption
+	// would let two goroutines interleave their datagrams on the wire in an
+	// order that does not match their SRTCP indices, which the peer's replay
+	// window then rejects.
+	_, writeErr := s.mediaWriter.Write(encrypted)
+	s.outboundWriteMu.Unlock()
+
+	if writeErr != nil {
+		s.logEvery("rtcp-write-"+label, "[raw][%s] [RTCP] %s write failed: %v", s.bridgeID, label, writeErr)
 	}
 }
 
-func (s *rawShadowSession) srtpReadLoop(ctx context.Context, srtpCh <-chan []byte) {
+func (s *rawShadowSession) srtpReadLoop(ctx context.Context, srtpCh <-chan *[]byte) {
 	s.logf("[raw][%s] SRTP read loop started", s.bridgeID)
 	defer s.logf("[raw][%s] SRTP read loop stopped", s.bridgeID)
 
@@ -1536,15 +1769,35 @@ func (s *rawShadowSession) srtpReadLoop(ctx context.Context, srtpCh <-chan []byt
 		select {
 		case <-ctx.Done():
 			return
-		case encrypted, ok := <-srtpCh:
+		case buf, ok := <-srtpCh:
 			if !ok {
 				return
 			}
-			s.decryptAndDispatch(encrypted)
+			s.decryptAndDispatch(*buf)
+			// decryptAndDispatch has finished with the bytes by the time it
+			// returns — the relay either copied what it needed or wrote the
+			// packet synchronously — so the buffer can go back to the pool.
+			putSRTPBuffer(buf)
 		}
 	}
 }
 
+// decryptAndDispatch handles one inbound datagram from the SFU: demux, decrypt,
+// account for it, and hand it to the relay.
+//
+// This runs once per inbound packet — a thousand times a second or more — so it
+// is written to touch as few locks and allocate as few objects as it can. Three
+// things it deliberately does NOT do, each of which it used to:
+//
+//   - It does not consult ptCodecMap under the session mutex. The codec is
+//     resolved once, from the lock-free snapshot, and passed down. The previous
+//     version took s.mu three separate times to look up the same payload type,
+//     and the relay callback took it a fourth to deep-copy the whole map.
+//   - It does not parse the RTP header twice. The header decrypted in place is
+//     reused for the packet handed onward.
+//   - It does not read the wall clock for arrival timestamps. Jitter and TWCC
+//     both scale arrival times by a clock rate, and a Unix microsecond count
+//     overflows int64 when multiplied by 90000 — see sessionMicros.
 func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 	if len(encrypted) < 12 {
 		return
@@ -1562,128 +1815,122 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 	}
 
 	// ── SRTP path ────────────────────────────────────────────────────────
-	var header rtp.Header
-	if _, err := header.Unmarshal(encrypted); err != nil {
-		return
-	}
-
-	decrypted, err := s.srtpCtx.DecryptRTP(nil, encrypted, &header)
+	pkt := &rtp.Packet{}
+	payloadOffset, err := pkt.Header.Unmarshal(encrypted)
 	if err != nil {
 		return
 	}
+
+	decrypted, err := s.inboundCtx.DecryptRTP(nil, encrypted, &pkt.Header)
+	if err != nil {
+		return
+	}
+	// DecryptRTP returns header+payload with the auth tag stripped, and leaves
+	// the header bytes untouched — so the payload is simply what follows the
+	// offset the parse above already reported. Re-running a full Unmarshal over
+	// the same bytes to rediscover that was the second header parse per packet.
+	//
+	// Padding must still be split off exactly as rtp.Packet.Unmarshal does it:
+	// the last byte gives the padding length, and it belongs to neither the
+	// payload nor a re-marshal of this packet. RTX bandwidth probes are padded,
+	// so getting this wrong feeds padding bytes to the decoder and re-marshals
+	// with Padding set but PaddingSize zero.
+	if !setPayloadWithPadding(pkt, decrypted, payloadOffset) {
+		return
+	}
+
+	header := &pkt.Header
+	ssrc := header.SSRC
+	seq := header.SequenceNumber
+
+	// One codec lookup for the whole function, off the lock-free snapshot.
+	codec, codecKnown := s.codecs()[header.PayloadType]
+	isVideo := codecKnown && strings.Contains(strings.ToUpper(codec.MimeType), "VIDEO")
+	isAudio := codecKnown && strings.Contains(strings.ToUpper(codec.MimeType), "AUDIO")
+	rtxMediaPT, isRTX := s.rtxMapping.isRTX(header.PayloadType)
+
+	// One clock reading for the whole function, relative to session start.
+	arrivalUs := s.sessionMicros()
 
 	// Track sequence numbers with proper cycle counting (RFC 3550 §A.1).
 	s.incomingSeqsMu.Lock()
 	if s.incomingSeqs == nil {
 		s.incomingSeqs = make(map[uint32]*seqTracker)
 	}
-	tracker := s.incomingSeqs[header.SSRC]
+	tracker := s.incomingSeqs[ssrc]
 	if tracker == nil {
-		tracker = &seqTracker{}
-		// Set clock rate from codec map for jitter computation.
-		s.mu.Lock()
-		if ci, ok := s.ptCodecMap[header.PayloadType]; ok {
-			tracker.clockRate = ci.ClockRate
-		}
-		s.mu.Unlock()
-		s.incomingSeqs[header.SSRC] = tracker
+		tracker = &seqTracker{clockRate: codec.ClockRate}
+		s.incomingSeqs[ssrc] = tracker
+	} else if tracker.clockRate == 0 && codec.ClockRate != 0 {
+		// The first packets of a stream can beat the SDP that describes them,
+		// especially on an incoming call. Without this the tracker would keep
+		// clockRate 0 for the life of the session and never report jitter.
+		tracker.clockRate = codec.ClockRate
 	}
-	tracker.updateSeq(header.SequenceNumber)
-	// Update interarrival jitter (RFC 3550 §A.8).
-	tracker.updateJitter(time.Now().UnixMicro(), header.Timestamp)
+	tracker.updateSeq(seq)
+	tracker.updateJitter(arrivalUs, header.Timestamp) // RFC 3550 §A.8
+	tracker.lastPacketAt = time.Now()
 	s.incomingSeqsMu.Unlock()
 
 	// ── Dynamic video SSRC tracking ───────────────────────────────────
 	// Track video SSRCs directly from the decrypted wire so that PLI and
-	// REMB in the heartbeat always use the real SSRC the SFU is sending
-	// on — even if it differs from (or was missing in) the SDP.
-	//
-	// We look up the payload type in ptCodecMap (populated from SDP). If
-	// the codec is known and is video, register the SSRC. trackVideoSSRC
-	// is a no-op for SSRCs already known, so this is hot-path safe.
-	s.mu.Lock()
-	wireCodec, wireCodecKnown := s.ptCodecMap[header.PayloadType]
-	s.mu.Unlock()
-	if wireCodecKnown && strings.Contains(strings.ToUpper(wireCodec.MimeType), "VIDEO") {
-		s.trackVideoSSRC(header.SSRC)
+	// REMB always use the real SSRC the SFU is sending on — even if it
+	// differs from (or was missing in) the SDP. trackVideoSSRC is a no-op
+	// for SSRCs already known, so this is hot-path safe.
+	if isVideo {
+		s.trackVideoSSRC(ssrc)
 	}
 
 	// Extract transport-wide sequence number for TWCC feedback.
-	if s.transportCCExtID != 0 {
-		if ext := header.GetExtension(s.transportCCExtID); len(ext) >= 2 {
-			twccSeq := binary.BigEndian.Uint16(ext)
-			s.twcc.add(twccSeq, time.Now().UnixMicro())
+	if extID := s.transportCCExtID.Load(); extID != 0 {
+		if ext := header.GetExtension(uint8(extID)); len(ext) >= 2 {
+			s.twcc.add(binary.BigEndian.Uint16(ext), arrivalUs)
 		}
 	}
 
-	// ── Unmarshal full RTP packet (used for H264 inspection + relay) ───
-	pkt := &rtp.Packet{}
-	if err := pkt.Unmarshal(decrypted); err != nil {
-		return
-	}
-
-	// ── Per-SSRC stream registration + gap detection ─────────────────
+	// ── Per-SSRC stream registration + loss detection ─────────────────
 	if s.ssrcReg != nil {
-		st, isNew := s.ssrcReg.getOrCreate(header.SSRC)
+		st, isNew := s.ssrcReg.getOrCreate(ssrc)
+
 		st.mu.Lock()
 		if isNew {
 			st.pt = header.PayloadType
-			st.role = roleUnknown
-			s.mu.Lock()
-			if ci, ok := s.ptCodecMap[header.PayloadType]; ok {
-				if strings.Contains(strings.ToUpper(ci.MimeType), "VIDEO") {
-					st.role = rolePrimVideo
-				} else if strings.Contains(strings.ToUpper(ci.MimeType), "AUDIO") {
-					st.role = roleAudio
-				}
-			}
-			s.mu.Unlock()
-			if _, ok := s.rtxMapping.isRTX(header.PayloadType); ok {
-				st.role = roleRTXVideo
-			}
-		}
-		// Gap / reorder detection.
-		if st.seqInitiated {
-			expected := st.highestSeq + 1
-			delta := int16(header.SequenceNumber - expected)
 			switch {
-			case delta == 0: // normal
-			case delta > 0:
-				missing := s.nackSt.recordGap(header.SSRC, expected, header.SequenceNumber)
-				st.totalLost += int64(len(missing))
-				if len(missing) > 0 {
-					s.rtcpMu.Lock()
-					s.rtcpNACKCount++
-					s.rtcpMu.Unlock()
-					st.nackSent++
-					// Only NACK primary media SSRCs, never the RTX repair stream itself.
-					if st.role != roleRTXVideo {
-						go s.sendNACK(header.SSRC, missing)
-					}
-				}
-			case delta < 0: // reordered or duplicate — nothing to record
+			case isRTX:
+				st.role = roleRTXVideo
+			case isVideo:
+				st.role = rolePrimVideo
+			case isAudio:
+				st.role = roleAudio
+			default:
+				st.role = roleUnknown
 			}
 		}
-		if !st.seqInitiated || int16(header.SequenceNumber-st.highestSeq) > 0 {
-			st.highestSeq = header.SequenceNumber
+		role := st.role
+		wasInitiated := st.seqInitiated
+		expected := st.highestSeq + 1
+		if !st.seqInitiated || int16(seq-st.highestSeq) > 0 {
+			st.highestSeq = seq
 			st.seqInitiated = true
 		}
 		st.pktCount++
 		st.byteCount += int64(len(decrypted))
 		st.mu.Unlock()
+
+		// The RTX repair stream is never itself repaired — asking the SFU to
+		// retransmit a retransmission is not a thing it can do.
+		if wasInitiated && role != roleRTXVideo {
+			s.trackLoss(ssrc, seq, expected, role == rolePrimVideo)
+		}
 	}
 
-	// ── H264 NAL inspection ──────────────────────────────────────────
-	s.mu.Lock()
-	ci, ciOK := s.ptCodecMap[header.PayloadType]
-	s.mu.Unlock()
-	if ciOK && strings.Contains(strings.ToUpper(ci.MimeType), "H264") && len(pkt.Payload) > 0 {
-		if IsH264Keyframe(pkt.Payload) {
-			if st, _ := s.ssrcReg.getOrCreate(header.SSRC); st != nil {
-				st.mu.Lock()
-				st.keyframeCount++
-				st.mu.Unlock()
-			}
+	// ── H264 keyframe accounting ──────────────────────────────────────
+	if codecKnown && strings.Contains(strings.ToUpper(codec.MimeType), "H264") &&
+		len(pkt.Payload) > 0 && IsH264Keyframe(pkt.Payload) {
+		if st, _ := s.ssrcReg.getOrCreate(ssrc); st != nil {
+			st.mu.Lock()
+			st.keyframeCount++
+			st.mu.Unlock()
 		}
 	}
 
@@ -1695,29 +1942,105 @@ func (s *rawShadowSession) decryptAndDispatch(encrypted []byte) {
 	// RTX packets must be intercepted BEFORE the relay sees them. The relay
 	// strict-drops any PT it doesn't recognise (PT=99). We decapsulate here
 	// and feed the reconstructed packet back as the original media PT/SSRC.
-	if mediaPT, isRTX := s.rtxMapping.isRTX(header.PayloadType); isRTX {
-		s.decapsulateRTX(pkt, header.SSRC, mediaPT)
+	if isRTX {
+		s.decapsulateRTX(pkt, ssrc, rtxMediaPT)
 		return
 	}
 
 	s.onRTPPacket(pkt)
 }
 
+// setPayloadWithPadding slices pkt.Payload out of buf, given the header length
+// that parsing the header already reported, and splits off RFC 3550 §5.1
+// padding. Returns false if the buffer is too short to be consistent.
+//
+// This is the payload half of rtp.Packet.Unmarshal, lifted out so the receive
+// path can reuse the header parse it has already done instead of running a
+// second one per packet. It must stay behaviourally identical to that function;
+// the tests compare a round-tripped packet against the original for both padded
+// and unpadded input.
+func setPayloadWithPadding(pkt *rtp.Packet, buf []byte, headerLen int) bool {
+	if headerLen > len(buf) {
+		return false
+	}
+
+	end := len(buf)
+	if pkt.Header.Padding {
+		if end <= headerLen {
+			return false
+		}
+		pkt.PaddingSize = buf[end-1]
+		end -= int(pkt.PaddingSize)
+	} else {
+		pkt.PaddingSize = 0
+	}
+	if end < headerLen {
+		return false
+	}
+
+	pkt.Payload = buf[headerLen:end]
+	return true
+}
+
+// trackLoss feeds one arrival into the NACK engine: either it advances past a
+// gap, or it closes one.
+//
+// Nothing here decides that a packet is lost. A forward jump only opens pending
+// entries, which the engine holds through a reorder grace before asking for
+// anything and writes off only after retrying. A backward sequence number is
+// the other half: it may be a packet we had already given up waiting for, and
+// clearing it is what stops ordinary reordering from being recorded as
+// permanent loss forever.
+func (s *rawShadowSession) trackLoss(ssrc uint32, seq, expected uint16, isVideo bool) {
+	delta := int16(seq - expected)
+	switch {
+	case delta == 0:
+		// In order; nothing outstanding can be resolved by it.
+	case delta > 0:
+		s.nackEng.setVideo(ssrc, isVideo)
+		s.nackEng.recordGap(ssrc, expected, seq)
+	default:
+		// Behind the highest seen: a late arrival, a duplicate, or a repair.
+		if cleared, wasRequested := s.nackEng.observe(ssrc, seq); cleared {
+			s.creditRecovery(ssrc, wasRequested)
+		}
+	}
+}
+
+// creditRecovery accounts for a sequence number that came back. wasRequested
+// separates a real retransmission from reordering that resolved on its own
+// before any request went out — the latter costs nothing and is not repair.
+func (s *rawShadowSession) creditRecovery(ssrc uint32, wasRequested bool) {
+	st, _ := s.ssrcReg.getOrCreate(ssrc)
+	if st == nil {
+		return
+	}
+	st.mu.Lock()
+	if wasRequested {
+		st.nackRecovered++
+	} else {
+		st.reordered++
+	}
+	st.mu.Unlock()
+}
+
 // processInboundSRTCP decrypts an incoming SRTCP packet and extracts Sender
 // Reports so we can reflect LSR/DLSR in our Receiver Reports.
 //
-// NOTE: SRTCP from the SFU is decrypted with srtpCtx (derived from the
-// server→client key material). srtcpCtx holds the client→server keys used
-// for ENCRYPTING our outbound RTCP — using it to decrypt inbound SRTCP
-// causes silent auth failures.
+// NOTE: inbound SRTCP is decrypted with inboundCtx (server→client key
+// material), NOT outboundCtx. outboundCtx holds the client→server keys used to
+// ENCRYPT what we send; using it here fails authentication silently.
 func (s *rawShadowSession) processInboundSRTCP(encrypted []byte) {
-	// CRITICAL: Use srtpCtx (inbound / server→client key material) to decrypt
-	// incoming SRTCP, NOT srtcpCtx which holds outbound / client→server keys.
-	// srtcpCtx is for encrypting OUR RTCP; srtpCtx shares the server's keys
-	// and can decrypt both SRTP and SRTCP from the SFU.
-	decrypted, err := s.srtpCtx.DecryptRTCP(nil, encrypted, nil)
+	decrypted, err := s.inboundCtx.DecryptRTCP(nil, encrypted, nil)
 	if err != nil {
-		s.logf("[RTCP-RX] SRTCP decrypt failed: %v (len=%d pt=%d)", err, len(encrypted), encrypted[1])
+		// Throttled: this sits on the media path and fires per packet. If the
+		// keys are wrong it is wrong for every packet, and an unthrottled log
+		// line here writes to file and stdout synchronously — enough, at RTCP
+		// rates during a renegotiation storm, to delay the SRTP read loop and
+		// cause loss of its own.
+		s.logEvery("srtcp-decrypt",
+			"[raw][%s] [RTCP-RX] SRTCP decrypt failed: %v (len=%d pt=%d)",
+			s.bridgeID, err, len(encrypted), encrypted[1])
 		return // auth failure or corrupt
 	}
 
@@ -2261,33 +2584,24 @@ func safePrefix(s string, n int) string {
 // RFC 4585 §6.2.1: the NACK carries (PID, BLP) pairs. PID is a single seq,
 // BLP is a 16-bit bitmask of the next 16 seqs after PID. We build these
 // pairs from the missing list.
+//
+// Called only from the NACK engine's goroutine (nack.go), which has already
+// bounded the list to what fits in one packet and decided which numbers are
+// due. This function's whole job is encoding.
 func (s *rawShadowSession) sendNACK(mediaSSRC uint32, missing []uint16) {
-	if s.srtcpCtx == nil || s.iceConn == nil {
+	if len(missing) == 0 {
 		return
 	}
 
-	// Cap to avoid MTU overflow (each NackPair is 4 bytes; 100 pairs = 400 bytes).
-	// Capping is routine under loss and fires several times a second when the
-	// ingress leg is bad, so it is counted rather than logged; the NACK totals
-	// appear in [MEDIA-SUMMARY].
-	const maxNACKSeqs = 100
-	if len(missing) > maxNACKSeqs {
-		missing = missing[:maxNACKSeqs]
-	}
-
-	// Build NackPair list: group sequences into (PID, BLP) pairs.
-	// Sort first to enable BLP grouping.
+	// Sort so consecutive numbers can share one pair's bitmask. Comparison is
+	// on the signed difference, not the raw value, so a run spanning the 65535→0
+	// wrap still sorts contiguously.
 	sorted := make([]uint16, len(missing))
 	copy(sorted, missing)
-	for i := 1; i < len(sorted); i++ {
-		for j := i; j > 0 && int16(sorted[j]-sorted[j-1]) < 0; j-- {
-			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
-		}
-	}
+	sort.Slice(sorted, func(i, j int) bool { return int16(sorted[i]-sorted[j]) < 0 })
 
-	var pairs []rtcp.NackPair
-	i := 0
-	for i < len(sorted) {
+	pairs := make([]rtcp.NackPair, 0, len(sorted))
+	for i := 0; i < len(sorted); {
 		pid := sorted[i]
 		blp := uint16(0)
 		i++
@@ -2303,44 +2617,53 @@ func (s *rawShadowSession) sendNACK(mediaSSRC uint32, missing []uint16) {
 		pairs = append(pairs, rtcp.NackPair{PacketID: pid, LostPackets: rtcp.PacketBitmap(blp)})
 	}
 
-	// Use localVideoSSRC as SenderSSRC for video NACKs so the SFU
-	// recognises us as the correct participant in the video m-section.
-	// Fall back to localSenderSSRC (audio) if video SSRC is not yet known.
-	s.mu.Lock()
-	senderSSRC := s.localVideoSSRC
-	if senderSSRC == 0 {
-		senderSSRC = s.localSenderSSRC
-	}
-	s.mu.Unlock()
-	if senderSSRC == 0 {
-		senderSSRC = 1
-	}
+	// SenderSSRC identifies US to the SFU, so it must match the m-section the
+	// NACKed stream belongs to. Picking the video SSRC for an audio NACK would
+	// address the request to the wrong participant, so choose by the role the
+	// media SSRC was classified as rather than always preferring video.
+	senderSSRC := s.senderSSRCFor(mediaSSRC)
 
-	nack := &rtcp.TransportLayerNack{
+	s.sendRTCP([]rtcp.Packet{&rtcp.TransportLayerNack{
 		SenderSSRC: senderSSRC,
 		MediaSSRC:  mediaSSRC,
 		Nacks:      pairs,
+	}}, "nack")
+}
+
+// senderSSRCFor picks the local SSRC to identify ourselves with in feedback
+// about mediaSSRC — the video one for a video stream, the audio one otherwise.
+//
+// The previous code always preferred localVideoSSRC when it was known, so once
+// video was negotiated every audio NACK was addressed from the video
+// m-section's participant. Falls back to 1 only when the local SDP has told us
+// nothing at all, which is the same non-zero placeholder the rest of the RTCP
+// path uses.
+func (s *rawShadowSession) senderSSRCFor(mediaSSRC uint32) uint32 {
+	isVideo := false
+	if s.ssrcReg != nil {
+		s.ssrcReg.mu.Lock()
+		if st, ok := s.ssrcReg.stats[mediaSSRC]; ok {
+			st.mu.Lock()
+			isVideo = st.role == rolePrimVideo || st.role == roleRTXVideo
+			st.mu.Unlock()
+		}
+		s.ssrcReg.mu.Unlock()
 	}
 
-	raw, err := rtcp.Marshal([]rtcp.Packet{nack})
-	if err != nil {
-		s.logf("[NACK-TX] marshal failed SSRC=%d: %v", mediaSSRC, err)
-		return
-	}
-	s.srtcpWriteMu.Lock()
-	encrypted, err := s.srtcpCtx.EncryptRTCP(nil, raw, nil)
-	if err != nil {
-		s.srtcpWriteMu.Unlock()
-		s.logf("[NACK-TX] encrypt failed SSRC=%d: %v", mediaSSRC, err)
-		return
-	}
-	_, writeErr := s.iceConn.Write(encrypted)
-	s.srtcpWriteMu.Unlock()
-	if writeErr != nil {
-		s.logf("[NACK-TX] write failed SSRC=%d: %v", mediaSSRC, writeErr)
-		return
-	}
+	s.mu.Lock()
+	video, audio := s.localVideoSSRC, s.localSenderSSRC
+	s.mu.Unlock()
 
+	if isVideo && video != 0 {
+		return video
+	}
+	if audio != 0 {
+		return audio
+	}
+	if video != 0 {
+		return video
+	}
+	return 1
 }
 
 // decapsulateRTX implements RFC 4588 RTX packet processing.
@@ -2385,15 +2708,13 @@ func (s *rawShadowSession) decapsulateRTX(rtxPkt *rtp.Packet, rtxSSRC uint32, me
 		return
 	}
 
-	// Check if this seq was in our NACK missing set.
-	wasExpected := s.nackSt.recover(mediaSSRC, originalSeq)
-
-	if wasExpected {
-		if st, _ := s.ssrcReg.getOrCreate(rtxSSRC); st != nil {
-			st.mu.Lock()
-			st.nackRecovered++
-			st.mu.Unlock()
-		}
+	// Clear the sequence number from the pending set if it was outstanding, and
+	// credit the recovery against the MEDIA SSRC rather than the RTX one. The
+	// previous version credited rtxSSRC, which put every recovery in the
+	// rtx-video row of the summary and left primary-video showing loss it had
+	// in fact repaired.
+	if cleared, wasRequested := s.nackEng.observe(mediaSSRC, originalSeq); cleared {
+		s.creditRecovery(mediaSSRC, wasRequested)
 	}
 
 	// Reconstruct the original RTP packet.
@@ -2445,19 +2766,24 @@ func (s *rawShadowSession) mediaSummaryLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Re-enabled: 5-second ingress (SFU→bcr_client) health summary so we can
-			// measure per-role packets/bitrate/keyframes/LOST/nack/recovered — this is
+			// 5-second ingress (SFU→bcr_client) health summary: per-role
+			// packets/bitrate/keyframes/lost/nack/recovered/reordered — this is
 			// how we quantify the video packet loss on the media leg.
-			s.mu.Lock()
-			ptMap := make(map[uint8]CodecInfo, len(s.ptCodecMap))
-			for k, v := range s.ptCodecMap {
-				ptMap[k] = v
-			}
-			s.mu.Unlock()
 			s.rtcpMu.Lock()
 			rr, remb, pli, nack := s.rtcpRRCount, s.rtcpREMBCount, s.rtcpPLICount, s.rtcpNACKCount
 			s.rtcpMu.Unlock()
-			EmitMediaSummary(s.bridgeID, s.ssrcReg, ptMap, s.rtxMapping, rr, remb, pli, nack, interval.Seconds(), baseline, s.logf)
+			EmitMediaSummary(s.bridgeID, s.ssrcReg, s.codecs(), s.rtxMapping, rr, remb, pli, nack, interval.Seconds(), baseline, s.logf)
+			if pending := s.nackEng.pendingCount(); pending > 0 {
+				s.logf("[MEDIA-SUMMARY] repair in flight: %d sequence number(s) outstanding", pending)
+			}
+			// Locally-inflicted loss, reported separately from network loss so
+			// the two are never confused. Silent while the receive path keeps up.
+			if s.splitter != nil {
+				if received, dropped := s.splitter.MediaCounters(); dropped > 0 {
+					s.logf("[MEDIA-SUMMARY] LOCAL DROPS: %d of %d datagram(s) discarded before decryption — the SRTP read loop is falling behind, this is not network loss",
+						dropped, received+dropped)
+				}
+			}
 		}
 	}
 }

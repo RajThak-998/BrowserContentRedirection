@@ -70,9 +70,8 @@ type Engine struct {
 	connectMu   sync.Mutex
 	bridgeRetry map[string]bridgeRetryState
 
-	// Diagnostic: track unknown PTs to avoid log spam.
-	unknownPTMu sync.Mutex
-	unknownPTs  map[uint8]bool
+	// Unknown-PT and first-packet log suppression now lives in relay.go, keyed
+	// per bridge rather than per process — see noteFirst.
 }
 
 func New(cfg Config, cb Callbacks) *Engine {
@@ -298,29 +297,21 @@ func (e *Engine) getOrCreateRawSession(bridgeID string) *rawShadowSession {
 	}
 
 	session := newRawShadowSession(bridgeID, e.logf)
-	// Callback is set once at creation; it is safe to read ptCodecMap since
-	// that map is populated before Init() starts (in handleShadowLocal).
+	// Callback is set once at creation.
+	//
+	// The codec table reaches the relay as the session's immutable snapshot —
+	// one atomic load, no lock, no allocation. It used to be deep-copied here
+	// under session.mu for every single RTP packet, ostensibly because "the map
+	// is typically 2–4 entries". A Teams offer carries fifteen to twenty, and
+	// this runs a thousand-plus times a second, holding the mutex that Connect,
+	// the RTCP heartbeat and the TWCC loop all contend for. The race that copy
+	// was written to close is closed properly now, at the point of mutation:
+	// see publishCodecSnapshot.
+	//
+	// Video SSRC tracking is not repeated here either — decryptAndDispatch has
+	// already done it, from the same codec lookup, before calling this.
 	session.onRTPPacket = func(pkt *rtp.Packet) {
-		// ── Snapshot ptCodecMap under lock (Bug-4 fix) ─────────────────────
-		// mergeCodecsAndSSRCs writes this map from the WebSocket goroutine
-		// while srtpReadLoop reads it from the SRTP goroutine — a data race
-		// that can cause a concurrent-map panic under renegotiation. We take
-		// a cheap copy here (typically 2–4 entries) to give each packet its
-		// own immutable view of the codec table.
-		session.mu.Lock()
-		ptMap := make(map[uint8]CodecInfo, len(session.ptCodecMap))
-		for k, v := range session.ptCodecMap {
-			ptMap[k] = v
-		}
-		session.mu.Unlock()
-
-		// Track video SSRCs so the RTCP heartbeat loop can send PLI.
-		if codec, ok := ptMap[pkt.Header.PayloadType]; ok {
-			if strings.Contains(strings.ToUpper(codec.MimeType), "VIDEO") {
-				session.trackVideoSSRC(pkt.SSRC)
-			}
-		}
-		e.onRawRTPPacket(bridgeID, pkt, ptMap)
+		e.onRawRTPPacket(bridgeID, pkt, session.codecs())
 	}
 	e.rawSessions[bridgeID] = session
 	return session
@@ -342,6 +333,10 @@ func (e *Engine) closeShadowSession(bridgeID string) {
 	if ok {
 		session.Close()
 	}
+
+	// So the next session on this bridge reports its own first-packet lines
+	// rather than inheriting this one's.
+	forgetFirsts(bridgeID)
 
 	e.closeLoopbackSession(bridgeID)
 }
@@ -440,6 +435,9 @@ func (e *Engine) triggerConnect(conn SignalingConn, bridgeID string, session *ra
 			newSession.isOfferer = (sdpType == "offer")
 			newSession.localDTLSSetup = localDTLSSetup
 			newSession.mu.Unlock()
+			// The carried-over codec table has to reach the media path too, and
+			// only publishCodecSnapshot puts it there.
+			newSession.publishCodecSnapshot()
 
 			go e.retryBridge(conn, bridgeID, newSession, remoteSDP, sdpType, backoff)
 			return
@@ -577,6 +575,7 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 	session.localDTLSSetup = firstSDPAttr(payload.SDP, "a=setup:")
 	localSetup := session.localDTLSSetup
 	session.mu.Unlock()
+	session.publishCodecSnapshot()
 	e.logf("[raw][%s] local %s SDP: %d codec(s), a=setup:%s", bridgeID, sdpType, codecCount, orNone(localSetup))
 	// Populate RTX mappings from SDP fmtp:apt= lines.
 	for rtxPT, mediaPT := range extractFmtpAPT(payload.SDP) {
@@ -610,9 +609,7 @@ func (e *Engine) handleShadowLocal(conn SignalingConn, payload RTCShadowLocalPay
 		session.localCNAME = cname
 		session.mu.Unlock()
 	}
-	if extID := ExtractTransportCCExtID(payload.SDP); extID != 0 {
-		session.transportCCExtID = extID
-	}
+	session.setTransportCCExtID(ExtractTransportCCExtID(payload.SDP))
 
 	// Mark ICE role: offerer = controlling (Dial), answerer = controlled (Accept).
 	session.mu.Lock()
@@ -960,22 +957,14 @@ func (e *Engine) ensureLoopbackSession(bridgeID string, session *rawShadowSessio
 		e.logf,
 		e.cb.OnLoopbackOffer,
 		ptMap,
-		// onRequestKeyframe
+		// onRequestKeyframe — forwarded upstream because only the SFU can
+		// produce a keyframe. Unlike NACK, there is no local substitute.
 		func(bID string, ssrc uint32) {
 			e.shadowMu.Lock()
 			session := e.rawSessions[bID]
 			e.shadowMu.Unlock()
 			if session != nil {
 				session.requestKeyframe(ssrc)
-			}
-		},
-		// onNACK
-		func(bID string, ssrc uint32, missing []uint16) {
-			e.shadowMu.Lock()
-			session := e.rawSessions[bID]
-			e.shadowMu.Unlock()
-			if session != nil {
-				session.sendNACK(ssrc, missing)
 			}
 		},
 	)
@@ -1062,6 +1051,9 @@ func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpTyp
 		}
 	}
 	session.mu.Unlock()
+	if added > 0 {
+		session.publishCodecSnapshot()
+	}
 
 	if isLocal {
 		allSSRCs := ExtractAllSSRCs(sdp)
@@ -1081,18 +1073,18 @@ func (e *Engine) mergeCodecsAndSSRCs(session *rawShadowSession, bridgeID, sdpTyp
 			session.localCNAME = cname
 			session.mu.Unlock()
 		}
-		if extID := ExtractTransportCCExtID(sdp); extID != 0 {
-			session.transportCCExtID = extID
-		}
 	} else {
 		videoSSRCs := ExtractVideoSSRCs(sdp)
 		for _, ssrc := range videoSSRCs {
 			session.trackVideoSSRC(ssrc)
 		}
-		// TWCC Asymmetry Fix: re-extract from remote SDP.
-		remoteExtID := ExtractTransportCCExtID(sdp)
-		session.transportCCExtID = remoteExtID
 	}
+
+	// Both directions feed the same setter, which ignores a zero. This used to
+	// assign the remote SDP's value unconditionally, so a renegotiation answer
+	// that simply omitted the extmap silently disabled TWCC for the rest of the
+	// call — see setTransportCCExtID.
+	session.setTransportCCExtID(ExtractTransportCCExtID(sdp))
 }
 
 // ─── Renegotiation Handlers ───────────────────────────────────────────────────

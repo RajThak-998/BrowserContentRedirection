@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,16 +32,70 @@ import (
 
 const (
 	muxSRTPBufSize = 2048 // media is high-frequency; larger buffer prevents drops
+
+	// muxDatagramCap is the capacity of each pooled media buffer. Comfortably
+	// over any path MTU, so a datagram never needs a larger allocation.
+	muxDatagramCap = 2048
 )
+
+// srtpBufferPool recycles the byte slices handed to the SRTP channel.
+//
+// Every media datagram used to be copied into a fresh make([]byte, n). At the
+// thousand-plus packets a second a call produces, that is a thousand-plus
+// short-lived heap allocations a second feeding the garbage collector, on the
+// one goroutine that must not pause. The buffers are returned to the pool by
+// the reader once decryption is done, so steady state allocates nothing.
+var srtpBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, muxDatagramCap)
+		return &b
+	},
+}
+
+// getSRTPBuffer returns a pooled buffer holding a copy of src.
+func getSRTPBuffer(src []byte) *[]byte {
+	bp := srtpBufferPool.Get().(*[]byte)
+	b := *bp
+	if cap(b) < len(src) {
+		b = make([]byte, len(src))
+	} else {
+		b = b[:len(src)]
+	}
+	copy(b, src)
+	*bp = b
+	return bp
+}
+
+// putSRTPBuffer returns a buffer to the pool. The caller must not touch it
+// afterwards — in particular, nothing derived from the decrypted bytes may
+// outlive the call.
+func putSRTPBuffer(bp *[]byte) {
+	if bp == nil || cap(*bp) > muxDatagramCap {
+		return // oversized one-off; let it be collected rather than pooled
+	}
+	*bp = (*bp)[:0]
+	srtpBufferPool.Put(bp)
+}
 
 // iceConnSplitter wraps an ice.Conn to implement net.PacketConn for pion/dtls,
 // while inline-diverting SRTP packets to a separate channel.
 type iceConnSplitter struct {
 	conn            *ice.Conn
-	srtpCh          chan []byte
+	srtpCh          chan *[]byte
 	logf            func(string, ...any)
 	bridgeID        string
 	ignoreDeadlines bool
+
+	// mediaDropped counts datagrams discarded because srtpCh was full — that
+	// is, loss WE caused by not draining fast enough, as distinct from loss the
+	// network caused.
+	//
+	// This used to be an unremarked `default:` on the channel send. Self
+	// inflicted loss and network loss then looked identical in every diagnostic
+	// downstream, which makes tuning the receive path guesswork: a stall in the
+	// relay shows up as "the SFU is dropping packets".
+	mediaDropped  atomic.Uint64
+	mediaReceived atomic.Uint64
 
 	// expectedPeerFP is the SFU's a=fingerprint from the remote SDP, normalized
 	// to bare uppercase colon-hex. Every inbound Certificate message is hashed
@@ -68,7 +123,7 @@ type iceConnSplitter struct {
 func newIceConnSplitter(conn *ice.Conn, logf func(string, ...any), bridgeID string) *iceConnSplitter {
 	return &iceConnSplitter{
 		conn:               conn,
-		srtpCh:             make(chan []byte, muxSRTPBufSize),
+		srtpCh:             make(chan *[]byte, muxSRTPBufSize),
 		logf:               logf,
 		bridgeID:           bridgeID,
 		staleFilterEnabled: staleDTLSFilterEnabled(),
@@ -264,13 +319,22 @@ func (s *iceConnSplitter) ReadFrom(p []byte) (int, net.Addr, error) {
 			return n, s.conn.RemoteAddr(), nil
 
 		case first >= 128 && first <= 191: // SRTP or SRTCP
-			// Copy buffer because 'p' belongs to pion/dtls
-			pkt := make([]byte, n)
-			copy(pkt, p[:n])
+			// Copy because 'p' belongs to pion/dtls and is reused on the next
+			// read. The buffer is pooled — the SRTP read loop returns it.
+			pkt := getSRTPBuffer(p[:n])
 			select {
 			case s.srtpCh <- pkt:
+				s.mediaReceived.Add(1)
 			default:
-				// RTP loss is acceptable — the codec recovers via PLI/FEC.
+				// The reader is not keeping up. This is loss we are inflicting
+				// on ourselves, so it is counted rather than shrugged off:
+				// downstream it is indistinguishable from network loss, and
+				// chasing it as if it were network loss wastes a lot of time.
+				putSRTPBuffer(pkt)
+				if dropped := s.mediaDropped.Add(1); dropped == 1 || dropped%1000 == 0 {
+					s.logf("[raw][%s] [MUX] media channel full — dropped %d datagram(s) locally; the SRTP read loop is not draining fast enough",
+						s.bridgeID, dropped)
+				}
 			}
 			// Loop to read next packet without returning to pion/dtls
 			continue
@@ -342,8 +406,17 @@ func (s *iceConnSplitter) SetWriteDeadline(t time.Time) error {
 }
 
 // SRTPChan returns the read-only channel carrying SRTP/SRTCP datagrams.
-func (s *iceConnSplitter) SRTPChan() <-chan []byte {
+//
+// Buffers come from srtpBufferPool; the reader MUST return each one with
+// putSRTPBuffer once it is finished with the bytes.
+func (s *iceConnSplitter) SRTPChan() <-chan *[]byte {
 	return s.srtpCh
+}
+
+// MediaCounters reports datagrams accepted onto the media channel and
+// datagrams dropped because it was full.
+func (s *iceConnSplitter) MediaCounters() (received, dropped uint64) {
+	return s.mediaReceived.Load(), s.mediaDropped.Load()
 }
 
 func explainAlert(p []byte) string {

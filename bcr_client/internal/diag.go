@@ -50,14 +50,26 @@ type ssrcStats struct {
 	// Sequence tracking for gap detection.
 	highestSeq   uint16
 	seqInitiated bool
-	totalLost    int64
+
+	// totalLost counts sequence numbers the NACK engine gave up on — packets
+	// that are genuinely gone. It is deliberately NOT incremented when a gap is
+	// first noticed: most gaps close again, either because the packet was
+	// merely reordered or because retransmission recovered it, and counting
+	// them at detection time made the reported loss figure large enough to be
+	// useless for judging anything.
+	totalLost int64
 
 	// Keyframe counter (video only).
 	keyframeCount int64
 
-	// NACK counters.
+	// NACK counters. nackSent counts requests actually put on the wire,
+	// retries included. reordered counts gaps that closed on their own inside
+	// the reorder grace, without a request ever being sent — worth seeing
+	// separately, because a high reordered count with low loss means the link
+	// is fine and only the ordering is untidy.
 	nackSent      int64
 	nackRecovered int64
+	reordered     int64
 }
 
 // ssrcRegistry is a thread-safe map from SSRC → ssrcStats.
@@ -96,6 +108,7 @@ type ssrcSnapshot struct {
 	keyframeCount int64
 	nackSent      int64
 	nackRecovered int64
+	reordered     int64
 }
 
 // snapshot returns a copy of all stats (for the summary ticker).
@@ -113,6 +126,7 @@ func (r *ssrcRegistry) snapshot() []ssrcSnapshot {
 			keyframeCount: s.keyframeCount,
 			nackSent:      s.nackSent,
 			nackRecovered: s.nackRecovered,
+			reordered:     s.reordered,
 		})
 		s.mu.Unlock()
 	}
@@ -149,49 +163,10 @@ func (m *rtxMap) isRTX(pt uint8) (uint8, bool) {
 	return apt, ok
 }
 
-// ─── NACK State ──────────────────────────────────────────────────────────────
-
-// nackState tracks missing sequence numbers per SSRC for NACK generation readiness.
-type nackState struct {
-	mu      sync.Mutex
-	missing map[uint32]map[uint16]bool // ssrc → set of missing seqs
-}
-
-func newNACKState() *nackState {
-	return &nackState{missing: make(map[uint32]map[uint16]bool)}
-}
-
-// recordGap marks sequences [expected, got) as missing for ssrc.
-func (n *nackState) recordGap(ssrc uint32, expected, got uint16) []uint16 {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.missing[ssrc] == nil {
-		n.missing[ssrc] = make(map[uint16]bool)
-	}
-	var seqs []uint16
-	for seq := expected; seq != got; seq++ {
-		if !n.missing[ssrc][seq] {
-			n.missing[ssrc][seq] = true
-			seqs = append(seqs, seq)
-		}
-	}
-	return seqs
-}
-
-// recover marks a sequence as recovered (arrived via RTX or late delivery).
-func (n *nackState) recover(ssrc uint32, seq uint16) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	m := n.missing[ssrc]
-	if m == nil {
-		return false
-	}
-	if m[seq] {
-		delete(m, seq)
-		return true
-	}
-	return false
-}
+// NACK state lives in nack.go. It used to be here, as a bare per-SSRC set of
+// missing sequence numbers with no expiry, no retry and no reorder tolerance —
+// see the header comment on nack.go for what was wrong with that and why the
+// replacement is shaped the way it is.
 
 // ─── SDP Dump Helpers (called after every SDP parse) ─────────────────────────
 
@@ -263,7 +238,7 @@ type mediaSummaryStats struct {
 	lost      int64
 	nack      int64
 	recovered int64
-	dropped   int64
+	reordered int64
 }
 
 // summaryBaseline holds the previous tick's cumulative totals so each block can
@@ -313,6 +288,7 @@ func EmitMediaSummary(
 		st.lost += s.totalLost
 		st.nack += s.nackSent
 		st.recovered += s.nackRecovered
+		st.reordered += s.reordered
 	}
 
 	logf("[MEDIA-SUMMARY] bridgeId=%s last %.0fs (totals in parens) ─────", bridgeID, intervalSec)
@@ -330,11 +306,16 @@ func EmitMediaSummary(
 		dLost := st.lost - prev.lost
 		dNack := st.nack - prev.nack
 		dRecovered := st.recovered - prev.recovered
+		dReordered := st.reordered - prev.reordered
 
 		kbps := float64(dBytes*8) / (intervalSec * 1000)
-		logf("[MEDIA-SUMMARY] %-16s pkts=%-5d bitrate=%-6.0fkbps keyframes=%d lost=%d(%d) nack=%d(%d) recovered=%d(%d)",
+		// lost= is now unrecoverable loss only (the NACK engine gave up).
+		// reordered= is gaps that closed on their own without costing a
+		// request. Reading them together says whether the link is lossy or
+		// merely out of order — the old single lost= counter conflated both.
+		logf("[MEDIA-SUMMARY] %-16s pkts=%-5d bitrate=%-6.0fkbps keyframes=%d lost=%d(%d) nack=%d(%d) recovered=%d(%d) reordered=%d(%d)",
 			role, dPackets, kbps, dKeyframes,
-			dLost, st.lost, dNack, st.nack, dRecovered, st.recovered)
+			dLost, st.lost, dNack, st.nack, dRecovered, st.recovered, dReordered, st.reordered)
 	}
 	logf("[MEDIA-SUMMARY] rtcp tx: rr=%d remb=%d pli=%d nack=%d",
 		rtcpRR-base.rr, rtcpREMB-base.remb, rtcpPLI-base.pli, rtcpNACK-base.nack)
