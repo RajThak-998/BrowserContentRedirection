@@ -821,10 +821,6 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	splitter := newIceConnSplitter(iceConn, s.logf, s.bridgeID)
 	s.splitter = splitter
 
-	// Arm the inbound DTLS trace with the peer fingerprint from the SFU's SDP so
-	// every inbound Certificate can be attributed to our peer or flagged foreign.
-	splitter.SetExpectedPeerFingerprint(remoteFP)
-
 	// Discard anything already queued on the ICE connection before DTLS starts.
 	// ICE spends seconds on connectivity checks, and on the VDI a DTLS server
 	// flight was found waiting in that buffer before we had sent a ClientHello —
@@ -944,10 +940,6 @@ func (s *rawShadowSession) Connect(ctx context.Context, remoteSDP string, gen ui
 	}
 	s.logf("[raw][%s] [DIAG] DTLS HandshakeContext completed successfully", s.bridgeID)
 	s.dtlsConn = dtlsConn
-
-	// Stop filtering: from here records are encrypted (epoch > 0) and cannot be
-	// inspected, and pion must receive everything.
-	splitter.SetHandshakeComplete()
 
 	// Disable deadlines on the splitter/connection post-handshake to prevent
 	// subsequent read timeouts from freezing the media flow.
@@ -1093,13 +1085,7 @@ func (s *rawShadowSession) drainStaleInbound(conn *ice.Conn) {
 			continue
 		}
 		drained++
-		if buf[0] >= 20 && buf[0] <= 63 {
-			for _, r := range parseDTLSRecords(buf[:n]) {
-				s.logf("[raw][%s] [DTLS-FILTER] drained pre-handshake datagram: %s", s.bridgeID, r.String())
-			}
-		} else {
-			s.logf("[raw][%s] [DTLS-FILTER] drained pre-handshake datagram: %d bytes, first_byte=0x%02x", s.bridgeID, n, buf[0])
-		}
+		s.logf("[raw][%s] [DTLS-FILTER] drained pre-handshake datagram: %d bytes, first_byte=0x%02x", s.bridgeID, n, buf[0])
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
